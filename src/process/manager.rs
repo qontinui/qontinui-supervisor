@@ -2870,7 +2870,7 @@ async fn start_holding_the_lifecycle_lock(
         let state_clone = state.clone();
         let managed_clone = managed.clone();
         tokio::spawn(async move {
-            watch_first_healthy(state_clone, managed_clone, pid_val).await;
+            watch_first_healthy(state_clone, managed_clone, pid_val, spawned_at).await;
         });
     }
 
@@ -4578,6 +4578,13 @@ pub enum ServingRestartDecision {
     SkipDisabled,
     /// The serving arm already disarmed itself.
     SkipDisarmed,
+    /// A respawn that has not answered during this spawn, and is either younger than
+    /// the first-healthy budget or still tracked by its first-healthy watchdog
+    /// ([`first_healthy_owns_boot`]). The budget half is the whole rule for a primary,
+    /// whose watchdog stands down on its first tick; the tracked half applies to a
+    /// temp or named runner. The serving restart, and the slot it would spend in the
+    /// rolling window, wait.
+    SkipInsideFirstHealthyBudget,
 }
 
 /// How long a runner's API has been silent, for the serving threshold: since its
@@ -4601,6 +4608,34 @@ pub(crate) fn serving_silence_secs(
         }
         _ => 0,
     }
+}
+
+/// Whether the first-healthy budget still covers this runner's boot: it has not
+/// answered during this spawn, and either that spawn is younger than the budget or a
+/// first-healthy watchdog is still tracking it (`watchdog_tracks_spawn`, the marker of
+/// [`FirstHealthyTracking`]). Pure; the serving decision takes the answer.
+///
+/// `UnresponsiveSince` carries a previous boot's answer into a respawn from its first
+/// tick, so the serving silence counts from the spawn ([`serving_silence_secs`]) and
+/// nothing else compared it with the budget. With the budget above the serving
+/// threshold, the serving restart would take a runner still inside its boot, and spend
+/// one of the window's restarts, before the first-healthy watchdog had ruled on it.
+pub(crate) fn first_healthy_owns_boot(
+    liveness: crate::state::RunnerLiveness,
+    started_at: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+    budget_secs: u64,
+    watchdog_tracks_spawn: bool,
+) -> bool {
+    let crate::state::RunnerLiveness::UnresponsiveSince(at) = liveness else {
+        return false;
+    };
+    if answered_during_spawn(Some(at), started_at) {
+        return false;
+    }
+    let budget = i64::try_from(budget_secs).unwrap_or(i64::MAX);
+    watchdog_tracks_spawn
+        || started_at.is_some_and(|started| (now - started).num_seconds() < budget)
 }
 
 /// How long a runner that has NEVER answered during this boot has been silent:
@@ -4749,6 +4784,10 @@ pub async fn maybe_alert_prebind_hang(state: &SharedState, managed: &Arc<Managed
 /// `silent_for_secs` is [`serving_silence_secs`] — **never a tick count.** The
 /// health-cache loop is not 2 s per tick when `health_cache_notify` fires an
 /// immediate refresh.
+///
+/// `boot_in_first_healthy_budget` is [`first_healthy_owns_boot`]. It sits just before
+/// the loop guard, so a boot the first-healthy budget still covers neither restarts nor
+/// disarms the arm.
 #[allow(clippy::too_many_arguments)]
 pub fn decide_serving_restart(
     liveness: crate::state::RunnerLiveness,
@@ -4761,6 +4800,7 @@ pub fn decide_serving_restart(
     globally_armed: bool,
     per_runner_enabled: bool,
     already_disarmed: bool,
+    boot_in_first_healthy_budget: bool,
     restarts_in_window: usize,
 ) -> ServingRestartDecision {
     if !matches!(liveness, crate::state::RunnerLiveness::UnresponsiveSince(_)) {
@@ -4786,6 +4826,9 @@ pub fn decide_serving_restart(
     }
     if already_disarmed {
         return ServingRestartDecision::SkipDisarmed;
+    }
+    if boot_in_first_healthy_budget {
+        return ServingRestartDecision::SkipInsideFirstHealthyBudget;
     }
     if restarts_in_window >= SERVING_RESTART_MAX_PER_WINDOW {
         return ServingRestartDecision::Disarm;
@@ -4917,15 +4960,13 @@ async fn alert_first_healthy_kill(
 /// flag the health cache lowered, would otherwise wait for the 330 s tick. A stop that
 /// has latched is ending this spawn anyway. The once-past-the-budget alert is marked
 /// per spawn on `WatchdogState::never_answered_alerted_spawn`, so it does not repeat.
-/// Residual: "tracked" is read as `running && pid.is_some()`, a proxy that outlives the
-/// watchdog after a failed kill or once the watchdog saw an answer first, so such a
-/// spawn's once-past-the-budget alert can wait for the loop's ~330 s cadence instead.
-#[allow(clippy::too_many_arguments)]
+/// "Tracked" is read off the watchdog's own marker
+/// ([`crate::state::WatchdogState::first_healthy_tracks`], held by
+/// [`FirstHealthyTracking`]), so a watchdog that has exited by a kill that failed, or by
+/// an answer it saw before the health cache did, no longer holds the alert back.
 async fn never_answered_alert_goes_out(
     managed: &ManagedRunner,
     adopted: bool,
-    running: bool,
-    pid: Option<u32>,
     started_at: Option<chrono::DateTime<chrono::Utc>>,
     stop_requested: bool,
     should_alert: bool,
@@ -4937,14 +4978,15 @@ async fn never_answered_alert_goes_out(
         now,
         Duration::from_secs(first_healthy_timeout_secs()),
     );
-    let watchdog_tracks_it = running && pid.is_some();
-    let first_past_the_budget =
-        due && !adopted && started_at.is_some() && !watchdog_tracks_it && !stop_requested && {
-            let mut watchdog = managed.watchdog.write().await;
-            let first = watchdog.never_answered_alerted_spawn != started_at;
+    let first_past_the_budget = due && !adopted && started_at.is_some() && !stop_requested && {
+        let mut watchdog = managed.watchdog.write().await;
+        let first = !watchdog.first_healthy_tracks(started_at)
+            && watchdog.never_answered_alerted_spawn != started_at;
+        if first {
             watchdog.never_answered_alerted_spawn = started_at;
-            first
-        };
+        }
+        first
+    };
     due && (should_alert || first_past_the_budget)
 }
 
@@ -4987,15 +5029,9 @@ pub async fn maybe_serving_restart(
     let kind = managed.config.kind();
     let now = chrono::Utc::now();
 
-    let (running, pid, started_at, stop_requested, restart_requested) = {
+    let (pid, started_at, stop_requested, restart_requested) = {
         let r = managed.runner.read().await;
-        (
-            r.running,
-            r.pid,
-            r.started_at,
-            r.stop_requested,
-            r.restart_requested,
-        )
+        (r.pid, r.started_at, r.stop_requested, r.restart_requested)
     };
     let silent_for_secs = serving_silence_secs(liveness, started_at, now);
     let adopted = runner_is_adopted(pid, &*managed.recent_spawns.read().await);
@@ -5010,8 +5046,6 @@ pub async fn maybe_serving_restart(
         if never_answered_alert_goes_out(
             managed,
             adopted,
-            running,
-            pid,
             started_at,
             stop_requested,
             should_alert,
@@ -5069,17 +5103,15 @@ pub async fn maybe_serving_restart(
     // A respawn that has never answered reads `UnresponsiveSince`, not `Unknown`,
     // because the previous boot's stamp survives the restart. Alert on it the
     // way the branch above does, inside the same first-healthy budget, and then
-    // let the decision below run unchanged: the serving restart on a zero census
-    // past the threshold, counted from this spawn's start, is the recovery path
-    // for a boot that holds its port and hangs. A respawn is a spawn this
+    // let the decision below run: the serving restart on a zero census past the
+    // threshold, counted from this spawn's start and not before the first-healthy
+    // budget is out, is the recovery path for a boot that holds its port and hangs. A respawn is a spawn this
     // supervisor made, so it is never treated as adopted here.
     if let crate::state::RunnerLiveness::UnresponsiveSince(at) = liveness {
         if !answered_during_spawn(Some(at), started_at)
             && never_answered_alert_goes_out(
                 managed,
                 false,
-                running,
-                pid,
                 started_at,
                 stop_requested,
                 should_alert,
@@ -5131,6 +5163,13 @@ pub async fn maybe_serving_restart(
             globally_armed,
             wd.enabled,
             wd.serving_disabled_reason.is_some(),
+            first_healthy_owns_boot(
+                liveness,
+                started_at,
+                now,
+                first_healthy_timeout_secs(),
+                wd.first_healthy_tracks(started_at),
+            ),
             wd.serving_history.len(),
         );
         match decision {
@@ -5446,6 +5485,11 @@ pub(crate) fn serving_decision_clause(decision: Option<ServingRestartDecision>) 
         }
         Some(ServingRestartDecision::SkipDisarmed) => {
             "Not restarting: the serving watchdog disarmed itself earlier".to_string()
+        }
+        Some(ServingRestartDecision::SkipInsideFirstHealthyBudget) => {
+            "Not restarting yet: this spawn has not answered and is still inside the \
+             first-healthy budget, or its first-healthy watchdog still tracks it"
+                .to_string()
         }
     }
 }
@@ -5940,12 +5984,85 @@ async fn maybe_crash_restart(
 /// the budget. So such a runner is not killed here, and what follows depends on its
 /// port. CLAUDE.md's "First-healthy watchdog" states the three cases. A temp or named
 /// runner's `running` is latched at spawn, so the kill applies to those.
-async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pid: u32) {
-    let timeout_secs = first_healthy_timeout_secs();
+async fn watch_first_healthy(
+    state: SharedState,
+    managed: Arc<ManagedRunner>,
+    pid: u32,
+    spawned_at: chrono::DateTime<chrono::Utc>,
+) {
+    watch_first_healthy_with(
+        state,
+        managed,
+        pid,
+        spawned_at,
+        first_healthy_timeout_secs(),
+        Duration::from_secs(FIRST_HEALTHY_POLL_INTERVAL_SECS),
+        crate::process::port::is_runner_responding,
+        crate::process::proc_kill::kill_by_pid_tree,
+    )
+    .await;
+}
+
+/// Marks one spawn as tracked by a first-healthy watchdog for as long as it lives,
+/// on [`crate::state::WatchdogState::first_healthy_tracked_spawn`].
+///
+/// "Tracked" has to mean the watchdog is still there, which `running && pid.is_some()`
+/// does not: that outlives the watchdog after a kill that failed and after an answer
+/// the watchdog saw before the health cache did. `Drop` clears the marker on every way
+/// out of the watchdog, a panic included, and only if it still names this spawn, so a
+/// newer spawn's watchdog that has already set its own is left alone.
+struct FirstHealthyTracking {
+    slot: Arc<std::sync::Mutex<Option<chrono::DateTime<chrono::Utc>>>>,
+    spawned_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl FirstHealthyTracking {
+    async fn begin(managed: &ManagedRunner, spawned_at: chrono::DateTime<chrono::Utc>) -> Self {
+        let slot = managed
+            .watchdog
+            .read()
+            .await
+            .first_healthy_tracked_spawn
+            .clone();
+        *slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(spawned_at);
+        Self { slot, spawned_at }
+    }
+}
+
+impl Drop for FirstHealthyTracking {
+    fn drop(&mut self) {
+        let mut tracked = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *tracked == Some(self.spawned_at) {
+            *tracked = None;
+        }
+    }
+}
+
+/// [`watch_first_healthy`] with its timing, its health probe and its kill passed in,
+/// so a test can drive every way out of it without a real process, port or budget.
+#[allow(clippy::too_many_arguments)]
+async fn watch_first_healthy_with<P, PF, K, KF>(
+    state: SharedState,
+    managed: Arc<ManagedRunner>,
+    pid: u32,
+    spawned_at: chrono::DateTime<chrono::Utc>,
+    timeout_secs: u64,
+    poll: Duration,
+    probe: P,
+    kill: K,
+) where
+    P: Fn(u16) -> PF,
+    PF: std::future::Future<Output = bool>,
+    K: Fn(u32) -> KF,
+    KF: std::future::Future<Output = anyhow::Result<bool>>,
+{
+    let _tracking = FirstHealthyTracking::begin(&managed, spawned_at).await;
     let runner_name = managed.config.name.clone();
     let port = managed.config.port;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let poll = Duration::from_secs(FIRST_HEALTHY_POLL_INTERVAL_SECS);
 
     loop {
         let still_tracked = {
@@ -5953,7 +6070,7 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
             runner.pid == Some(pid) && runner.running
         };
         let api_responding = if still_tracked {
-            crate::process::port::is_runner_responding(port).await
+            probe(port).await
         } else {
             false
         };
@@ -5998,7 +6115,7 @@ async fn watch_first_healthy(state: SharedState, managed: Arc<ManagedRunner>, pi
 
                 // Tree-kill so the wedged runner's child processes release the
                 // port too — cross-platform via the proc_kill facade.
-                match crate::process::proc_kill::kill_by_pid_tree(pid).await {
+                match kill(pid).await {
                     Ok(true) => {
                         info!(
                             "First-healthy watchdog killed wedged runner '{}' PID {}",

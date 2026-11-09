@@ -1113,6 +1113,12 @@ pub struct WatchdogState {
     /// for on passing the first-healthy budget, so that alert fires once there and
     /// then keeps the escalation loop's slower cadence. Alert bookkeeping only.
     pub never_answered_alerted_spawn: Option<DateTime<Utc>>,
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right now,
+    /// set when `watch_first_healthy` starts and cleared on every way out of it, a
+    /// panic included, by `FirstHealthyTracking`'s `Drop`. A sync mutex behind an
+    /// `Arc` so that `Drop` can clear it without awaiting this struct's lock. Read
+    /// with [`Self::first_healthy_tracks`]. Alert and restart bookkeeping only.
+    pub first_healthy_tracked_spawn: std::sync::Arc<std::sync::Mutex<Option<DateTime<Utc>>>>,
 }
 
 pub struct BuildState {
@@ -2292,7 +2298,19 @@ impl WatchdogState {
             serving_restart_in_flight: false,
             last_prebind_alert: None,
             never_answered_alerted_spawn: None,
+            first_healthy_tracked_spawn: Default::default(),
         }
+    }
+
+    /// Whether a first-healthy watchdog is tracking the spawn that started at
+    /// `started_at`. False for no recorded start, and for a marker naming another
+    /// spawn.
+    pub fn first_healthy_tracks(&self, started_at: Option<DateTime<Utc>>) -> bool {
+        let tracked = *self
+            .first_healthy_tracked_spawn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        started_at.is_some() && tracked == started_at
     }
 
     /// Clear BOTH arms' counters and disarm reasons — what

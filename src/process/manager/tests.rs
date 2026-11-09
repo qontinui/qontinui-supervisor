@@ -995,6 +995,7 @@ fn serving_restart_fires_on_a_wedge_past_the_threshold() {
             true,
             true,
             false,
+            false,
             0
         ),
         ServingRestartDecision::Restart { attempt: 1 }
@@ -1011,6 +1012,7 @@ fn serving_restart_fires_on_a_wedge_past_the_threshold() {
             false,
             true,
             true,
+            false,
             false,
             2
         ),
@@ -1068,7 +1070,8 @@ fn serving_restart_decision_table() {
              disarmed,
              window| {
         decide_serving_restart(
-            liveness, silent, 300, kind, stop, restart, in_flight, armed, enabled, disarmed, window,
+            liveness, silent, 300, kind, stop, restart, in_flight, armed, enabled, disarmed, false,
+            window,
         )
     };
 
@@ -5678,6 +5681,13 @@ async fn a_spawn_something_else_answers_for_does_not_alert_on_passing_its_budget
         runner.pid = Some(4242);
         runner.started_at = Some(spawned_at);
     }
+    *managed
+        .watchdog
+        .read()
+        .await
+        .first_healthy_tracked_spawn
+        .lock()
+        .unwrap() = Some(spawned_at);
     maybe_serving_restart(
         &state,
         &managed,
@@ -5687,6 +5697,13 @@ async fn a_spawn_something_else_answers_for_does_not_alert_on_passing_its_budget
     .await;
     assert_eq!(serving_events(&state).await, [], "the watchdog tracks it");
 
+    *managed
+        .watchdog
+        .read()
+        .await
+        .first_healthy_tracked_spawn
+        .lock()
+        .unwrap() = None;
     {
         let mut runner = managed.runner.write().await;
         runner.running = false;
@@ -6278,11 +6295,20 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
     );
     scan(
         &["process", "manager.rs"],
-        "async fn watch_first_healthy(",
+        "async fn watch_first_healthy_with<",
         &[
-            "kill_by_pid_tree(pid)",
+            "FirstHealthyTracking::begin(",
+            "kill(pid)",
             "Ok(true)=>{",
             "alert_first_healthy_kill(&state,&managed,pid,timeout_secs).await;",
+        ],
+    );
+    scan(
+        &["process", "manager.rs"],
+        "async fn watch_first_healthy(",
+        &[
+            "crate::process::port::is_runner_responding,",
+            "crate::process::proc_kill::kill_by_pid_tree,",
         ],
     );
     scan(
@@ -8785,5 +8811,420 @@ fn a_serving_restart_refused_at_shutdown_is_a_refunded_skip() {
     assert!(
         skip < failed,
         "the skip arm comes before the catch-all failure arm"
+    );
+}
+
+// =========================================================================
+// Phase 4: "a first-healthy watchdog tracks this spawn" reads the watchdog
+// =========================================================================
+
+/// The spawn a first-healthy watchdog is tracking on `managed`, as its marker says.
+fn first_healthy_marker(managed: &ManagedRunner) -> Option<chrono::DateTime<chrono::Utc>> {
+    let watchdog = managed
+        .watchdog
+        .try_read()
+        .expect("no writer holds the watchdog lock");
+    let tracked = *watchdog.first_healthy_tracked_spawn.lock().unwrap();
+    tracked
+}
+
+/// A primary alive on a spawn that started past its first-healthy budget, as
+/// `running` and `pid` report it, and the `started_at` of that spawn.
+async fn primary_alive_past_its_budget() -> (
+    SharedState,
+    tempfile::TempDir,
+    Arc<ManagedRunner>,
+    chrono::DateTime<chrono::Utc>,
+) {
+    let (state, root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let spawned_at =
+        chrono::Utc::now() - chrono::Duration::seconds(first_healthy_timeout_secs() as i64 + 1);
+    managed
+        .recent_spawns
+        .write()
+        .await
+        .push(crate::state::SpawnMarker::new(
+            spawned_at,
+            Some(4242),
+            None,
+            None,
+        ));
+    {
+        let mut runner = managed.runner.write().await;
+        runner.running = true;
+        runner.pid = Some(4242);
+        runner.started_at = Some(spawned_at);
+    }
+    (state, root, managed, spawned_at)
+}
+
+async fn never_answered_alerts(state: &SharedState) -> usize {
+    serving_events(state)
+        .await
+        .into_iter()
+        .filter(|event| *event == crate::diagnostics::ServingEvent::NeverAnsweredSinceSpawn)
+        .count()
+}
+
+/// The watchdog sets its marker when it starts and clears it on every way out of it:
+/// an answer it saw first, a kill that failed, a kill that found nothing, a spawn that
+/// moved on, and a panic. Each of those leaves the process alive or gone with nothing
+/// else to say the watchdog is over, which is what `running && pid.is_some()` read as
+/// "still tracked".
+#[tokio::test]
+async fn the_first_healthy_watchdog_marks_its_spawn_and_clears_it_on_every_way_out() {
+    #[derive(Clone, Copy, Debug)]
+    enum Exit {
+        AnswerSeenFirst,
+        KillFailed,
+        KillFoundNothing,
+        SpawnMoved,
+        KillPanicked,
+    }
+    for exit in [
+        Exit::AnswerSeenFirst,
+        Exit::KillFailed,
+        Exit::KillFoundNothing,
+        Exit::SpawnMoved,
+        Exit::KillPanicked,
+    ] {
+        let (state, _root, managed, spawned_at) = primary_alive_past_its_budget().await;
+        assert_eq!(first_healthy_marker(&managed), None, "{exit:?}: before");
+
+        // Wait until the budget is out only for the exits that need the kill; the
+        // others must be on a tick that reads `Wait` until the test releases them.
+        let budget_secs = match exit {
+            Exit::KillFailed | Exit::KillFoundNothing | Exit::KillPanicked => 0,
+            _ => 3600,
+        };
+        let answers = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watchdog = {
+            let (state, managed, answers) = (state.clone(), managed.clone(), answers.clone());
+            tokio::spawn(async move {
+                watch_first_healthy_with(
+                    state,
+                    managed,
+                    4242,
+                    spawned_at,
+                    budget_secs,
+                    Duration::from_millis(5),
+                    move |_port| {
+                        let answers = answers.clone();
+                        async move { answers.load(std::sync::atomic::Ordering::SeqCst) }
+                    },
+                    move |_pid| async move {
+                        match exit {
+                            Exit::KillFailed => Err(anyhow::anyhow!("the kill failed")),
+                            Exit::KillPanicked => panic!("the kill panicked"),
+                            _ => Ok(false),
+                        }
+                    },
+                )
+                .await;
+            })
+        };
+
+        if matches!(exit, Exit::AnswerSeenFirst | Exit::SpawnMoved) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while first_healthy_marker(&managed) != Some(spawned_at) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{exit:?}: the watchdog never marked its spawn"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            match exit {
+                Exit::AnswerSeenFirst => answers.store(true, std::sync::atomic::Ordering::SeqCst),
+                _ => managed.runner.write().await.pid = Some(9999),
+            }
+        }
+
+        let joined = tokio::time::timeout(Duration::from_secs(20), watchdog)
+            .await
+            .expect("the watchdog ended");
+        assert_eq!(
+            joined.is_err(),
+            matches!(exit, Exit::KillPanicked),
+            "{exit:?}: only the panicking kill ends the task in a panic"
+        );
+        assert_eq!(first_healthy_marker(&managed), None, "{exit:?}: after");
+    }
+}
+
+/// A watchdog's marker is cleared only by the watchdog that set it. An older spawn's
+/// watchdog that ends after a newer one began leaves the newer one's marker.
+#[tokio::test]
+async fn an_older_watchdog_ending_leaves_a_newer_spawns_marker() {
+    let (state, _root) = restart_test_state();
+    let managed = register_dead_primary(&state).await;
+    let older = chrono::Utc::now() - chrono::Duration::seconds(100);
+    let newer = chrono::Utc::now();
+
+    let older_tracking = FirstHealthyTracking::begin(&managed, older).await;
+    let newer_tracking = FirstHealthyTracking::begin(&managed, newer).await;
+    assert_eq!(first_healthy_marker(&managed), Some(newer));
+    drop(older_tracking);
+    assert_eq!(
+        first_healthy_marker(&managed),
+        Some(newer),
+        "the older spawn's watchdog cleared the newer one's marker"
+    );
+    drop(newer_tracking);
+    assert_eq!(first_healthy_marker(&managed), None);
+}
+
+/// The once-past-the-budget alert goes out for a spawn whose watchdog has let go while
+/// the process lives on, by a kill that failed and by an answer it saw before the
+/// health cache did. It does not repeat inside the loop's cadence.
+#[tokio::test]
+async fn a_spawn_whose_watchdog_let_go_alerts_on_its_first_tick_past_the_budget() {
+    for answer_seen_first in [false, true] {
+        let (state, _root, managed, spawned_at) = primary_alive_past_its_budget().await;
+        watch_first_healthy_with(
+            state.clone(),
+            managed.clone(),
+            4242,
+            spawned_at,
+            if answer_seen_first { 3600 } else { 0 },
+            Duration::from_millis(5),
+            move |_port| async move { answer_seen_first },
+            |_pid| async { Err(anyhow::anyhow!("the kill failed")) },
+        )
+        .await;
+        // `running` and `pid` still read as a live spawn: only the marker differs.
+        assert!(managed.runner.read().await.running);
+        assert_eq!(managed.runner.read().await.pid, Some(4242));
+
+        for _ in 0..2 {
+            maybe_serving_restart(
+                &state,
+                &managed,
+                crate::state::RunnerLiveness::Unknown,
+                false,
+            )
+            .await;
+        }
+        assert_eq!(
+            never_answered_alerts(&state).await,
+            1,
+            "answer_seen_first={answer_seen_first}"
+        );
+    }
+}
+
+// =========================================================================
+// Phase 5: the serving restart waits out a respawn's first-healthy budget
+// =========================================================================
+
+/// Who owns a boot: only a spawn that has not answered, and only while it is younger
+/// than the budget or its watchdog still tracks it.
+#[test]
+fn the_first_healthy_watchdog_owns_a_boot_until_it_lets_go() {
+    use crate::state::RunnerLiveness::{Responding, Stopped, Unknown, UnresponsiveSince};
+    let now = chrono::Utc::now();
+    let ago = |secs: i64| now - chrono::Duration::seconds(secs);
+    let earlier_boot = UnresponsiveSince(ago(86_400));
+    for (liveness, started_at, tracked, owns, row) in [
+        (
+            earlier_boot,
+            Some(ago(30)),
+            false,
+            true,
+            "inside the budget",
+        ),
+        (earlier_boot, Some(ago(89)), false, true, "a second short"),
+        (earlier_boot, Some(ago(90)), false, false, "at the budget"),
+        (
+            earlier_boot,
+            Some(ago(600)),
+            false,
+            false,
+            "past the budget",
+        ),
+        (
+            earlier_boot,
+            Some(ago(600)),
+            true,
+            true,
+            "past it but tracked",
+        ),
+        (earlier_boot, None, false, false, "no spawn recorded"),
+        (
+            UnresponsiveSince(ago(10)),
+            Some(ago(30)),
+            true,
+            false,
+            "answered this spawn",
+        ),
+        (Responding, Some(ago(30)), true, false, "responding"),
+        (Unknown, Some(ago(30)), true, false, "never answered"),
+        (Stopped, Some(ago(30)), true, false, "stopped"),
+    ] {
+        assert_eq!(
+            first_healthy_owns_boot(liveness, started_at, now, 90, tracked),
+            owns,
+            "{row}"
+        );
+    }
+}
+
+/// With the budget raised above the serving threshold, a respawn inside its budget
+/// has been silent past the threshold by its own clock, and the decision must still
+/// skip it. One past the budget restarts. The skip comes before the loop guard, so a
+/// boot the watchdog owns does not disarm the arm either.
+#[test]
+fn a_respawn_inside_its_budget_is_not_restarted_and_one_past_it_is() {
+    let now = chrono::Utc::now();
+    let ago = |secs: i64| now - chrono::Duration::seconds(secs);
+    let (threshold, budget) = (300_u64, 600_u64);
+    let earlier_boot = RunnerLiveness::UnresponsiveSince(ago(86_400));
+    for (started_ago, tracked, window, expected) in [
+        (
+            350,
+            false,
+            0,
+            ServingRestartDecision::SkipInsideFirstHealthyBudget,
+        ),
+        (
+            350,
+            false,
+            SERVING_RESTART_MAX_PER_WINDOW,
+            ServingRestartDecision::SkipInsideFirstHealthyBudget,
+        ),
+        (
+            601,
+            true,
+            0,
+            ServingRestartDecision::SkipInsideFirstHealthyBudget,
+        ),
+        (
+            601,
+            false,
+            0,
+            ServingRestartDecision::Restart { attempt: 1 },
+        ),
+        (
+            601,
+            false,
+            SERVING_RESTART_MAX_PER_WINDOW,
+            ServingRestartDecision::Disarm,
+        ),
+    ] {
+        let started_at = Some(ago(started_ago));
+        let silent = serving_silence_secs(earlier_boot, started_at, now);
+        assert_eq!(
+            silent, started_ago as u64,
+            "the silence counts from the spawn"
+        );
+        let owns = first_healthy_owns_boot(earlier_boot, started_at, now, budget, tracked);
+        assert_eq!(
+            decide_serving_restart(
+                earlier_boot,
+                silent,
+                threshold,
+                &primary_kind(),
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                owns,
+                window
+            ),
+            expected,
+            "started {started_ago}s ago, tracked={tracked}, window={window}"
+        );
+    }
+}
+
+/// The tick reads the marker: a respawn past the threshold whose first-healthy
+/// watchdog still tracks it is skipped, and no restart is spent from the window.
+#[tokio::test]
+async fn the_serving_tick_defers_to_a_first_healthy_watchdog_that_tracks_the_spawn() {
+    assert!(
+        !serving_restart_env_disabled(),
+        "QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1 leaves this test nothing to observe"
+    );
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.watchdog_enabled_at_start = true;
+    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let managed = register_dead_primary(&state).await;
+    managed.watchdog.write().await.enabled = true;
+
+    let previous_boot = chrono::Utc::now() - chrono::Duration::days(2);
+    let started_at = chrono::Utc::now()
+        - chrono::Duration::seconds(crate::config::serving_restart_after_secs() as i64 + 60);
+    {
+        let mut runner = managed.runner.write().await;
+        runner.last_seen_responding_at = Some(previous_boot);
+        runner.started_at = Some(started_at);
+    }
+    *managed
+        .watchdog
+        .read()
+        .await
+        .first_healthy_tracked_spawn
+        .lock()
+        .unwrap() = Some(started_at);
+
+    let decision = maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::UnresponsiveSince(previous_boot),
+        false,
+    )
+    .await;
+
+    assert_eq!(
+        decision,
+        Some(ServingRestartDecision::SkipInsideFirstHealthyBudget)
+    );
+    let watchdog = managed.watchdog.read().await;
+    assert_eq!(watchdog.serving_restart_attempts, 0);
+    assert!(watchdog.serving_history.is_empty());
+    assert!(!watchdog.serving_restart_in_flight);
+}
+
+/// The tick's call into the budget rule: a respawn past the serving threshold, with
+/// no first-healthy watchdog tracking it and a spawn older than the budget, restarts.
+/// With `started_at` and `now` swapped at the call site the rule would hold every
+/// unanswered respawn for good.
+#[tokio::test]
+async fn the_serving_tick_restarts_a_respawn_past_its_budget_that_nothing_tracks() {
+    assert!(
+        !serving_restart_env_disabled(),
+        "QONTINUI_SUPERVISOR_NO_SERVING_RESTART=1 leaves this test nothing to observe"
+    );
+    let (mut config, _root) = crate::config::config_over_an_empty_runner_tree();
+    config.watchdog_enabled_at_start = true;
+    let state: SharedState = Arc::new(crate::state::SupervisorState::new(config));
+    let managed = register_dead_primary(&state).await;
+    managed.watchdog.write().await.enabled = true;
+
+    let previous_boot = chrono::Utc::now() - chrono::Duration::days(2);
+    let started_at = chrono::Utc::now()
+        - chrono::Duration::seconds(
+            crate::config::serving_restart_after_secs().max(first_healthy_timeout_secs()) as i64
+                + 60,
+        );
+    {
+        let mut runner = managed.runner.write().await;
+        runner.last_seen_responding_at = Some(previous_boot);
+        runner.started_at = Some(started_at);
+    }
+
+    let decision = maybe_serving_restart(
+        &state,
+        &managed,
+        crate::state::RunnerLiveness::UnresponsiveSince(previous_boot),
+        false,
+    )
+    .await;
+
+    assert_eq!(
+        decision,
+        Some(ServingRestartDecision::Restart { attempt: 1 })
     );
 }
