@@ -1040,8 +1040,8 @@ expectations GET at every mint and the snapshot POST resolve it through
 cleartext non-loopback base gets no token) and then remembers, in one process-global
 slot keyed on the sources asked, what the cascade last found:
 
-- **a token** is reused while its `exp` is more than `EXPIRY_SKEW_SECS` (60 s) away; a
-  token with no readable `exp` is used once and not cached;
+- **a token** is reused while its `exp` is more than `EXPIRY_SKEW_SECS` (60 s) away; a token with no readable `exp`, or one already inside that skew,
+  is used once and not cached;
 - **a miss** is remembered for `NEGATIVE_BEARER_CACHE_SECS` (60 s), so a box with a
   signed-out, unpaired or wedged runner and nothing seeded pays the cascade, runner mint
   included, once a minute rather than on every action and every ingest attempt. A token
