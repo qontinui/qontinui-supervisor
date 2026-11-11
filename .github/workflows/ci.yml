@@ -37,8 +37,8 @@ jobs:
   #
   # On every run that is NOT a fork pull_request (main and merge-candidate*/**
   # pushes, workflow_dispatch, same-repo pull_requests) this job decides
-  # whether `Rust Check`,
-  # `Compose Parity`, `CI script tests` and `Frontend Check` run on the
+  # whether `Rust Check`, `Compose Parity`, `CI script tests` and
+  # `Frontend Check` run on the
   # self-hosted pool `[self-hosted, Linux, X64, ram-16g]` or on the free
   # GitHub-hosted `ubuntu-latest` floor. This file never routes a FORK
   # pull_request run, and this job is skipped on one. That alone does not keep
@@ -60,13 +60,13 @@ jobs:
   # question, and the router's SATURATED / STALLED overflow under `auto` is
   # what bounds it; the forced `self-hosted` lane gives that overflow up.
   #
-  # THE POOL, read 2026-11-03: four registrations on nawa (Debian 13),
-  # `nawa-sup-1..4`, registered to THIS repo. The org's only runner group does
-  # not admit public repos, so no other self-hosted runner can take these
-  # jobs. (That changed on 2026-11-04: the Default group now admits public
-  # repos, finding ac7f50a6, so org runners carrying the same labels can.) Each is its own systemd unit in ci-runners.slice (MemoryHigh 60 GiB,
-  # MemoryMax 64 GiB, PrivateTmp=yes, per `systemctl show`), and all four run
-  # as the host's one `runner` account, which is in no sudo group.
+  # THE POOL: four repo-scoped registrations on nawa (Debian 13),
+  # `nawa-sup-1..4` (read 2026-11-03), plus any org runner carrying the same
+  # labels: since 2026-11-04 the org's Default runner group admits public
+  # repos (finding ac7f50a6). Each nawa runner is its own systemd unit in
+  # ci-runners.slice (MemoryHigh 60 GiB, MemoryMax 64 GiB, PrivateTmp=yes, per
+  # `systemctl show`), and all four run as the host's one `runner` account,
+  # which is in no sudo group.
   #
   # WHY. The org is on GitHub Free: about 20 concurrent hosted jobs
   # org-wide, shared with every public repo's PR CI, and coord's land of a
@@ -158,8 +158,8 @@ jobs:
     # The pool on a FIRST attempt of a run that is not a fork pull_request,
     # when the lane is forced `self-hosted` or `route` said so under `auto` (its
     # `labels` output); everything else is the hosted floor: a fork
-    # pull_request, any re-run,
-    # the `hosted`/unset lane, and a `route` that produced nothing. The pool
+    # pull_request, any re-run, the `hosted`/unset lane, and a `route` that
+    # produced nothing. The pool
     # label set is spelled in nine places: this expression and the same one on
     # the three jobs below, the four `# coord-pools:` lines, and `route`'s
     # --self-hosted-labels. Change them together, because the router counts
