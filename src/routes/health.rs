@@ -224,6 +224,13 @@ pub struct WatchdogHealth {
     /// supervisor's lifetime.
     pub last_prebind_alert_at: Option<String>,
     pub last_prebind_alert_spawn_started_at: Option<String>,
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right
+    /// now, RFC3339, or `null` when none is. Live, not historical: while it names
+    /// the runner's current `started_at` and that spawn has not answered, the
+    /// serving watchdog holds its restart
+    /// (`ServingRestartDecision::SkipInsideFirstHealthyBudget`). Read from
+    /// `WatchdogState::first_healthy_tracked_spawn`.
+    pub first_healthy_tracked_spawn_started_at: Option<String>,
 }
 
 impl WatchdogHealth {
@@ -258,6 +265,9 @@ impl WatchdogHealth {
             last_prebind_alert_spawn_started_at: wd
                 .last_prebind_alert
                 .map(|(spawn, _)| spawn.to_rfc3339()),
+            first_healthy_tracked_spawn_started_at: wd
+                .first_healthy_tracked_spawn_at()
+                .map(|spawn| spawn.to_rfc3339()),
         }
     }
 
@@ -278,6 +288,7 @@ impl WatchdogHealth {
             serving_disabled_reason: None,
             last_prebind_alert_at: None,
             last_prebind_alert_spawn_started_at: None,
+            first_healthy_tracked_spawn_started_at: None,
         }
     }
 }
@@ -1575,6 +1586,7 @@ mod tests {
                 serving_disabled_reason: None,
                 last_prebind_alert_at: None,
                 last_prebind_alert_spawn_started_at: None,
+                first_healthy_tracked_spawn_started_at: None,
             },
             build: BuildHealth {
                 in_progress: false,
@@ -1910,6 +1922,32 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("last_prebind_alert_spawn_started_at"));
+    }
+
+    /// The first-healthy marker is served live: the spawn it names while set,
+    /// `null` (key present) once cleared.
+    #[test]
+    fn the_first_healthy_tracked_spawn_is_reported_while_set() {
+        let spawn = chrono::DateTime::parse_from_rfc3339("2026-11-09T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let wd = crate::state::WatchdogState::new(true);
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = Some(spawn);
+
+        let h = WatchdogHealth::from_state_with_arms(&wd, true, true);
+        assert_eq!(
+            h.first_healthy_tracked_spawn_started_at,
+            Some(spawn.to_rfc3339())
+        );
+
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = None;
+        let json =
+            serde_json::to_value(WatchdogHealth::from_state_with_arms(&wd, true, true)).unwrap();
+        assert!(json["first_healthy_tracked_spawn_started_at"].is_null());
+        assert!(json
+            .as_object()
+            .unwrap()
+            .contains_key("first_healthy_tracked_spawn_started_at"));
     }
 
     /// The serving arm is independent of the crash arm on every axis, and the

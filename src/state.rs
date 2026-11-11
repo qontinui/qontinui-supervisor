@@ -2302,15 +2302,20 @@ impl WatchdogState {
         }
     }
 
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right
+    /// now, or `None` when none is. What `GET /health` and `GET /runners` serve.
+    pub fn first_healthy_tracked_spawn_at(&self) -> Option<DateTime<Utc>> {
+        *self
+            .first_healthy_tracked_spawn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Whether a first-healthy watchdog is tracking the spawn that started at
     /// `started_at`. False for no recorded start, and for a marker naming another
     /// spawn.
     pub fn first_healthy_tracks(&self, started_at: Option<DateTime<Utc>>) -> bool {
-        let tracked = *self
-            .first_healthy_tracked_spawn
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        started_at.is_some() && tracked == started_at
+        started_at.is_some() && self.first_healthy_tracked_spawn_at() == started_at
     }
 
     /// Clear BOTH arms' counters and disarm reasons — what
