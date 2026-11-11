@@ -1610,7 +1610,7 @@ fn resolve_spawn_source_git_ref_degrades_to_project_dir_on_malformed_layout() {
     // A workspace root that can't be derived must not fail the spawn — the
     // build itself surfaces the real error. Degrade to project_dir.
     let tmp = TempDir::new().expect("tempdir");
-    let project_dir = tmp.path().join("not-a-workspace");
+    let project_dir = crate::spawn_worktree::beyond_walk_cap(tmp.path()).join("not-a-workspace");
     let (source, root) = super::resolve_spawn_source(
         &project_dir,
         &super::SpawnBuildSource::ExplicitRef("origin/main".into()),

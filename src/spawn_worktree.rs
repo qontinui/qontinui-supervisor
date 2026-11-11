@@ -102,6 +102,18 @@ pub fn find_repo_root(project_dir: &Path) -> Result<PathBuf, SupervisorError> {
 /// without devolving into "search the whole filesystem".
 const WORKSPACE_ROOT_WALK_CAP: usize = 6;
 
+/// Test-only: a directory under `base` nested deeper than
+/// [`WORKSPACE_ROOT_WALK_CAP`], so a walk from it (or from anything below it)
+/// never leaves `base`. A test that expects the walk to FAIL must start below
+/// this: otherwise the walk reaches the tempdir's own ancestors, and a host
+/// whose temp root sits beside real `qontinui-runner/` and `qontinui-schemas/`
+/// checkouts (a self-hosted CI runner's `_work/`, whose `TMPDIR` is
+/// `_work/_temp/tmp`) satisfies it there.
+#[cfg(test)]
+pub(crate) fn beyond_walk_cap(base: &Path) -> PathBuf {
+    (0..=WORKSPACE_ROOT_WALK_CAP).fold(base.to_path_buf(), |p, i| p.join(format!("pad{i}")))
+}
+
 /// Returns the workspace root: the directory that contains BOTH `qontinui-runner`
 /// AND `qontinui-schemas` (siblings under the same parent). Walks up from
 /// `project_dir`. Required so the per-ref spawn container can sit at the same
@@ -1263,7 +1275,9 @@ mod tests {
     fn derive_workspace_root_errors_on_malformed_layout() {
         // Only one of the two required siblings present — schemas missing.
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let runner_src_tauri = tmp.path().join("qontinui-runner").join("src-tauri");
+        let runner_src_tauri = beyond_walk_cap(tmp.path())
+            .join("qontinui-runner")
+            .join("src-tauri");
         std::fs::create_dir_all(&runner_src_tauri).expect("mkdir");
         let res = derive_workspace_root(&runner_src_tauri);
         let err = res.expect_err("must error when qontinui-schemas is missing");

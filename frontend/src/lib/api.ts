@@ -431,6 +431,22 @@ export interface OriginGuardWire {
   admitHostEnv: string;
 }
 
+/** `supervisor.dev_action_ingest` on `GET /health` (`IngestCounters`). */
+export interface DevActionIngestCounters {
+  /** Snapshots coord answered 2xx. */
+  delivered: number;
+  /** Retry attempts sent. */
+  retried: number;
+  /** Refused with a status a resend cannot cure; coord answered, not a drop. */
+  refused: number;
+  /** Dropped after the last retryable attempt failed. */
+  dropped_retries_exhausted: number;
+  /** Dropped because the delivery buffer was full. */
+  dropped_buffer_full: number;
+  /** Snapshots in delivery right now. */
+  pending: number;
+}
+
 export interface HealthResponse {
   status: string;
   /// Why `status` is not the plain process/API verdict, when it is not (today:
@@ -490,6 +506,12 @@ export interface HealthResponse {
      * Absent = unknown: a build can stamp its snapshots and predate this field.
      */
     attribution_epoch?: number;
+    /**
+     * Dev-action snapshot delivery counters since this supervisor process
+     * started (`dev_action::ingest::IngestCounters`). Absent = a build that
+     * predates the delivery buffer, never "zero drops".
+     */
+    dev_action_ingest?: DevActionIngestCounters;
   };
   runners?: RunnerInstanceHealth[];
   originGuard?: OriginGuardWire;

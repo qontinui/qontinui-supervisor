@@ -35,24 +35,38 @@ env:
 jobs:
   # ── Where the four Linux jobs run ───────────────────────────────────────
   #
-  # On every run that is NOT a pull_request (main and merge-candidate*/**
-  # pushes, workflow_dispatch) this job decides whether `Rust Check`,
-  # `Compose Parity`, `CI script tests` and `Frontend Check` run on the
+  # On every run that is NOT a fork pull_request (main and merge-candidate*/**
+  # pushes, workflow_dispatch, same-repo pull_requests) this job decides
+  # whether `Rust Check`, `Compose Parity`, `CI script tests` and
+  # `Frontend Check` run on the
   # self-hosted pool `[self-hosted, Linux, X64, ram-16g]` or on the free
-  # GitHub-hosted `ubuntu-latest` floor. This file never routes a pull_request
-  # run, and this job is skipped on one. That alone does not keep a fork's
-  # code off the pool: a pull_request run uses the PR's own copy of this file,
-  # so a fork could rewrite `runs-on`. What stops it is the repo's fork-PR
-  # approval policy, `all_external_contributors`: no outside contributor's run
-  # starts until a maintainer approves it. Never approve a fork run whose diff
-  # touches `.github/`.
+  # GitHub-hosted `ubuntu-latest` floor. This file never routes a FORK
+  # pull_request run, and this job is skipped on one. That alone does not keep
+  # a fork's code off the pool: a pull_request run uses the PR's own copy of
+  # this file, so a fork could rewrite `runs-on`. What stops it is the repo's
+  # fork-PR approval policy, `all_external_contributors`: no outside
+  # contributor's run starts until a maintainer approves it. Never approve a
+  # fork run whose diff touches `.github/`.
   #
-  # THE POOL, read 2026-11-03: four registrations on nawa (Debian 13),
-  # `nawa-sup-1..4`, registered to THIS repo. The org's only runner group does
-  # not admit public repos, so no other self-hosted runner can take these
-  # jobs. Each is its own systemd unit in ci-runners.slice (MemoryHigh 60 GiB,
-  # MemoryMax 64 GiB, PrivateTmp=yes, per `systemctl show`), and all four run
-  # as the host's one `runner` account, which is in no sudo group.
+  # PULL REQUESTS ROUTE TOO (2026-11-11). A same-repo pull_request routes
+  # exactly like a push: external PRs are prohibited on every qontinui repo, so
+  # a PR run executes the same code a push run would and repo visibility is not
+  # a trust boundary (decision_record self-hosted-runners-on-public-repos,
+  # amendment 2026-11-04; policy production-and-cost
+  # external-prs-are-prohibited-so-public-repo-ci-is-not-a-trust-boundary).
+  # A FORK pull_request (head repo != this repo) still goes to the floor: an
+  # optional free guard on top of the fork-PR approval policy,
+  # `all_external_contributors`, which stays. A PR backlog is a capacity
+  # question, and the router's SATURATED / STALLED overflow under `auto` is
+  # what bounds it; the forced `self-hosted` lane gives that overflow up.
+  #
+  # THE POOL: four repo-scoped registrations on nawa (Debian 13),
+  # `nawa-sup-1..4` (read 2026-11-03), plus any org runner carrying the same
+  # labels: since 2026-11-04 the org's Default runner group admits public
+  # repos (finding ac7f50a6). Each nawa runner is its own systemd unit in
+  # ci-runners.slice (MemoryHigh 60 GiB, MemoryMax 64 GiB, PrivateTmp=yes, per
+  # `systemctl show`), and all four run as the host's one `runner` account,
+  # which is in no sudo group.
   #
   # WHY. The org is on GitHub Free: about 20 concurrent hosted jobs
   # org-wide, shared with every public repo's PR CI, and coord's land of a
@@ -100,7 +114,7 @@ jobs:
   # pool), never SKIPPED, which coord's check classification would count as
   # passing. Their names are unchanged: they are the required check contexts.
   route:
-    if: ${{ github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'auto' }}
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'auto' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -135,15 +149,17 @@ jobs:
   rust-check:
     name: Rust Check
     # `route` decides where this runs (see above). `!cancelled()` is
-    # load-bearing: on a pull_request `route` is SKIPPED, and without it a job
-    # that needs a skipped job is skipped too, which would turn every required
-    # check below into `skipped` (= passing to coord) on every PR.
+    # load-bearing: on a fork pull_request or a non-`auto` lane `route` is
+    # SKIPPED, and without it a job that needs a skipped job is skipped too,
+    # which would turn every required check below into `skipped` (= passing
+    # to coord).
     needs: route
     if: ${{ !cancelled() }}
-    # The pool on a FIRST attempt of a run that is not a pull_request, when the
-    # lane is forced `self-hosted` or `route` said so under `auto` (its `labels`
-    # output); everything else is the hosted floor: a pull_request, any re-run,
-    # the `hosted`/unset lane, and a `route` that produced nothing. The pool
+    # The pool on a FIRST attempt of a run that is not a fork pull_request,
+    # when the lane is forced `self-hosted` or `route` said so under `auto` (its
+    # `labels` output); everything else is the hosted floor: a fork
+    # pull_request, any re-run, the `hosted`/unset lane, and a `route` that
+    # produced nothing. The pool
     # label set is spelled in nine places: this expression and the same one on
     # the three jobs below, the four `# coord-pools:` lines, and `route`'s
     # --self-hosted-labels. Change them together, because the router counts
@@ -154,7 +170,7 @@ jobs:
     # `systemd-run --user --scope`, peaked at 13.2 GiB of that scope's
     # memory.peak (page cache included; 4.7 GiB anonymous).
     # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
-    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     steps:
       # persist-credentials: false because no later step needs git auth, and
@@ -953,7 +969,7 @@ jobs:
     needs: route
     if: ${{ !cancelled() }}
     # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
-    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
@@ -997,7 +1013,7 @@ jobs:
     needs: route
     if: ${{ !cancelled() }}
     # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
-    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     # Enforces the supervisor-side half of the load-bearing invariant that
     # qontinui-supervisor/src/cache_key.rs::compose and
@@ -1202,7 +1218,7 @@ jobs:
     needs: route
     if: ${{ !cancelled() }}
     # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
-    runs-on: ${{ fromJSON((github.run_attempt == 1 && github.event_name != 'pull_request' && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     defaults:
       run:

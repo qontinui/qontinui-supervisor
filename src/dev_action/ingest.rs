@@ -252,9 +252,9 @@ fn rendered_numeric_len(token: &str) -> usize {
 
 /// Hold `metadata` under [`METADATA_BUDGET_BYTES`]: drop `served.predicted`
 /// rows from the tail (lowest posterior first, since the ACK is sorted) and
-/// mark `predicted_truncated`; if that is not enough, drop the
-/// `route_lkg_shadow` block, then the `served` block. A trial with less
-/// metadata beats a refused one.
+/// mark `predicted_truncated`; if that is not enough, drop the `served` block,
+/// then the `route_lkg_shadow` block. A trial with less metadata beats a
+/// refused one.
 fn fit_metadata(metadata: &mut serde_json::Map<String, serde_json::Value>) {
     while metadata_len(metadata) > METADATA_BUDGET_BYTES {
         let popped = metadata
@@ -269,19 +269,19 @@ fn fit_metadata(metadata: &mut serde_json::Map<String, serde_json::Value>) {
         if popped {
             continue;
         }
-        if metadata.remove(ROUTE_LKG_SHADOW_KEY).is_some() {
-            warn!(
-                "dev_action::ingest: dropped metadata.route_lkg_shadow to keep the snapshot's \
-                 metadata under {METADATA_BUDGET_BYTES} bytes"
-            );
-            continue;
-        }
-        // Coord-supplied strings left in `served` (its basis, a row's basis)
-        // are uncut, so the block itself goes before the trial would.
+        // No rows left to cut: what is still over is coord's uncut basis in
+        // `served`, so that block goes before the small, fixed-shape shadow.
         if metadata.remove(SERVED_KEY).is_some() {
             warn!(
                 "dev_action::ingest: dropped metadata.served to keep the snapshot's metadata \
                  under {METADATA_BUDGET_BYTES} bytes"
+            );
+            continue;
+        }
+        if metadata.remove(ROUTE_LKG_SHADOW_KEY).is_some() {
+            warn!(
+                "dev_action::ingest: dropped metadata.route_lkg_shadow to keep the snapshot's \
+                 metadata under {METADATA_BUDGET_BYTES} bytes"
             );
             continue;
         }
@@ -524,12 +524,41 @@ pub const INGEST_MAX_PENDING: usize = 64;
 /// Process-lifetime counters of snapshot delivery, served on `GET /health` as
 /// `supervisor.dev_action_ingest` ([`ingest_counters`]). Reset on supervisor
 /// restart, so read them as counts since this process started.
-static INGEST_DELIVERED: AtomicU64 = AtomicU64::new(0);
-static INGEST_RETRIED: AtomicU64 = AtomicU64::new(0);
-static INGEST_REFUSED: AtomicU64 = AtomicU64::new(0);
-static INGEST_DROPPED_RETRIES_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
-static INGEST_DROPPED_BUFFER_FULL: AtomicU64 = AtomicU64::new(0);
-static INGEST_PENDING: AtomicUsize = AtomicUsize::new(0);
+static INGEST_STATS: IngestStats = IngestStats::new();
+
+/// The live counters of one delivery buffer ([`DeliveryBuffer::stats`]).
+struct IngestStats {
+    delivered: AtomicU64,
+    retried: AtomicU64,
+    refused: AtomicU64,
+    dropped_retries_exhausted: AtomicU64,
+    dropped_buffer_full: AtomicU64,
+    pending: AtomicUsize,
+}
+
+impl IngestStats {
+    const fn new() -> Self {
+        Self {
+            delivered: AtomicU64::new(0),
+            retried: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
+            dropped_retries_exhausted: AtomicU64::new(0),
+            dropped_buffer_full: AtomicU64::new(0),
+            pending: AtomicUsize::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> IngestCounters {
+        IngestCounters {
+            delivered: self.delivered.load(Ordering::Relaxed),
+            retried: self.retried.load(Ordering::Relaxed),
+            refused: self.refused.load(Ordering::Relaxed),
+            dropped_retries_exhausted: self.dropped_retries_exhausted.load(Ordering::Relaxed),
+            dropped_buffer_full: self.dropped_buffer_full.load(Ordering::Relaxed),
+            pending: self.pending.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// A point read of the delivery counters.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -551,26 +580,20 @@ pub struct IngestCounters {
 
 /// The delivery counters, for `GET /health`.
 pub fn ingest_counters() -> IngestCounters {
-    IngestCounters {
-        delivered: INGEST_DELIVERED.load(Ordering::Relaxed),
-        retried: INGEST_RETRIED.load(Ordering::Relaxed),
-        refused: INGEST_REFUSED.load(Ordering::Relaxed),
-        dropped_retries_exhausted: INGEST_DROPPED_RETRIES_EXHAUSTED.load(Ordering::Relaxed),
-        dropped_buffer_full: INGEST_DROPPED_BUFFER_FULL.load(Ordering::Relaxed),
-        pending: INGEST_PENDING.load(Ordering::Relaxed),
-    }
+    INGEST_STATS.snapshot()
 }
 
-/// The delivery buffer: a gauge of snapshots in delivery and its capacity.
-/// Production uses [`DELIVERY_BUFFER`]; a test can bound its own.
+/// A delivery buffer: its counters (the pending gauge among them) and its
+/// capacity. Production uses [`DELIVERY_BUFFER`]; a test bounds and counts its
+/// own, so no other test's delivery can move what it asserts.
 struct DeliveryBuffer {
-    pending: &'static AtomicUsize,
+    stats: &'static IngestStats,
     capacity: usize,
 }
 
-/// The process's delivery buffer: [`INGEST_PENDING`] under [`INGEST_MAX_PENDING`].
+/// The process's delivery buffer: [`INGEST_STATS`] under [`INGEST_MAX_PENDING`].
 const DELIVERY_BUFFER: DeliveryBuffer = DeliveryBuffer {
-    pending: &INGEST_PENDING,
+    stats: &INGEST_STATS,
     capacity: INGEST_MAX_PENDING,
 };
 
@@ -585,13 +608,14 @@ impl PendingSlot {
     fn take(buffer: &DeliveryBuffer) -> Option<Self> {
         let capacity = buffer.capacity;
         buffer
+            .stats
             .pending
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
                 (n < capacity).then_some(n + 1)
             })
             .ok()
             .map(|_| PendingSlot {
-                pending: buffer.pending,
+                pending: &buffer.stats.pending,
             })
     }
 }
@@ -637,8 +661,12 @@ fn disposition(status: Option<reqwest::StatusCode>) -> Disposition {
 /// never panics, so the attribution watcher can `tokio::spawn` it.
 ///
 /// Each attempt carries this box's coord device JWT when one resolves from
-/// `sources` (re-resolved per attempt, so a token that expired during a backoff
-/// is replaced); coord observes it and never requires it. A retryable failure
+/// `sources`, looked up per attempt through the bearer cache
+/// ([`crate::fleet::resolve_device_bearer_cached_for`]): a token near its `exp`
+/// is replaced, but a failed lookup is remembered for 60 s, so a mint that
+/// failed once (a runner restarting, say) sends the attempts in that window
+/// anonymously. Coord observes the bearer and never requires it, so that costs
+/// device attribution for the window, never the trial. A retryable failure
 /// ([`Disposition::Retry`]) is retried up to [`INGEST_MAX_ATTEMPTS`] with
 /// [`INGEST_RETRY_BACKOFF`], at most [`INGEST_MAX_PENDING`] snapshots at once;
 /// past either bound the snapshot is dropped and counted.
@@ -691,9 +719,9 @@ async fn deliver_snapshot_in<F, Fut>(
     F: Fn() -> Fut,
     Fut: std::future::Future<Output = crate::fleet::ResolvedBearer>,
 {
-    let capacity = buffer.capacity;
+    let (capacity, stats) = (buffer.capacity, buffer.stats);
     let Some(_slot) = PendingSlot::take(buffer) else {
-        INGEST_DROPPED_BUFFER_FULL.fetch_add(1, Ordering::Relaxed);
+        stats.dropped_buffer_full.fetch_add(1, Ordering::Relaxed);
         warn!(
             "dev_action::ingest: DROPPED snapshot {action_id} ({}): {capacity} \
              snapshots are already in delivery (dropped_buffer_full)",
@@ -710,7 +738,9 @@ async fn deliver_snapshot_in<F, Fut>(
         Ok(c) => c,
         Err(e) => {
             // No attempt can be made at all, so it is a drop like any other.
-            INGEST_DROPPED_RETRIES_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            stats
+                .dropped_retries_exhausted
+                .fetch_add(1, Ordering::Relaxed);
             warn!("dev_action::ingest: DROPPED snapshot {action_id}: reqwest builder failed: {e}");
             return;
         }
@@ -738,7 +768,7 @@ async fn deliver_snapshot_in<F, Fut>(
         };
         match (disposition(status), status) {
             (Disposition::Delivered, _) => {
-                INGEST_DELIVERED.fetch_add(1, Ordering::Relaxed);
+                stats.delivered.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     "dev_action::ingest: persisted snapshot {action_id} ({}) to coord \
                      (attempt {attempt})",
@@ -759,7 +789,7 @@ async fn deliver_snapshot_in<F, Fut>(
                     rekeyed = true;
                     continue;
                 }
-                INGEST_REFUSED.fetch_add(1, Ordering::Relaxed);
+                stats.refused.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     "dev_action::ingest: coord returned {status} for POST {url} \
                      (snapshot {action_id}, not retried): {detail}"
@@ -772,7 +802,9 @@ async fn deliver_snapshot_in<F, Fut>(
                     None => format!("no answer: {detail}"),
                 };
                 if attempt >= INGEST_MAX_ATTEMPTS {
-                    INGEST_DROPPED_RETRIES_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .dropped_retries_exhausted
+                        .fetch_add(1, Ordering::Relaxed);
                     warn!(
                         "dev_action::ingest: DROPPED snapshot {action_id} ({}) after \
                          {attempt} attempts (dropped_retries_exhausted); last: {what}",
@@ -787,7 +819,7 @@ async fn deliver_snapshot_in<F, Fut>(
                 );
                 tokio::time::sleep(wait).await;
                 attempt += 1;
-                INGEST_RETRIED.fetch_add(1, Ordering::Relaxed);
+                stats.retried.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -974,10 +1006,6 @@ mod tests {
         }
     }
 
-    /// The delivery counters and the pending gauge are process-global, so the
-    /// tests that assert on them run one at a time under this lock.
-    static COUNTER_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     /// Sources that resolve no bearer and read no identity.
     fn no_sources() -> crate::fleet::DeviceSources {
         crate::fleet::DeviceSources::for_access(&crate::config::AmbientCoord::Ignore)
@@ -1058,17 +1086,33 @@ mod tests {
         }
     }
 
+    /// A delivery buffer with counters of its own, so no other test's delivery
+    /// (the attribution watchers' among them) can move what a test asserts.
+    fn private_buffer(capacity: usize) -> DeliveryBuffer {
+        DeliveryBuffer {
+            stats: Box::leak(Box::new(IngestStats::new())),
+            capacity,
+        }
+    }
+
+    fn no_bearer() -> crate::fleet::ResolvedBearer {
+        (None, crate::fleet::SOURCE_NONE)
+    }
+
     /// A snapshot coord answers 503 twice is delivered on the third attempt,
     /// and every attempt carries the device bearer the resolver hands it.
     #[tokio::test]
     async fn a_transient_failure_is_retried_with_the_bearer_on_every_attempt() {
-        let _serial = COUNTER_TESTS.lock().await;
+        let buffer = private_buffer(INGEST_MAX_PENDING);
         let (base, seen) = scripted_coord(vec![503, 503, 200]).await;
         let record = restart_with_shadow();
-        let before = ingest_counters();
-        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
-            (Some("header.payload.sig".to_string()), "test")
-        })
+        deliver_snapshot_in(
+            &buffer,
+            &base,
+            record.action_id,
+            body_for(&record),
+            || async { (Some("header.payload.sig".to_string()), "test") },
+        )
         .await;
         let seen = seen.lock().expect("seen").clone();
         assert_eq!(seen.len(), 3, "two retries, then delivered: {seen:?}");
@@ -1077,10 +1121,16 @@ mod tests {
                 .all(|a| a.as_deref() == Some("Bearer header.payload.sig")),
             "{seen:?}"
         );
-        let after = ingest_counters();
-        assert_eq!(after.delivered, before.delivered + 1);
-        assert_eq!(after.retried, before.retried + 2);
-        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+        let c = buffer.stats.snapshot();
+        assert_eq!((c.delivered, c.retried, c.pending), (1, 2, 0));
+        assert_eq!(
+            (
+                c.refused,
+                c.dropped_retries_exhausted,
+                c.dropped_buffer_full
+            ),
+            (0, 0, 0)
+        );
     }
 
     /// A snapshot that never gets an answer worth keeping is sent
@@ -1088,79 +1138,72 @@ mod tests {
     /// no `Authorization` header is sent at all.
     #[tokio::test]
     async fn a_snapshot_failing_every_attempt_is_dropped_and_counted() {
-        let _serial = COUNTER_TESTS.lock().await;
+        let buffer = private_buffer(INGEST_MAX_PENDING);
         let (base, seen) = scripted_coord(vec![503]).await;
         let record = restart_with_shadow();
-        let before = ingest_counters();
-        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
-            (None, crate::fleet::SOURCE_NONE)
-        })
+        deliver_snapshot_in(
+            &buffer,
+            &base,
+            record.action_id,
+            body_for(&record),
+            || async { no_bearer() },
+        )
         .await;
         let seen = seen.lock().expect("seen").clone();
         assert_eq!(seen.len(), INGEST_MAX_ATTEMPTS as usize, "{seen:?}");
         assert!(seen.iter().all(Option::is_none), "{seen:?}");
-        let after = ingest_counters();
-        assert_eq!(
-            after.dropped_retries_exhausted,
-            before.dropped_retries_exhausted + 1
-        );
-        assert_eq!(
-            after.retried,
-            before.retried + u64::from(INGEST_MAX_ATTEMPTS - 1)
-        );
-        assert_eq!(after.delivered, before.delivered);
-        assert_eq!(after.pending, before.pending, "the buffer slot is released");
+        let c = buffer.stats.snapshot();
+        assert_eq!(c.dropped_retries_exhausted, 1);
+        assert_eq!(c.retried, u64::from(INGEST_MAX_ATTEMPTS - 1));
+        assert_eq!((c.delivered, c.pending), (0, 0));
     }
 
     /// A refused connection is retried the same way (no answer is retryable).
+    /// Port 1 never listens, so no other test's stand-in can answer it.
     #[tokio::test]
     async fn an_unreachable_coord_is_retried_then_dropped() {
-        let base = {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let base = format!("http://{}", listener.local_addr().expect("addr"));
-            drop(listener);
-            base
-        };
-        let _serial = COUNTER_TESTS.lock().await;
+        let buffer = private_buffer(INGEST_MAX_PENDING);
         let attempts = std::sync::atomic::AtomicU32::new(0);
         let record = restart_with_shadow();
-        let before = ingest_counters();
-        deliver_snapshot(&base, record.action_id, body_for(&record), || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            async { (None, crate::fleet::SOURCE_NONE) }
-        })
+        deliver_snapshot_in(
+            &buffer,
+            "http://127.0.0.1:1",
+            record.action_id,
+            body_for(&record),
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { no_bearer() }
+            },
+        )
         .await;
         assert_eq!(attempts.load(Ordering::SeqCst), INGEST_MAX_ATTEMPTS);
-        let after = ingest_counters();
+        let c = buffer.stats.snapshot();
         assert_eq!(
-            after.dropped_retries_exhausted,
-            before.dropped_retries_exhausted + 1
+            (c.dropped_retries_exhausted, c.delivered, c.pending),
+            (1, 0, 0)
         );
-        assert_eq!(after.pending, before.pending, "the buffer slot is released");
     }
 
     /// A 400 is not retried: one attempt, counted refused, not dropped.
     #[tokio::test]
     async fn a_refusal_is_sent_once_and_counted_refused() {
-        let _serial = COUNTER_TESTS.lock().await;
+        let buffer = private_buffer(INGEST_MAX_PENDING);
         let (base, seen) = scripted_coord(vec![400]).await;
         let record = restart_with_shadow();
-        let before = ingest_counters();
-        deliver_snapshot(&base, record.action_id, body_for(&record), || async {
-            (None, crate::fleet::SOURCE_NONE)
-        })
+        deliver_snapshot_in(
+            &buffer,
+            &base,
+            record.action_id,
+            body_for(&record),
+            || async { no_bearer() },
+        )
         .await;
         assert_eq!(seen.lock().expect("seen").len(), 1);
-        let after = ingest_counters();
-        assert_eq!(after.refused, before.refused + 1);
-        assert_eq!(after.retried, before.retried);
+        let c = buffer.stats.snapshot();
         assert_eq!(
-            after.dropped_retries_exhausted,
-            before.dropped_retries_exhausted
+            (c.refused, c.retried, c.dropped_retries_exhausted, c.pending),
+            (1, 0, 0, 0)
         );
-        assert_eq!(after.pending, before.pending, "the buffer slot is released");
     }
 
     /// A slot raises the pending gauge by one and its drop lowers it again; a
@@ -1168,18 +1211,12 @@ mod tests {
     /// counted, and sends nothing.
     #[tokio::test]
     async fn the_delivery_buffer_is_bounded_and_its_slots_are_released() {
-        // A buffer of its own, so filling it cannot drop another test's snapshot.
-        static GAUGE: AtomicUsize = AtomicUsize::new(0);
-        let buffer = DeliveryBuffer {
-            pending: &GAUGE,
-            capacity: 2,
-        };
-        let _serial = COUNTER_TESTS.lock().await;
-        let before = ingest_counters();
+        let buffer = private_buffer(2);
+        let pending = || buffer.stats.pending.load(Ordering::SeqCst);
         let slot = PendingSlot::take(&buffer).expect("a slot");
-        assert_eq!(GAUGE.load(Ordering::SeqCst), 1);
+        assert_eq!(pending(), 1);
         drop(slot);
-        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+        assert_eq!(pending(), 0);
 
         let held: Vec<PendingSlot> = std::iter::from_fn(|| PendingSlot::take(&buffer)).collect();
         assert_eq!(held.len(), 2);
@@ -1191,30 +1228,37 @@ mod tests {
             &base,
             record.action_id,
             body_for(&record),
-            || async { (None, crate::fleet::SOURCE_NONE) },
+            || async { no_bearer() },
         )
         .await;
         assert!(
             seen.lock().expect("seen").is_empty(),
             "a dropped snapshot is not sent"
         );
-        assert_eq!(
-            ingest_counters().dropped_buffer_full,
-            before.dropped_buffer_full + 1
-        );
+        assert_eq!(buffer.stats.snapshot().dropped_buffer_full, 1);
         drop(held);
-        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+        assert_eq!(pending(), 0);
         // A slot freed, the next delivery goes out and releases its own slot.
         deliver_snapshot_in(
             &buffer,
             &base,
             record.action_id,
             body_for(&record),
-            || async { (None, crate::fleet::SOURCE_NONE) },
+            || async { no_bearer() },
         )
         .await;
         assert_eq!(seen.lock().expect("seen").len(), 1);
-        assert_eq!(GAUGE.load(Ordering::SeqCst), 0);
+        assert_eq!(pending(), 0);
+        assert_eq!(buffer.stats.snapshot().delivered, 1);
+    }
+
+    /// `/health` reads the process's own buffer, the one production delivers
+    /// through.
+    #[test]
+    fn ingest_counters_read_the_process_buffer() {
+        assert!(std::ptr::eq(DELIVERY_BUFFER.stats, &INGEST_STATS));
+        assert_eq!(DELIVERY_BUFFER.capacity, INGEST_MAX_PENDING);
+        assert_eq!(ingest_counters(), INGEST_STATS.snapshot());
     }
 
     /// The size measure is coord's: the JSON as Postgres prints it back. The
@@ -1249,6 +1293,24 @@ mod tests {
             .expect("map")
             .clone();
         assert_eq!(metadata_len(&map), r#"{"a": 1, "b": 0.00000015}"#.len());
+    }
+
+    /// With a shadow present, an oversized coord basis costs the `served`
+    /// block only: the small shadow is S3's evidence and survives.
+    #[test]
+    fn an_oversized_basis_keeps_the_shadow() {
+        use crate::dev_action::record::ServedAtMint;
+        let mut record = restart_with_shadow();
+        record.expectations_basis = Some("b".repeat(5000));
+        record.served = Some(ServedAtMint {
+            predicted: vec![served_row("DEV-A", 0.4)],
+            route_lkg: false,
+        });
+        let json = serde_json::to_value(body_for(&record)).expect("serialize");
+        let metadata = json["metadata"].as_object().expect("object").clone();
+        assert!(metadata.get("served").is_none());
+        assert!(metadata.get("route_lkg_shadow").is_some());
+        assert!(metadata_len(&metadata) <= METADATA_BUDGET_BYTES);
     }
 
     /// A coord basis too long to fit drops the whole `served` block rather
@@ -1679,7 +1741,6 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         tokio::spawn(async move { axum::serve(listener, app).await });
 
-        let _serial = COUNTER_TESTS.lock().await;
         let record = restart_with_shadow();
         assert!(record.rekey_restart_to_lkg());
         post_snapshot_to_coord(&base, &record, &confirmed(), None, None, &no_sources()).await;
