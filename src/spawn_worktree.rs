@@ -38,7 +38,7 @@
 //! <workspace_root>/.spawn-<ref>/
 //!   qontinui-runner/             ← detached worktree at the requested ref
 //!     src-tauri/Cargo.toml       ← path = "../../qontinui-schemas/rust"
-//!   qontinui-schemas/            ← detached worktree pinned to origin/main
+//!   qontinui-schemas/            ← detached worktree at the runner's declared pin
 //!     rust/ rust-vision-core/
 //! ```
 //!
@@ -46,8 +46,24 @@
 //! now resolves to `<container>/qontinui-schemas/rust` — the pinned worktree,
 //! fully isolated from whatever branch the shared schemas checkout is on.
 //! The schemas worktree is created from the SHARED `qontinui-schemas` repo
-//! (which has the git object history) but checked out detached at
-//! `origin/main`, and re-pinned on every reuse.
+//! (which has the git object history) and checked out detached, re-pinned on
+//! every reuse.
+//!
+//! ## Which schemas commit
+//!
+//! The commit the runner tree at the requested ref DECLARES in
+//! `.github/sibling-pins.conf` (the `qontinui/qontinui-schemas <sha>` line):
+//! the pin that ref's own CI builds against, except where a coord dep-edge
+//! label pairs the ref with a schemas PR (CI then checks out the partner
+//! PR's head, which no spawn of the bare ref reproduces). Only a tree that
+//! declares no schemas pin falls back to `origin/main`. Pinning `origin/main`
+//! unconditionally broke every temp-runner and primary build of runner main
+//! whenever schemas had landed a change runner main had not yet adapted to
+//! (a schemas-leads window): 2026-11-11, schemas 6.2.0 removed four
+//! `verification` types that runner main still imported, and `spawn-test`
+//! for runner `bb421e28c` failed with four `E0425`s while the runner's own
+//! pin (`9f4f7b60`, 6.1.0) built clean. A malformed declared pin is an error,
+//! never a silent fall back to `origin/main`.
 
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
@@ -247,7 +263,8 @@ pub fn classify_drift(error: &str, container: &Path) -> Option<String> {
 ///
 /// Materializes the nested-container layout described in the module docs:
 /// a runner worktree at the requested ref plus a pinned `qontinui-schemas`
-/// worktree at `origin/main`, both under `<workspace_root>/.spawn-<ref>/`.
+/// worktree at the runner tree's declared schemas pin (else `origin/main`),
+/// both under `<workspace_root>/.spawn-<ref>/`.
 pub struct PreparedWorktree {
     /// Per-ref container dir (`<workspace_root>/.spawn-<ref>/`). Parent of
     /// both the runner and schemas worktrees. This is what cleanup removes
@@ -265,6 +282,14 @@ pub struct PreparedWorktree {
     pub requested_ref: String,
     /// `git rev-parse HEAD` of the prepared runner worktree.
     pub resolved_sha: String,
+    /// The ref the schemas worktree was pinned to: the runner tree's declared
+    /// sha, or [`SCHEMAS_PIN_REF`] when it declares none.
+    pub schemas_pin_ref: String,
+    /// True when `schemas_pin_ref` came from the runner tree's
+    /// `.github/sibling-pins.conf`; false for the `origin/main` fallback.
+    pub schemas_pin_declared: bool,
+    /// `git rev-parse HEAD` of the prepared schemas worktree.
+    pub schemas_resolved_sha: String,
 }
 
 /// A validated, caller-owned worktree the supervisor will build *as-is*.
@@ -509,9 +534,90 @@ pub async fn cleanup_fresh_worktree(
     }
 }
 
-/// Ref the pinned schemas worktree is always checked out at. Centralized so
-/// the fresh-add, reuse, and tests agree.
+/// Ref the schemas worktree is checked out at when the runner tree declares
+/// no schemas pin of its own. Centralized so the fresh-add, reuse, and tests
+/// agree.
 const SCHEMAS_PIN_REF: &str = "origin/main";
+
+/// The runner repo's sibling-pin file, relative to its root. Written by the
+/// runner's `sibling-pin-bump.yml` / `schemas-pair-follow.yml`; read by its CI.
+const SIBLING_PINS_CONF: &str = ".github/sibling-pins.conf";
+
+/// The pin-file key naming the schemas sibling.
+const SCHEMAS_PIN_KEY: &str = "qontinui/qontinui-schemas";
+
+/// Parse the `qontinui-schemas` sha out of a `sibling-pins.conf` body: one
+/// `<owner>/<repo> <sha>` pair per line, `#` starts a comment.
+///
+/// The file's header requires every parser to agree field for field, so this
+/// follows the runner's `lookup_pin` (`src-tauri/src/ci_node/sibling.rs`) and
+/// the two awks: fields split on space and tab ONLY (not NBSP or other Unicode
+/// separators), the sha must be 40 LOWERCASE hex, and a repo listed twice is
+/// ambiguous.
+///
+/// `Ok(None)`: no schemas line (the caller falls back to [`SCHEMAS_PIN_REF`]).
+/// `Err`: a schemas line CI would refuse. That is never treated as absent,
+/// because falling back to `origin/main` there would rebuild against the very
+/// commit the pin exists to avoid.
+pub fn parse_declared_schemas_pin(contents: &str) -> Result<Option<String>, String> {
+    let mut matches: Vec<(usize, Vec<&str>)> = Vec::new();
+    for (idx, raw) in contents.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        let code = line.split_once('#').map_or(line, |(before, _)| before);
+        let fields: Vec<&str> = code.split([' ', '\t']).filter(|f| !f.is_empty()).collect();
+        if fields.first().copied() == Some(SCHEMAS_PIN_KEY) {
+            matches.push((idx + 1, fields));
+        }
+    }
+    let (lineno, fields) = match matches.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        many => {
+            let lines: Vec<String> = many.iter().map(|(n, _)| n.to_string()).collect();
+            return Err(format!(
+                "lists {} {} times (lines {}); exactly one schemas commit can be pinned",
+                SCHEMAS_PIN_KEY,
+                many.len(),
+                lines.join(", ")
+            ));
+        }
+    };
+    match fields.as_slice() {
+        [_, sha]
+            if sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            Ok(Some((*sha).to_string()))
+        }
+        _ => Err(format!(
+            "line {} pins {} as {:?}: expected exactly `{} <40-character lowercase hex sha>` \
+             (trailing text must be a `#` comment)",
+            lineno,
+            SCHEMAS_PIN_KEY,
+            fields[1..].join(" "),
+            SCHEMAS_PIN_KEY
+        )),
+    }
+}
+
+/// Read the schemas pin the runner worktree declares (see
+/// [`parse_declared_schemas_pin`]). An absent pin file is `Ok(None)`.
+async fn declared_schemas_pin(runner_wt: &Path) -> Result<Option<String>, SupervisorError> {
+    let conf = runner_wt.join(SIBLING_PINS_CONF);
+    // Bytes, not `read_to_string`: the awks and `lookup_pin` accept a non-UTF-8
+    // byte in a `#` comment, and lossy decoding cannot manufacture a 40-hex sha.
+    match tokio::fs::read(&conf).await {
+        Ok(bytes) => parse_declared_schemas_pin(&String::from_utf8_lossy(&bytes))
+            .map_err(|e| SupervisorError::Process(format!("{:?}: {}", conf, e))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SupervisorError::Process(format!(
+            "failed to read the runner's sibling-pin file {:?}: {}",
+            conf, e
+        ))),
+    }
+}
 
 /// Detect a stale FLAT-layout spawn dir from before the nested-container
 /// migration. The old layout put the runner worktree's `src-tauri` directly
@@ -557,19 +663,19 @@ pub fn runner_worktree_path_for_ref(
 /// Ensure a managed, *isolated* detached worktree set for `git_ref` exists.
 /// Idempotent: a subsequent call for the same ref reuses the existing
 /// container, force-resets the runner worktree to the ref, and re-pins the
-/// schemas worktree to `origin/main`.
+/// schemas worktree to the runner tree's declared pin (else `origin/main`).
 ///
 /// Layout (see module docs for the rationale):
 ///
 /// ```text
 /// <workspace_root>/.spawn-<sanitized_ref>/   ← container
 ///   qontinui-runner/                         ← detached worktree at git_ref
-///   qontinui-schemas/                        ← detached worktree at origin/main
+///   qontinui-schemas/                        ← detached worktree at the declared pin
 /// ```
 ///
 /// The runner worktree is created from the runner repo (`repo_root`); the
 /// schemas worktree from the SHARED `<workspace_root>/qontinui-schemas` repo,
-/// pinned to `origin/main`, so the runner crate's `../../qontinui-schemas/...`
+/// pinned to the declared sha, so the runner crate's `../../qontinui-schemas/...`
 /// path-deps resolve INSIDE the container and never touch the shared
 /// checkout's working-tree branch.
 ///
@@ -628,8 +734,8 @@ pub async fn prepare_worktree(
 
     let was_fresh = !container.exists();
     if was_fresh {
-        // Fresh add: create the runner worktree at the ref and the schemas
-        // worktree pinned to origin/main. `git worktree add --detach <path>
+        // Fresh add: create the runner worktree at the ref (the schemas
+        // worktree is pinned below). `git worktree add --detach <path>
         // <ref>` creates the intermediate `<container>/` dir as needed.
         let runner_wt_str = runner_wt.to_string_lossy().to_string();
         git(
@@ -651,49 +757,71 @@ pub async fn prepare_worktree(
     }
 
     // Prepare (or re-pin) the schemas worktree. Done for BOTH fresh and reuse
-    // paths: on reuse the shared schemas checkout may have advanced, so we
-    // always fetch + force-pin the worktree to origin/main. Wrapped so a
-    // failure on the fresh path triggers full cleanup below.
+    // paths: on reuse the requested ref (and so its declared pin) or the
+    // shared schemas checkout may have moved, so we always fetch + force-pin.
+    // The pin is the schemas sha the runner tree at this ref declares in
+    // `.github/sibling-pins.conf`, else `origin/main` (module doc, "Which
+    // schemas commit"). Wrapped so a failure on the fresh path triggers full
+    // cleanup below.
     let prepare_schemas = async {
-        // Best-effort fetch on the shared schemas repo so origin/main is current.
+        let declared = declared_schemas_pin(&runner_wt).await?;
+        let pin_ref: String = declared
+            .clone()
+            .unwrap_or_else(|| SCHEMAS_PIN_REF.to_string());
+        // Best-effort fetches on the shared schemas repo (worktrees share its
+        // object store): origin/main for the fallback, and the declared sha
+        // itself, which need not be on main and may postdate the last fetch.
+        // Offline is tolerated; the checkout below fails loudly if the commit
+        // is still absent.
         git(
             &["fetch", "--quiet", "origin", "main"],
             &schemas_repo_root,
             true,
         )
         .await?;
+        if let Some(sha) = &declared {
+            git(
+                &["fetch", "--quiet", "origin", sha],
+                &schemas_repo_root,
+                true,
+            )
+            .await?;
+        }
         if !schemas_wt.exists() {
             let schemas_wt_str = schemas_wt.to_string_lossy().to_string();
             git(
-                &[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    &schemas_wt_str,
-                    SCHEMAS_PIN_REF,
-                ],
+                &["worktree", "add", "--detach", &schemas_wt_str, &pin_ref],
                 &schemas_repo_root,
                 false,
             )
             .await?;
         } else {
-            // Re-pin an existing schemas worktree to origin/main.
-            git(&["fetch", "--quiet", "origin", "main"], &schemas_wt, true).await?;
             git(
-                &["checkout", "--detach", "--force", SCHEMAS_PIN_REF],
+                &["checkout", "--detach", "--force", &pin_ref],
                 &schemas_wt,
                 false,
             )
             .await?;
-            git(&["reset", "--hard", SCHEMAS_PIN_REF], &schemas_wt, false).await?;
+            git(&["reset", "--hard", &pin_ref], &schemas_wt, false).await?;
         }
-        Ok::<(), SupervisorError>(())
+        let schemas_sha = git(&["rev-parse", "HEAD"], &schemas_wt, false).await?;
+        tracing::info!(
+            "spawn-worktree: schemas sibling pinned to {} ({}) at {}",
+            pin_ref,
+            if declared.is_some() {
+                SIBLING_PINS_CONF
+            } else {
+                "no declared pin; origin/main fallback"
+            },
+            schemas_sha
+        );
+        Ok::<(String, bool, String), SupervisorError>((pin_ref, declared.is_some(), schemas_sha))
     };
 
     // Run schemas prep + post-add validation in an inner async block so a
     // single match arm can wire cleanup-on-error for the fresh-add path.
     let finalize = async {
-        prepare_schemas.await?;
+        let (schemas_pin_ref, schemas_pin_declared, schemas_resolved_sha) = prepare_schemas.await?;
 
         let resolved_sha = git(&["rev-parse", "HEAD"], &runner_wt, false).await?;
         let src_tauri = runner_wt.join("src-tauri");
@@ -721,6 +849,9 @@ pub async fn prepare_worktree(
             schemas_path: schemas_wt.clone(),
             requested_ref: git_ref.to_string(),
             resolved_sha,
+            schemas_pin_ref,
+            schemas_pin_declared,
+            schemas_resolved_sha,
         })
     };
 
@@ -1361,6 +1492,176 @@ mod tests {
             Some(&prepared.schemas_path),
         )
         .await;
+    }
+
+    // ---------- declared schemas pin (`.github/sibling-pins.conf`) ----------
+
+    const PIN_A: &str = "9f4f7b6001f2028c2824bd591ed2ef452c140ab7";
+
+    #[test]
+    fn parse_declared_schemas_pin_reads_the_schemas_line() {
+        let conf = format!(
+            "# pins\r\nqontinui/ui-bridge      7f766ae656ea460cf848e4cae29d697062e956ee\n\n\
+             qontinui/qontinui-schemas\t{PIN_A}   # bumped by sibling-pin-bump.yml\r\n"
+        );
+        assert_eq!(
+            parse_declared_schemas_pin(&conf),
+            Ok(Some(PIN_A.to_string())),
+            "tab-separated, CRLF line ends and a trailing comment all parse"
+        );
+    }
+
+    #[test]
+    fn parse_declared_schemas_pin_absent_is_none() {
+        assert_eq!(parse_declared_schemas_pin(""), Ok(None));
+        assert_eq!(
+            parse_declared_schemas_pin(
+                "# qontinui/qontinui-schemas deadbeef\nqontinui/qontinui-web 4f5ea9f01fd103b37e6edec1f877afe641017bad\n"
+            ),
+            Ok(None),
+            "a commented-out schemas line and other repos' pins are not a schemas pin"
+        );
+        // NBSP is not a field separator (awk's FS is space/tab), so this is ONE
+        // unlisted token to CI, which floats; parity means no pin here either.
+        assert_eq!(
+            parse_declared_schemas_pin(
+                "qontinui/qontinui-schemas\u{a0}9f4f7b6001f2028c2824bd591ed2ef452c140ab7\n"
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn parse_declared_schemas_pin_refuses_a_malformed_schemas_line() {
+        for bad in [
+            "qontinui/qontinui-schemas 9f4f7b60",
+            "qontinui/qontinui-schemas main",
+            "qontinui/qontinui-schemas",
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140ab7 extra",
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140abz",
+            // Uppercase hex: git takes it, but CI's `[0-9a-f]` globs refuse it.
+            "qontinui/qontinui-schemas 9F4F7B6001F2028C2824BD591ED2EF452C140AB7",
+            // Listed twice: ambiguous.
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140ab7\n\
+             qontinui/qontinui-schemas 38258049aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = parse_declared_schemas_pin(bad).expect_err(bad);
+            assert!(err.contains("qontinui/qontinui-schemas"), "{bad}: {err}");
+        }
+    }
+
+    /// Advance the fixture's schemas `main` by one commit (and its self-origin),
+    /// returning `(old_sha, new_sha)`, so a declared pin and `origin/main` differ.
+    fn advance_schemas_main(root: &Path) -> (String, String) {
+        let schemas = root.join("qontinui-schemas");
+        let old = rev_parse_sync(&schemas, "HEAD");
+        std::fs::write(schemas.join("rust").join("lib.rs"), "pub struct Newer;\n")
+            .expect("write schemas lib.rs");
+        git_in(&schemas, &["commit", "-q", "-am", "schemas leads"]);
+        git_in(&schemas, &["fetch", "-q", "origin"]);
+        (old, rev_parse_sync(&schemas, "HEAD"))
+    }
+
+    fn rev_parse_sync(dir: &Path, rev: &str) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "rev-parse {rev} in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Commit a `.github/sibling-pins.conf` with `body` into the runner repo.
+    fn commit_runner_pin_file(root: &Path, body: &str) {
+        let runner = root.join("qontinui-runner");
+        std::fs::create_dir_all(runner.join(".github")).expect("mkdir .github");
+        std::fs::write(runner.join(SIBLING_PINS_CONF), body).expect("write pin file");
+        git_in(&runner, &["add", "-A"]);
+        git_in(&runner, &["commit", "-q", "-m", "declare sibling pins"]);
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_pins_schemas_to_the_runners_declared_sha() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let (declared, main_tip) = advance_schemas_main(&root);
+        assert_ne!(declared, main_tip);
+        commit_runner_pin_file(&root, &format!("qontinui/qontinui-schemas {declared}\n"));
+
+        let prepared = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare_worktree HEAD");
+        assert!(prepared.schemas_pin_declared);
+        assert_eq!(prepared.schemas_pin_ref, declared);
+        assert_eq!(
+            prepared.schemas_resolved_sha, declared,
+            "the schemas worktree must sit at the runner's declared pin, not origin/main ({main_tip})"
+        );
+        assert_eq!(rev_parse_sync(&prepared.schemas_path, "HEAD"), declared);
+
+        // Reuse re-pins to the declared sha too, even after the worktree moved.
+        git_in(
+            &prepared.schemas_path,
+            &["checkout", "-q", "--detach", &main_tip],
+        );
+        let again = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("second prepare (reuse)");
+        assert_eq!(again.schemas_resolved_sha, declared);
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &again.container_path,
+            &again.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&again.schemas_path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_without_a_declared_pin_falls_back_to_origin_main() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let (_old, main_tip) = advance_schemas_main(&root);
+
+        let prepared = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare_worktree HEAD");
+        assert!(!prepared.schemas_pin_declared);
+        assert_eq!(prepared.schemas_pin_ref, SCHEMAS_PIN_REF);
+        assert_eq!(prepared.schemas_resolved_sha, main_tip);
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &prepared.container_path,
+            &prepared.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&prepared.schemas_path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_refuses_a_malformed_declared_pin_and_cleans_up() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        commit_runner_pin_file(&root, "qontinui/qontinui-schemas main\n");
+
+        let err = match prepare_worktree(&src_tauri, "HEAD").await {
+            Ok(_) => panic!("a malformed declared pin must not fall back to origin/main"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("sibling-pins.conf"),
+            "error names the file: {err}"
+        );
+        let container = root.join(format!(".spawn-{}", sanitize_ref("HEAD")));
+        assert!(
+            !container.exists(),
+            "the fresh container must be cleaned up on the refusal"
+        );
     }
 
     #[tokio::test]

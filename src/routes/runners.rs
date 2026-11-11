@@ -3906,6 +3906,12 @@ async fn execute_spawn_build_inner(
     // or the DEFAULT `origin/main`: (requested_ref, resolved_sha).
     // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
     let mut git_ref_info: Option<(String, String)> = None;
+    // Set alongside `git_ref_info`: which qontinui-schemas commit the managed
+    // worktree's sibling was pinned to, and whether that pin was the runner
+    // tree's declared `.github/sibling-pins.conf` sha or the `origin/main`
+    // fallback. Surfaced as `schemas_path` / `schemas_sha` /
+    // `schemas_pin_ref` / `schemas_pin_source`.
+    let mut git_ref_schemas_info: Option<(std::path::PathBuf, String, String, bool)> = None;
     // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
     // the `cleanup_worktree_on_fail` flag to wipe the spawn container on a
     // downstream cargo failure.
@@ -4034,15 +4040,28 @@ async fn execute_spawn_build_inner(
                                 LogSource::Supervisor,
                                 LogLevel::Info,
                                 format!(
-                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} (requester={:?})",
+                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} schemas_sha={} schemas_pin={} ({}) (requester={:?})",
                                     wt.requested_ref,
                                     wt.resolved_sha,
                                     wt.worktree_path,
+                                    wt.schemas_resolved_sha,
+                                    wt.schemas_pin_ref,
+                                    if wt.schemas_pin_declared {
+                                        "declared in .github/sibling-pins.conf"
+                                    } else {
+                                        "no declared pin; origin/main fallback"
+                                    },
                                     body.requester_id
                                 ),
                             )
                             .await;
                         git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
+                        git_ref_schemas_info = Some((
+                            wt.schemas_path.clone(),
+                            wt.schemas_resolved_sha.clone(),
+                            wt.schemas_pin_ref.clone(),
+                            wt.schemas_pin_declared,
+                        ));
                         // Stash paths for the optional cleanup-on-fail branch
                         // below. `find_repo_root` walks up from the
                         // configured project_dir; if it errors here (the
@@ -5193,6 +5212,21 @@ async fn execute_spawn_build_inner(
         resp["git_ref_resolved"] = json!(requested_ref);
         resp["git_ref_resolved_sha"] = json!(resolved_sha);
         resp["git_ref_resolved_sha_short"] = json!(short);
+        // Which schemas commit the managed worktree's sibling was built
+        // against: the runner tree's declared pin, or the origin/main fallback.
+        if let Some((schemas_path, schemas_sha, pin_ref, declared)) = &git_ref_schemas_info {
+            resp["schemas_path"] = json!(schemas_path.to_string_lossy());
+            resp["schemas_sha"] = json!(schemas_sha);
+            resp["schemas_pin_ref"] = json!(pin_ref);
+            resp["schemas_pin_source"] = json!(if *declared {
+                "sibling_pins_conf"
+            } else {
+                "origin_main_fallback"
+            });
+            // The pinned sibling lives inside the spawn container, never the
+            // shared checkout — the same field the `worktree_path` arm sets.
+            resp["schemas_is_shared"] = json!(false);
+        }
         // `origin_main` for the DEFAULT path, `worktree` for an explicitly
         // requested ref — so a caller can tell "the supervisor picked merged
         // truth for me" from "I asked for this ref" without re-reading

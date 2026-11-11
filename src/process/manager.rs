@@ -7177,7 +7177,8 @@ pub async fn stop_runner_by_id(
 ///
 /// Materializes (or refreshes) a managed `origin/main` worktree via
 /// [`crate::spawn_worktree::prepare_worktree`] — which fetches origin itself and
-/// pins the `qontinui-schemas` sibling to `origin/main`, handling the
+/// pins the `qontinui-schemas` sibling to the sha the runner tree declares in
+/// `.github/sibling-pins.conf` (else schemas `origin/main`), handling the
 /// shared-path-dep-drift hazard for the primary too — then compiles its
 /// `src-tauri` with an explicit [`BuildSourceKind::OriginMain`] carrying the
 /// worktree's resolved SHA. The result is provenance-classified `origin_main`:
@@ -7192,10 +7193,19 @@ async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), Sup
         crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
 
     let msg = format!(
-        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}). \
-         This is the default Phase B path — the primary runs latest-green-main, not the working \
-         checkout. Pass from_working_tree:true to compile the live tree instead.",
-        prepared.resolved_sha, prepared.src_tauri
+        "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}, \
+         schemas_sha={} pinned to {} ({})). This is the default Phase B path — the primary runs \
+         latest-green-main, not the working checkout. Pass from_working_tree:true to compile the \
+         live tree instead.",
+        prepared.resolved_sha,
+        prepared.src_tauri,
+        prepared.schemas_resolved_sha,
+        prepared.schemas_pin_ref,
+        if prepared.schemas_pin_declared {
+            "declared in .github/sibling-pins.conf"
+        } else {
+            "no declared pin; origin/main fallback"
+        }
     );
     info!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
