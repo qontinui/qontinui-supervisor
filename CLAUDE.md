@@ -690,7 +690,7 @@ unnecessary.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/` | React SPA dashboard |
-| GET | `/health` | Comprehensive status (runners, build, expo). The top-level `runner` block and every `runners[]` row carry `liveness` / `last_seen_responding_at` / `port_open` — **read `liveness`, not `running`**, see "Liveness". `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. `supervisor.attribution_epoch` is the epoch this binary stamps on every dev-action snapshot (see "Dev-action trials"). `runner_isolation` is `{mechanism: "systemd-scope"|"unknown"|"none", reason}` — on Linux, whether user-owned runners this supervisor spawns leave its cgroup into their own transient `qontinui-runner-<id>-<ts>.scope` (`process::systemd_scope`); `unknown` until the systemd preflight has answered. It is supervisor-wide, never proof about one runner — read that runner's own `/proc/<pid>/cgroup`. |
+| GET | `/health` | Comprehensive status (runners, build, expo). The top-level `runner` block and every `runners[]` row carry `liveness` / `last_seen_responding_at` / `port_open` — **read `liveness`, not `running`**, see "Liveness". `supervisor.built_from_sha` is **the commit THIS supervisor binary was compiled from** — a bare lowercase-hex git sha (the full 40 characters for any build that read it from git; a 7-40 char unambiguous prefix is accepted only from a build-env override), or `null` when the build could not establish one (`null` = UNKNOWN, never "clean"). Stamped by `build.rs` at compile time, so it describes the running binary and not whatever the checkout says now. Feed it straight to `git merge-base --is-ancestor <fix-sha> <built_from_sha>` to answer "is the running supervisor newer than fix X?". `supervisor.built_from_dirty` (`true`/`false`/`null`) is a **separate** field so the sha never needs de-suffixing; `true` makes the sha a lower bound, and `null` means the dirtiness could not be measured at all — never "clean". Do NOT confuse it with the adjacent `buildId`, which is the **runner's** and is an ISO timestamp — and note the runner's own `/health` spells that same name as `<sha>-<epoch-ms>`. `supervisor.attribution_epoch` is the epoch this binary stamps on every dev-action snapshot, and `supervisor.dev_action_ingest` counts this process's snapshot deliveries (both: see "Dev-action trials"). `runner_isolation` is `{mechanism: "systemd-scope"|"unknown"|"none", reason}` — on Linux, whether user-owned runners this supervisor spawns leave its cgroup into their own transient `qontinui-runner-<id>-<ts>.scope` (`process::systemd_scope`); `unknown` until the systemd preflight has answered. It is supervisor-wide, never proof about one runner — read that runner's own `/proc/<pid>/cgroup`. |
 | GET | `/health/stream` | SSE stream of real-time health data |
 | POST | `/supervisor/restart` | Self-restart supervisor (user-owned runners — primary, named, external — are left running; temp runners are reaped). Spawn-and-exit: the replacement process is spawned, the shutdown is latched so in-flight handlers get a window to answer, then `std::process::exit(0)`. **Temp runners, per platform:** on Windows that exit closes the kill-on-exit JobObject handle, which reaps every **assigned** (temp) runner; off Windows the job is a no-op stub, so the one-shot shutdown sweep (`process::shutdown_sweep`, bounded ~2.5 s) stops them between the latch and the exit. The latch happens only AFTER the replacement spawn succeeds — latching first would turn a failed restart into an outage. **Refused with 409** (`SelfRestartRefused`) when this supervisor is the MAIN process of its own systemd service (how `supervisor-verbs.sh start` runs it on Linux once plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners` Phase 2 lands), or when that cannot be read: the replacement would be spawned into the same unit and killed with it. Restart such a supervisor with that verb's `stop` and then `start`. |
 
@@ -1033,6 +1033,40 @@ Any other value is passed through unchanged, so the `re-accruing` Phase 5 plans 
 reach the ACK with no change here. The field decides nothing: the risk assessment reads
 the rows themselves, so a weak basis does not stop `risk` tripping, and with no rows it
 cannot trip whatever the basis says.
+
+**Both dev-action calls to coord carry the device bearer, through one cache.** The
+expectations GET at every mint and the snapshot POST resolve it through
+`fleet::resolve_device_bearer_cached_for`, which runs the transport guard first (a
+cleartext non-loopback base gets no token) and then remembers, in one process-global
+slot keyed on the sources asked, what the cascade last found:
+
+- **a token** is reused while its `exp` is more than `EXPIRY_SKEW_SECS` (60 s) away; a token with no readable `exp`, or one already inside that skew,
+  is used once and not cached;
+- **a miss** is remembered for `NEGATIVE_BEARER_CACHE_SECS` (60 s), so a box with a
+  signed-out, unpaired or wedged runner and nothing seeded pays the cascade, runner mint
+  included, once a minute rather than on every action and every ingest attempt. A token
+  seeded or a runner paired inside that window is picked up when it ends, and a
+  snapshot whose attempts fall in it is sent anonymously. Coord observes the bearer and
+  never requires it, so that costs device attribution, never the trial.
+
+Sources that read no identity (`DeviceSources::for_access` under `At` / `Ignore`) never
+read or fill the cache. The expectations fetch gives the lookup
+`EXPECTATIONS_BEARER_BUDGET` (750 ms) and then goes anonymously. The budget publish,
+the resource sample and the serving-watchdog alert use the uncached
+`resolve_device_bearer_for`. A test that reaches the cache with identity-reading sources
+(`DeviceSources::fixture`) over an https or loopback base must hold
+`fleet::tests::BEARER_CACHE_TESTS`.
+
+**Snapshot delivery is counted on `GET /health` → `supervisor.dev_action_ingest`**
+(`ingest::ingest_counters`): `delivered` (coord answered 2xx), `retried` (retry attempts
+sent), `refused` (a 4xx other than 408 / 429; coord answered, so not a drop),
+`dropped_retries_exhausted` (after `INGEST_MAX_ATTEMPTS` = 4, backoff 5 s / 30 s /
+120 s), `dropped_buffer_full` (`INGEST_MAX_PENDING` = 64 already in delivery) and
+`pending` (in delivery now). They count since this process started, and the buffer is
+in memory: a supervisor exit loses what it holds, and no later process counts that. A
+missing key is a build that predates the buffer, not zero drops. The counters live on
+the delivery buffer (`IngestStats`), so a test delivers through a private buffer
+(`deliver_snapshot_in`) and asserts exact counts.
 
 ### Optional request bodies — `OptionalJson`, not `Option<Json<T>>`
 
