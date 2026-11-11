@@ -34,7 +34,7 @@
 //! the user: not in the taskbar, not in Alt-Tab, not painted anywhere on
 //! screen. Users who want to peek at the dashboard can restore the window
 //! manually via the supervisor's logs if they know its process — the normal
-//! interaction path remains the HTTP dashboard at `http://localhost:9875/`.
+//! interaction path remains the HTTP dashboard at `http://127.0.0.1:9875/`.
 //!
 //! # Safety / lifetime
 //!

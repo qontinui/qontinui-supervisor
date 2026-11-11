@@ -22,6 +22,7 @@ use crate::dev_action::{
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::loopback::{runner_loopback_base, runner_ui_bridge_base};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::settings;
@@ -891,7 +892,7 @@ pub async fn runners_by_unit(
         result.push(json!({
             "runner_id": managed.config.id,
             "port": port,
-            "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+            "ui_bridge_url": runner_ui_bridge_base(port),
             "git_sha": b.git_sha,
             "attempt_id": b.attempt_id,
         }));
@@ -2062,7 +2063,7 @@ pub struct SpawnTestRequest {
     /// Optional post-spawn health probe window in milliseconds.
     ///
     /// After the child process is spawned, the supervisor polls
-    /// `GET http://localhost:{port}/health` every 200ms until it succeeds or
+    /// `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
     /// this many milliseconds elapse. Defaults to 60000 (60 seconds).
     ///
     /// Set to `0` to skip the probe entirely (legacy behavior — return
@@ -3184,8 +3185,8 @@ pub async fn spawn_test(
                     "submission_id": existing_id.to_string(),
                     "id": existing.runner_id,
                     "port": existing.port,
-                    "api_url": format!("http://localhost:{}", existing.port),
-                    "ui_bridge_url": format!("http://localhost:{}/ui-bridge", existing.port),
+                    "api_url": runner_loopback_base(existing.port),
+                    "ui_bridge_url": runner_ui_bridge_base(existing.port),
                     "poll_url": format!("/build/{}/status", existing_id),
                     "message": format!(
                         "an identical spawn-test build ({}) is already in flight for this \
@@ -3429,8 +3430,8 @@ pub async fn spawn_test(
                 "status": "queued",
                 "id": id,
                 "port": port,
-                "api_url": format!("http://localhost:{}", port),
-                "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+                "api_url": runner_loopback_base(port),
+                "ui_bridge_url": runner_ui_bridge_base(port),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
                     "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
@@ -3567,7 +3568,7 @@ pub async fn spawn_test_in_flight(
                 "port": inflight.port,
                 "build_id": inflight.submission_id.to_string(),
                 "submission_id": inflight.submission_id.to_string(),
-                "api_url": format!("http://localhost:{}", inflight.port),
+                "api_url": runner_loopback_base(inflight.port),
                 "poll_url": format!("/build/{}/status", inflight.submission_id),
                 "logs_url": format!("/runners/{}/logs", inflight.runner_id),
                 "stop_url": format!("/runners/{}/stop", inflight.runner_id),
@@ -3854,13 +3855,10 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), json!(id));
         obj.insert("port".to_string(), json!(port));
-        obj.insert(
-            "api_url".to_string(),
-            json!(format!("http://localhost:{port}")),
-        );
+        obj.insert("api_url".to_string(), json!(runner_loopback_base(port)));
         obj.insert(
             "ui_bridge_url".to_string(),
-            json!(format!("http://localhost:{port}/ui-bridge")),
+            json!(runner_ui_bridge_base(port)),
         );
         obj.insert("logs_url".to_string(), json!(format!("/runners/{id}/logs")));
         obj.insert("stop_url".to_string(), json!(format!("/runners/{id}/stop")));
@@ -4803,7 +4801,7 @@ async fn execute_spawn_build_inner(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -4863,7 +4861,7 @@ async fn execute_spawn_build_inner(
 
                     // Clear localStorage for this port to avoid stale tab state
                     let clear_url =
-                        format!("http://localhost:{}/ui-bridge/control/clear-storage", port);
+                        format!("{}/control/clear-storage", runner_ui_bridge_base(port));
                     if let Err(e) = client
                         .post(&clear_url)
                         .json(&serde_json::json!({}))
@@ -5033,8 +5031,8 @@ async fn execute_spawn_build_inner(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         // Per-runner log endpoints — these capture the runner's own
         // stdout/stderr. /logs/history on the supervisor has the
         // supervisor's own buffer and does NOT include runner logs, so
@@ -5544,7 +5542,7 @@ enum ProbeOutcome {
     },
 }
 
-/// Poll `GET http://localhost:{port}/health` every 200ms until it succeeds or
+/// Poll `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
 /// `timeout_ms` elapses. On failure, also reports whether the child process
 /// is still alive and snapshots the last 20 log lines from the runner's
 /// per-runner buffer.
@@ -5557,7 +5555,7 @@ async fn probe_runner_health(
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let interval = std::time::Duration::from_millis(200);
     let start = std::time::Instant::now();
-    let url = format!("http://localhost:{}/health", port);
+    let url = format!("{}/health", runner_loopback_base(port));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build()
@@ -6091,7 +6089,7 @@ async fn spawn_named_inner(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -6213,8 +6211,8 @@ async fn spawn_named_inner(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "build_result": build_result,

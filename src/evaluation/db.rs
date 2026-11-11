@@ -221,7 +221,7 @@ impl EvalDb {
             ("check-format-python", "Check Python code formatting with black in the backend directory without making changes, report any files that would be reformatted", "code_quality", "simple"),
             ("check-security-scan", "Run a security scan on the backend Python code to detect common vulnerabilities like SQL injection or hardcoded secrets", "security", "medium"),
             ("check-ts-analyze", "Run static analysis on the TypeScript frontend code to detect unused variables, unreachable code, and potential null pointer issues", "code_quality", "medium"),
-            ("check-http-status", "Verify that the frontend at localhost:3001, backend at localhost:8000, and runner at localhost:9876 all return HTTP 200 on their health endpoints", "monitoring", "medium"),
+            ("check-http-status", "Verify that the frontend at localhost:3001, backend at localhost:8000, and runner at 127.0.0.1:9876 all return HTTP 200 on their health endpoints", "monitoring", "medium"),
             ("check-ai-review", "Run an AI code review on the most recently changed files in the backend to identify code quality issues and suggest improvements", "code_quality", "complex"),
             ("check-ci-pipeline", "Run the full CI/CD check pipeline including lint, format, typecheck, and tests for the backend project", "devops", "complex"),
 

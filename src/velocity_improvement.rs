@@ -810,17 +810,20 @@ async fn spawn_fix_agent(
 
 async fn restart_frontend(state: &SharedState, restart_backend: bool) -> Result<(), String> {
     let client = &state.http_client;
+    // This supervisor's own address: the port it bound (`--port`), on the
+    // IPv4 loopback its listener binds.
+    let supervisor = crate::loopback::loopback_base(state.config.port);
 
     if restart_backend {
         let _ = client
-            .post("http://localhost:9875/dev-start/backend")
+            .post(format!("{supervisor}/dev-start/backend"))
             .timeout(Duration::from_secs(120))
             .send()
             .await;
     }
 
     let resp = client
-        .post("http://localhost:9875/dev-start/frontend")
+        .post(format!("{supervisor}/dev-start/frontend"))
         .timeout(Duration::from_secs(180))
         .send()
         .await

@@ -704,10 +704,16 @@ impl EnvForwarder for WindowPositionEnv {
                 Overflow, SpawnPlacementClient, SpawnPlacementClientError,
             };
 
-            let base = match reqwest::Url::parse("http://localhost:9876") {
+            // The primary's API on the IPv4 loopback it binds, through the
+            // same port field the `/ui-bridge`, `/runner-api` and `/graphql`
+            // proxies forward to (a test can point it at a stub).
+            let base = match reqwest::Url::parse(&crate::loopback::runner_loopback_base(
+                state.runner_api_port,
+            )) {
                 Ok(u) => u,
                 Err(e) => {
-                    // Static URL — this should never fail, but log defensively.
+                    // An IPv4 literal and a u16 port — this should never fail,
+                    // but log defensively.
                     let msg = format!(
                         "Spawn temp placement: skipping runner '{}' — runner base URL parse failed: {}",
                         runner_name, e

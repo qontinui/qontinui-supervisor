@@ -30,6 +30,7 @@ mod fs_atomic;
 mod git_provenance;
 mod health_cache;
 mod log_capture;
+mod loopback;
 mod origin_guard;
 mod otel;
 mod pii_scrub;
@@ -583,7 +584,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
-    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+    // The same constant every URL the supervisor builds names
+    // (`loopback::loopback_base`), so the address a client dials is the one
+    // this listener binds.
+    let bind_addr = std::net::SocketAddr::from((loopback::LOOPBACK_IP, port));
     let listener = {
         let mut attempts = 0;
         loop {
@@ -615,7 +619,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    info!("Supervisor listening on http://127.0.0.1:{}", port);
+    info!("Supervisor listening on {}", loopback::loopback_base(port));
 
     // Spawn the ambient dashboard WebView2 window (item B of the post-3J UI
     // Bridge improvements plan). Runs on its own dedicated OS thread so it
@@ -633,7 +637,7 @@ async fn main() -> anyhow::Result<()> {
         if state.config.no_webview {
             info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW)");
         } else {
-            webview::spawn_webview_thread(format!("http://127.0.0.1:{}/", port));
+            webview::spawn_webview_thread(format!("{}/", loopback::loopback_base(port)));
         }
     }
 

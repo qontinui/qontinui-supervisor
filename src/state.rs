@@ -1947,6 +1947,7 @@ impl SupervisorState {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
         let expo_port = config.expo_port;
+        let supervisor_port = config.port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
         // Capacity 8 with `broadcast` semantics: lagging receivers see Lagged,
@@ -2042,7 +2043,7 @@ impl SupervisorState {
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
-            command_relay: CommandRelay::new(),
+            command_relay: CommandRelay::new(supervisor_port),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,

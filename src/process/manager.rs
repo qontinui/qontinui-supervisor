@@ -7994,7 +7994,7 @@ pub async fn rebuild_and_restart_by_id(
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
         let port = managed.config.port;
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", crate::loopback::runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()

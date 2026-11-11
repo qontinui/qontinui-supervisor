@@ -349,7 +349,7 @@ fn spawn_error_body_names_the_runner_it_reserved() {
 
     assert_eq!(body["id"], serde_json::json!("test-abc123"));
     assert_eq!(body["port"], serde_json::json!(9878));
-    assert_eq!(body["api_url"], serde_json::json!("http://localhost:9878"));
+    assert_eq!(body["api_url"], serde_json::json!("http://127.0.0.1:9878"));
     // The two URLs a caller needs to follow and clean up its own runner.
     assert_eq!(
         body["logs_url"],
@@ -1981,7 +1981,7 @@ async fn runners_by_unit_resolves_bound_previews() {
         .find(|h| h["attempt_id"] == "a1")
         .expect("a1 present");
     assert_eq!(a1["port"], 9877);
-    assert_eq!(a1["ui_bridge_url"], "http://localhost:9877/ui-bridge");
+    assert_eq!(a1["ui_bridge_url"], "http://127.0.0.1:9877/ui-bridge");
     assert_eq!(a1["git_sha"], "0156c6775b18");
     assert_eq!(a1["runner_id"], "test-9877");
     let a2 = arr

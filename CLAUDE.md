@@ -1359,7 +1359,7 @@ Used by the evaluation and velocity systems to select which AI provider and mode
 
 ### Spawn-Monitor Placement
 
-The supervisor pulls placement config from the primary runner via `GET http://localhost:9876/spawn-placement/preview?slot=N&overflow=wrap` when spawning a temp runner. Configuration lives in the runner's Settings → Runner Instances UI.
+The supervisor pulls placement config from the primary runner via `GET http://127.0.0.1:9876/spawn-placement/preview?slot=N&overflow=wrap` when spawning a temp runner. Configuration lives in the runner's Settings → Runner Instances UI.
 
 ### Proxies
 
@@ -1527,7 +1527,7 @@ Debug-only endpoints under `/control/dev/*` are admitted **only** when the super
 
 ## Dashboard
 
-The supervisor serves a React SPA dashboard at `GET /`. Open `http://localhost:9875/` in a browser.
+The supervisor serves a React SPA dashboard at `GET /`. Open `http://127.0.0.1:9875/` in a browser.
 
 **Features:**
 - Real-time service health table with status dots and action buttons
@@ -1846,13 +1846,13 @@ The supervisor preserves the most recently successfully-built runner exe at `tar
 
 ```bash
 # What commit is the LKG built from, and is it merged truth?
-curl -s 'localhost:9875/lkg/coverage' | jq '.data.commit_provenance'
+curl -s '127.0.0.1:9875/lkg/coverage' | jq '.data.commit_provenance'
 # → {"lkg_sha": "…", "lkg_source": "origin_main",
 #    "behind_origin_main": 0, "is_ancestor_of_origin_main": true,
 #    "contains_query": null, "contains": null}
 
 # Definitive: is MY fix in the LKG binary?
-curl -s 'localhost:9875/lkg/coverage?contains=<fix-sha>' | jq '.data.commit_provenance.contains'
+curl -s '127.0.0.1:9875/lkg/coverage?contains=<fix-sha>' | jq '.data.commit_provenance.contains'
 # → true  = the commit IS in the binary
 # → false = provably absent
 # → null  = NOT COMPUTABLE (no LKG sha, or a sha unknown to the local object db).
@@ -1865,13 +1865,13 @@ curl -s 'localhost:9875/lkg/coverage?contains=<fix-sha>' | jq '.data.commit_prov
 
 ```bash
 # Inspect LKG state
-curl localhost:9875/health   | jq '.build.lkg'
-curl localhost:9875/builds   | jq '.lkg'
+curl 127.0.0.1:9875/health   | jq '.build.lkg'
+curl 127.0.0.1:9875/builds   | jq '.lkg'
 # → {"built_at": "2026-04-26T15:30:00Z", "source_slot": 1, "exe_size": 253749760, "sha": "a1b2c3d4e5f6", "source": "live_tree"}
 # → null if no successful build has happened yet on this checkout
 
 # Spawn a test runner pinned to LKG (no rebuild)
-curl -X POST localhost:9875/runners/spawn-test \
+curl -X POST 127.0.0.1:9875/runners/spawn-test \
      -H 'content-type: application/json' \
      -d '{"rebuild": false, "use_lkg": true, "wait": true}'
 # Response includes: "used_lkg": true, "lkg": {"built_at": ..., "source_slot": ..., "exe_size": ...}
