@@ -4720,7 +4720,7 @@ fn every_lifecycle_door_names_its_action_on_the_spawn_ring() {
     );
     let manager = squeezed(&["src", "process", "manager.rs"]);
     let rar_start = first_call(
-        &body_of(&manager, "pub async fn rebuild_and_restart_by_id("),
+        &body_of(&manager, "async fn rebuild_and_restart_latched("),
         "start_managed_runner(",
     );
     assert!(
@@ -6175,10 +6175,11 @@ fn both_restarts_read_what_their_stop_removed_before_their_rebuild() {
         }
     };
     in_order(
-        "pub async fn rebuild_and_restart_by_id(",
+        "async fn rebuild_and_restart_latched(",
         &[
             "stop_runner_by_id(state,runner_id,",
             "Ok(outcome)=>(true,outcome.removed_entry)",
+            "stop_removed_entry.store(removed_by_its_stop,",
             "run_cargo_build_with_requester(",
             "StartAs::Restart{removed_by_its_stop,}",
         ],
@@ -6186,6 +6187,7 @@ fn both_restarts_read_what_their_stop_removed_before_their_rebuild() {
     // Neither restart reads the registry for it: the lock is gone by then.
     for sig in [
         "pub async fn rebuild_and_restart_by_id(",
+        "async fn rebuild_and_restart_latched(",
         "async fn restart_after_gate(",
     ] {
         let body = crate::source_scan::fn_body(&src, sig).unwrap_or_else(|| panic!("{sig} exists"));
@@ -7894,6 +7896,67 @@ fn a_marked_precondition_refusal_is_errored_not_refused() {
     }
 }
 
+/// `rebuild_and_restart_by_id` is a restart, so a `test-*` runner's stop must keep
+/// the per-instance state its start brings the same id back to: the latch goes up
+/// before the stop, comes off once the start has returned (or on any other exit),
+/// and a rebuild or start that fails after the stop removed the entry reaps the
+/// state it kept. Pinned at source level because a real build cannot run in a unit
+/// test.
+#[test]
+fn rebuild_and_restart_latches_its_restart_and_reaps_what_a_failure_orphans() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let squeezed = |sig: &str| -> String {
+        crate::source_scan::fn_body(&src, sig)
+            .unwrap_or_else(|| panic!("{sig} exists"))
+            .split_whitespace()
+            .collect()
+    };
+    let in_order = |body: &str, marks: &[&str]| {
+        let mut last = 0;
+        for mark in marks {
+            let at = body[last..]
+                .find(mark)
+                .unwrap_or_else(|| panic!("no {mark} after byte {last}"));
+            last += at + mark.len();
+        }
+    };
+    in_order(
+        &squeezed("pub async fn rebuild_and_restart_by_id("),
+        &[
+            "is_primary()",
+            ".restart_requested=true;",
+            "restart_requested=false;",
+            "reap_state_orphaned_by_restart(",
+            "reap_orphaned_state_once_free(",
+            "rebuild_and_restart_latched(",
+            "latch.run_now().await;",
+            "orphan_guard.run_now().await;",
+        ],
+    );
+    in_order(
+        &squeezed("async fn rebuild_and_restart_latched("),
+        &[
+            "stop_runner_by_id(",
+            "run_cargo_build_with_requester(",
+            "start_managed_runner(",
+            "stop_removed_entry.store(false,",
+            "ifletSome(latch)=latch.take(){latch.run_now().await;}",
+            "if body.wait"
+                .split_whitespace()
+                .collect::<String>()
+                .as_str(),
+        ],
+    );
+}
+
 /// `rebuild_and_restart_by_id` builds before it starts, so its start failing
 /// is a failure after the body acted: the start's error must leave marked.
 /// Pinned at source level because a real build cannot run in a unit test.
@@ -7907,8 +7970,10 @@ fn rebuild_and_restart_marks_a_failed_start_as_after_act() {
         .expect("manager.rs")
         .split_whitespace()
         .collect();
-    let sig = "pubasyncfnrebuild_and_restart_by_id(";
-    let body = &manager[manager.find(sig).expect("rebuild_and_restart_by_id exists")..];
+    let sig = "asyncfnrebuild_and_restart_latched(";
+    let body = &manager[manager
+        .find(sig)
+        .expect("rebuild_and_restart_latched exists")..];
     let body = body.split_once('{').expect("a body").1;
     let start = body
         .find("start_managed_runner(")

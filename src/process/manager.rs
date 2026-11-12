@@ -8039,6 +8039,72 @@ pub async fn rebuild_and_restart_by_id(
         ));
     }
 
+    // This is a restart, so it latches `restart_requested` like
+    // [`run_admitted_restart`] does. Without the latch a `test-*` runner's stop
+    // reaps the per-instance state (pairing copy, config, dev logs) that the start
+    // below brings the same id back to (`reap_instance_state_on_stop`), and the
+    // serving watchdog does not skip the runner as one being restarted. The latch
+    // comes off on every exit.
+    managed.runner.write().await.restart_requested = true;
+    let mut latch = Some({
+        let managed = managed.clone();
+        CleanupIfDropped::new(async move {
+            managed.runner.write().await.restart_requested = false;
+        })
+    });
+    // The state the stop kept is reaped when the rebuild or the start fails before
+    // the id is registered again, as [`run_admitted_restart`]'s guard does, and only
+    // while this call's own stop removed the entry and its start has not put it back
+    // (the body clears `stop_removed_entry` once the start returns). On a dropped
+    // task (a panic, a runtime shutdown) the reap waits for the lifecycle lock first.
+    let stop_removed_entry = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let orphan_guard = {
+        let (state, managed, id) = (state.clone(), managed.clone(), runner_id.to_string());
+        let (dropped_state, dropped_managed, dropped_id) =
+            (state.clone(), managed.clone(), id.clone());
+        let (removed, dropped_removed) = (stop_removed_entry.clone(), stop_removed_entry.clone());
+        CleanupIfDropped::new(async move {
+            reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+        })
+        .if_dropped_run(async move {
+            reap_orphaned_state_once_free(
+                &dropped_state,
+                &dropped_managed,
+                &dropped_id,
+                &dropped_removed,
+            )
+            .await;
+        })
+    };
+    let outcome = rebuild_and_restart_latched(
+        state,
+        &managed,
+        runner_id,
+        body,
+        initiated_by,
+        &stop_removed_entry,
+        &mut latch,
+    )
+    .await;
+    if let Some(latch) = latch.take() {
+        latch.run_now().await;
+    }
+    orphan_guard.run_now().await;
+    outcome
+}
+
+/// The body of [`rebuild_and_restart_by_id`], run with `restart_requested` latched.
+/// The latch comes off once the start has returned, before the optional health
+/// wait, as in [`run_admitted_restart`]; the caller takes it off on every other exit.
+async fn rebuild_and_restart_latched(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+    body: crate::routes::runners::RebuildAndRestartRequest,
+    initiated_by: Option<uuid::Uuid>,
+    stop_removed_entry: &std::sync::atomic::AtomicBool,
+    latch: &mut Option<CleanupIfDropped>,
+) -> Result<serde_json::Value, SupervisorError> {
     let runner_name = managed.config.name.clone();
     let source_label = if body.source.is_empty() {
         "rebuild-and-restart".to_string()
@@ -8076,6 +8142,7 @@ pub async fn rebuild_and_restart_by_id(
             Err(SupervisorError::RunnerNotRunning) => (false, false),
             Err(e) => return Err(e),
         };
+    stop_removed_entry.store(removed_by_its_stop, std::sync::atomic::Ordering::SeqCst);
     #[cfg(test)]
     after_stop_seam(runner_id).await;
 
@@ -8099,7 +8166,7 @@ pub async fn rebuild_and_restart_by_id(
     let started_at = chrono::Utc::now();
     start_managed_runner(
         state,
-        &managed,
+        managed,
         initiated_by,
         StartAs::Restart {
             removed_by_its_stop,
@@ -8107,6 +8174,13 @@ pub async fn rebuild_and_restart_by_id(
     )
     .await
     .map_err(SupervisorError::after_act)?;
+    // The start registered the id again, so the kept state has an owner: a later
+    // removal (a peer restart's stop during the health wait below) is that
+    // owner's to account for, never this call's to reap.
+    stop_removed_entry.store(false, std::sync::atomic::Ordering::SeqCst);
+    if let Some(latch) = latch.take() {
+        latch.run_now().await;
+    }
     state
         .logs
         .emit(

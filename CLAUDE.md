@@ -219,7 +219,11 @@ copy, config, dev logs, Restate journal, macros/prompts, WebView2 profile.
 back under the same `QONTINUI_INSTANCE_NAME`. Only the exe-copy directory is
 removed, and the start redeploys it. A restart that fails before the start
 re-registers the id reaps the whole set instead (`orphaned_by_failed_restart`),
-since no other path would ever visit that id again. The app-data reap briefly
+since no other path would ever visit that id again. Both restart doors latch
+it: `POST /runners/{id}/restart` (`run_admitted_restart`) and
+`POST /runners/{id}/rebuild-and-restart` (`rebuild_and_restart_by_id`), which
+latched nothing until the #304 follow-up, so its stop wiped a temp runner's
+pairing copy before the start brought the id back. The app-data reap briefly
 escaped this gate after #198 made it cross-platform, so every Linux temp
 restart wiped the logs of the run being restarted. The test
 `temp_restart_keeps_the_instance_state` now fails on any teardown site that
