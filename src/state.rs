@@ -888,7 +888,15 @@ pub struct RunnerState {
     /// Never render this alone as "gone"; use [`Self::liveness`].
     pub running: bool,
     pub started_at: Option<DateTime<Utc>>,
+    /// A restart is in flight. Kept equal to `restart_latches > 0` by
+    /// [`Self::latch_restart`] / [`Self::unlatch_restart`]; tests may set it
+    /// directly to simulate a latch.
     pub restart_requested: bool,
+    /// How many restarts currently hold the latch. A bool alone let the first
+    /// of two concurrent restarts to finish clear the flag while the other was
+    /// still rebuilding, and could not say whether any restart remained to own
+    /// a `test-*` runner's kept per-instance state.
+    pub restart_latches: u32,
     /// A stop was requested for the current process. Latched by
     /// [`Self::latch_stop_request`] before any kill, cleared only by the next
     /// start ([`Self::clear_stop_request`]), so the exit monitor reads the
@@ -1014,6 +1022,19 @@ pub fn answered_since(
 }
 
 impl RunnerState {
+    /// Take one hold on the restart latch: a restart is now in flight.
+    pub fn latch_restart(&mut self) {
+        self.restart_latches = self.restart_latches.saturating_add(1);
+        self.restart_requested = true;
+    }
+
+    /// Release one hold on the restart latch. The flag comes down only when no
+    /// other restart still holds it.
+    pub fn unlatch_restart(&mut self) {
+        self.restart_latches = self.restart_latches.saturating_sub(1);
+        self.restart_requested = self.restart_latches > 0;
+    }
+
     /// Whether the runner's HTTP API has answered during its current boot.
     ///
     /// `last_seen_responding_at` is never cleared, so it answers for the
@@ -2252,6 +2273,7 @@ impl RunnerState {
             running: false,
             started_at: None,
             restart_requested: false,
+            restart_latches: 0,
             stop_requested: false,
             stop_requested_at: None,
             pid: None,

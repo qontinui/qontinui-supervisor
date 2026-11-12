@@ -7673,7 +7673,7 @@ pub async fn run_admitted_restart(
 
     {
         let mut runner = managed.runner.write().await;
-        runner.restart_requested = true;
+        runner.latch_restart();
     }
 
     // The restart stays cancellable: one whose client went away must not go on to
@@ -7684,7 +7684,7 @@ pub async fn run_admitted_restart(
     let latch = {
         let managed = managed.clone();
         CleanupIfDropped::new(async move {
-            managed.runner.write().await.restart_requested = false;
+            managed.runner.write().await.unlatch_restart();
         })
     };
 
@@ -7790,16 +7790,24 @@ async fn reap_state_orphaned_by_restart(
     runner_id: &str,
     stop_removed_entry: &std::sync::atomic::AtomicBool,
 ) {
-    // Only state this restart's own stop kept is its to reap: without this, a
-    // restart that lost a race to a peer's stop (its own stop found the entry gone)
-    // would delete the pairing copy and config the peer's restart is still to use.
-    // Known limit: when that peer is a PLAIN stop (not a restart) that read the
-    // `restart_requested` latch and so kept the state, nothing reaps it, because the
-    // latch is a bool and cannot say whose restart the state was kept for. A leaked
-    // directory is the safer failure than deleting a live restart's pairing.
-    if !stop_removed_entry.load(std::sync::atomic::Ordering::SeqCst) {
+    // Only a `test-*` runner's stop keeps state for its start half.
+    if !is_temp_runner(runner_id) {
         return;
     }
+    if stop_removed_entry.load(std::sync::atomic::Ordering::SeqCst) {
+        reap_if_unregistered(state, managed, runner_id).await;
+        return;
+    }
+    // A peer's stop kept this state. Wait for the lifecycle lock first: a start
+    // already under way holds it until it has re-registered the id, and its own
+    // restart's latch can come off (a cancelled restart drops it at once) while that
+    // start is still running, so the latch alone cannot say no start is pending.
+    let _lifecycle = managed.lifecycle.lock().await;
+    reap_peer_kept_state_unless_latched(state, managed, runner_id).await;
+}
+
+/// State this restart's own stop kept: reap it unless the id is registered again.
+async fn reap_if_unregistered(state: &SharedState, managed: &Arc<ManagedRunner>, runner_id: &str) {
     let still_registered = state.get_runner(runner_id).await.is_some();
     if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered) {
         warn!(
@@ -7809,6 +7817,24 @@ async fn reap_state_orphaned_by_restart(
         );
         reap_runner_instance_state(runner_id, &managed.config.name).await;
     }
+}
+
+/// State a peer's stop kept (this restart's own stop found the entry gone). Called
+/// with the runner's lifecycle lock held. Reaped only when no restart still holds the
+/// latch: a peer restart that won the race holds it through its rebuild and start, so
+/// its pairing copy is never deleted under it, while a PLAIN stop that kept the state
+/// because it read this restart's latch leaves it with no owner once this restart
+/// lets go. The caller releases its own latch first; a latch not yet released only
+/// makes this skip (a leak), never reap early.
+async fn reap_peer_kept_state_unless_latched(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    runner_id: &str,
+) {
+    if managed.runner.read().await.restart_latches > 0 {
+        return;
+    }
+    reap_if_unregistered(state, managed, runner_id).await;
 }
 
 /// The dropped path of a cancelled restart's reap: wait for the runner's lifecycle
@@ -7821,12 +7847,15 @@ async fn reap_orphaned_state_once_free(
     runner_id: &str,
     stop_removed_entry: &std::sync::atomic::AtomicBool,
 ) {
-    // Only a `test-*` runner's stop keeps state for its start half.
     if !is_temp_runner(runner_id) {
         return;
     }
     let _lifecycle = managed.lifecycle.lock().await;
-    reap_state_orphaned_by_restart(state, managed, runner_id, stop_removed_entry).await;
+    if stop_removed_entry.load(std::sync::atomic::Ordering::SeqCst) {
+        reap_if_unregistered(state, managed, runner_id).await;
+    } else {
+        reap_peer_kept_state_unless_latched(state, managed, runner_id).await;
+    }
 }
 
 /// Whether a FAILED restart left a temp runner's per-instance state with no owner:
@@ -8045,11 +8074,11 @@ pub async fn rebuild_and_restart_by_id(
     // below brings the same id back to (`reap_instance_state_on_stop`), and the
     // serving watchdog does not skip the runner as one being restarted. The latch
     // comes off on every exit.
-    managed.runner.write().await.restart_requested = true;
+    managed.runner.write().await.latch_restart();
     let mut latch = Some({
         let managed = managed.clone();
         CleanupIfDropped::new(async move {
-            managed.runner.write().await.restart_requested = false;
+            managed.runner.write().await.unlatch_restart();
         })
     });
     // The state the stop kept is reaped when the rebuild or the start fails before
