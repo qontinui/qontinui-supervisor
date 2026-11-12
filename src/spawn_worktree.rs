@@ -292,6 +292,25 @@ pub struct PreparedWorktree {
     pub schemas_resolved_sha: String,
 }
 
+impl PreparedWorktree {
+    /// One line naming the schemas commit this worktree builds against and
+    /// where its pin came from, e.g. `schemas_sha=<sha> pinned to <ref>
+    /// (declared in .github/sibling-pins.conf)`. Shared by the spawn-test and
+    /// primary-rebuild log lines and the primary rebuild's build error, so all
+    /// three word it the same way.
+    pub fn schemas_pin_summary(&self) -> String {
+        let source = if self.schemas_pin_declared {
+            format!("declared in {SIBLING_PINS_CONF}")
+        } else {
+            "no declared pin; origin/main fallback".to_string()
+        };
+        format!(
+            "schemas_sha={} pinned to {} ({})",
+            self.schemas_resolved_sha, self.schemas_pin_ref, source
+        )
+    }
+}
+
 /// A validated, caller-owned worktree the supervisor will build *as-is*.
 ///
 /// Returned by [`validate_existing_worktree`] for the `worktree_path`

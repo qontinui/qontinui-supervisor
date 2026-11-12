@@ -9,8 +9,9 @@
 //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
 //! state as `None`.
 use super::{
-    attach_build_slot_id, attach_spawn_identity, check_dist_freshness, probe_runner_health,
-    spawn_abandoned_body, wait_out_queue_timeout, FrontendStaleReason, ProbeOutcome,
+    attach_build_slot_id, attach_build_tree, attach_spawn_identity, check_dist_freshness,
+    probe_runner_health, spawn_abandoned_body, wait_out_queue_timeout, FrontendStaleReason,
+    ProbeOutcome, SpawnBuildTree,
 };
 use crate::build_monitor::BuildPhase;
 use crate::source_scan::production_span;
@@ -448,6 +449,198 @@ fn execute_spawn_build_attaches_identity_on_both_arms() {
              runner reserved for it, and so cannot read its logs or stop it. Body scanned:\n\
              {body}"
     );
+}
+
+// ---------------------------------------------------------------------
+// Regression: a FAILED spawn-test build did not say which tree it compiled.
+//
+// qontinui-supervisor#309 pinned a spawn worktree's schemas sibling to the
+// runner tree's declared `.github/sibling-pins.conf` sha and surfaced the pin
+// as `schemas_sha` / `schemas_pin_ref` / `schemas_pin_source`, but only on the
+// SUCCESS body. A compile failure against the schemas sibling (the motivating
+// 2026-11-11 incident: four E0425s against schemas origin/main) is exactly
+// when a caller needs those fields, and every `return Err(e)` lost them,
+// together with `git_ref_resolved_sha` and `source`.
+// ---------------------------------------------------------------------
+
+const RUNNER_SHA: &str = "bb421e28c0000000000000000000000000000000";
+const SCHEMAS_PIN: &str = "9f4f7b6001f2028c2824bd591ed2ef452c140ab7";
+
+fn managed_tree(declared: bool) -> SpawnBuildTree {
+    SpawnBuildTree::Managed {
+        requested_ref: "origin/main".to_string(),
+        resolved_sha: RUNNER_SHA.to_string(),
+        source: "origin_main",
+        schemas_path: std::path::PathBuf::from("/ws/.spawn-origin_main/qontinui-schemas"),
+        schemas_sha: SCHEMAS_PIN.to_string(),
+        schemas_pin_ref: if declared {
+            SCHEMAS_PIN.to_string()
+        } else {
+            "origin/main".to_string()
+        },
+        schemas_pin_declared: declared,
+    }
+}
+
+#[test]
+fn a_failed_managed_build_body_names_its_runner_and_schemas_commits() {
+    let mut body = serde_json::json!({ "error": "Build failed: E0425 cannot find type" });
+    attach_build_tree(&mut body, Some(&managed_tree(true)));
+
+    assert_eq!(body["source"], serde_json::json!("origin_main"));
+    assert_eq!(body["git_ref"], serde_json::json!("origin/main"));
+    assert_eq!(body["git_ref_resolved"], serde_json::json!("origin/main"));
+    assert_eq!(body["git_ref_resolved_sha"], serde_json::json!(RUNNER_SHA));
+    assert_eq!(
+        body["git_ref_resolved_sha_short"],
+        serde_json::json!(&RUNNER_SHA[..12])
+    );
+    assert_eq!(
+        body["schemas_path"],
+        serde_json::json!("/ws/.spawn-origin_main/qontinui-schemas")
+    );
+    assert_eq!(body["schemas_sha"], serde_json::json!(SCHEMAS_PIN));
+    assert_eq!(body["schemas_pin_ref"], serde_json::json!(SCHEMAS_PIN));
+    assert_eq!(
+        body["schemas_pin_source"],
+        serde_json::json!("sibling_pins_conf")
+    );
+    assert_eq!(body["schemas_is_shared"], serde_json::json!(false));
+    // The diagnosis is preserved, not replaced.
+    assert_eq!(
+        body["error"],
+        serde_json::json!("Build failed: E0425 cannot find type")
+    );
+}
+
+#[test]
+fn a_managed_tree_without_a_declared_pin_says_it_fell_back() {
+    let mut body = serde_json::json!({ "error": "x" });
+    attach_build_tree(&mut body, Some(&managed_tree(false)));
+    assert_eq!(body["schemas_pin_ref"], serde_json::json!("origin/main"));
+    assert_eq!(
+        body["schemas_pin_source"],
+        serde_json::json!("origin_main_fallback")
+    );
+}
+
+#[test]
+fn a_failed_caller_owned_build_body_names_its_schemas_sibling() {
+    let tree = SpawnBuildTree::CallerOwned {
+        worktree_path: std::path::PathBuf::from("/ws/agent-worktrees/a/qontinui-runner"),
+        resolved_sha: Some(RUNNER_SHA.to_string()),
+        schemas_path: Some(std::path::PathBuf::from("/ws/qontinui-schemas")),
+        schemas_sha: Some(SCHEMAS_PIN.to_string()),
+        schemas_is_shared: true,
+    };
+    let mut body = serde_json::json!({ "error": "x" });
+    attach_build_tree(&mut body, Some(&tree));
+
+    assert_eq!(body["source"], serde_json::json!("worktree_path"));
+    assert_eq!(
+        body["worktree_path"],
+        serde_json::json!("/ws/agent-worktrees/a/qontinui-runner")
+    );
+    assert_eq!(body["git_ref_resolved_sha"], serde_json::json!(RUNNER_SHA));
+    assert_eq!(
+        body["schemas_path"],
+        serde_json::json!("/ws/qontinui-schemas")
+    );
+    assert_eq!(body["schemas_sha"], serde_json::json!(SCHEMAS_PIN));
+    assert_eq!(body["schemas_is_shared"], serde_json::json!(true));
+    // A caller-owned sibling is whatever the caller checked out: there is no
+    // pin to report, and a managed-only key here would claim one.
+    let obj = body.as_object().unwrap();
+    assert!(!obj.contains_key("schemas_pin_ref"), "{body}");
+    assert!(!obj.contains_key("schemas_pin_source"), "{body}");
+    assert!(!obj.contains_key("git_ref"), "{body}");
+}
+
+/// A caller-owned tree that is not a git checkout, with a sibling whose path
+/// could not be canonicalized, keeps the schemas keys present as `null`
+/// (UNKNOWN), the shape the success body always had.
+#[test]
+fn a_caller_owned_tree_with_unknown_shas_renders_nulls_not_absences() {
+    let tree = SpawnBuildTree::CallerOwned {
+        worktree_path: std::path::PathBuf::from("/ws/plain"),
+        resolved_sha: None,
+        schemas_path: None,
+        schemas_sha: None,
+        schemas_is_shared: false,
+    };
+    let mut body = serde_json::json!({});
+    attach_build_tree(&mut body, Some(&tree));
+    let obj = body.as_object().unwrap();
+    assert_eq!(obj["schemas_path"], serde_json::Value::Null);
+    assert_eq!(obj["schemas_sha"], serde_json::Value::Null);
+    assert!(!obj.contains_key("git_ref_resolved_sha"), "{body}");
+}
+
+/// With no tree (a live-tree spawn, or a failure before the tree was
+/// prepared) nothing is written: a `source` there would claim a tree the
+/// request never reached.
+#[test]
+fn no_build_tree_writes_nothing() {
+    let mut body = serde_json::json!({ "error": "failed to prepare worktree" });
+    let before = body.clone();
+    attach_build_tree(&mut body, None);
+    assert_eq!(body, before);
+}
+
+#[test]
+fn build_tree_leaves_a_non_object_body_alone() {
+    let mut body = serde_json::json!("not an object");
+    attach_build_tree(&mut body, Some(&managed_tree(true)));
+    assert_eq!(body, serde_json::json!("not an object"));
+}
+
+/// Re-attaching onto a body that already carries the tree changes nothing,
+/// which is what lets `execute_spawn_build` merge it onto the success body
+/// the inner fn already rendered.
+#[test]
+fn build_tree_attach_is_idempotent() {
+    let tree = managed_tree(true);
+    let mut once = serde_json::json!({ "status": "healthy" });
+    tree.attach(&mut once);
+    let mut twice = once.clone();
+    attach_build_tree(&mut twice, Some(&tree));
+    assert_eq!(once, twice);
+}
+
+/// Source guard: `execute_spawn_build` merges the build tree on BOTH arms,
+/// as it does the identity and the slot id. The Err arm is the one #309 left
+/// bare.
+#[test]
+fn execute_spawn_build_attaches_the_build_tree_on_both_arms() {
+    let body = fn_source("async fn execute_spawn_build(");
+    let merges = body
+        .matches("attach_build_tree(&mut body, side.tree.as_ref())")
+        .count();
+    assert_eq!(
+        merges, 2,
+        "execute_spawn_build must call `attach_build_tree` on the Ok arm AND the Err arm \
+         (found {merges}): a failed build's body must name the runner and schemas commits \
+         it compiled. Body scanned:\n{body}"
+    );
+}
+
+/// Source guard: the spawn-test body has ONE renderer for the build-tree
+/// fields. A second hand-written `resp["schemas_…"]` in the inner fn could
+/// drift from what the failure bodies carry.
+#[test]
+fn the_build_tree_fields_have_one_renderer() {
+    let body = fn_source("async fn execute_spawn_build_inner(");
+    for key in [
+        "resp[\"schemas_",
+        "resp[\"git_ref",
+        "resp[\"worktree_path\"]",
+    ] {
+        assert!(
+            !body.contains(key),
+            "execute_spawn_build_inner writes `{key}` directly; render it through \
+             `SpawnBuildTree::attach` so failure bodies carry the same field"
+        );
+    }
 }
 
 /// Source guard: the SYNCHRONOUS spawn-test path must race its terminal

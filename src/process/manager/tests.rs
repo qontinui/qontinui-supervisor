@@ -8980,3 +8980,66 @@ async fn the_serving_tick_restarts_a_respawn_past_its_budget_that_nothing_tracks
         Some(ServingRestartDecision::Restart { attempt: 1 })
     );
 }
+
+// A failed primary origin/main rebuild names the tree it compiled
+// (post-merge follow-up to qontinui-supervisor#309).
+fn prepared_for_naming(declared: bool) -> crate::spawn_worktree::PreparedWorktree {
+    crate::spawn_worktree::PreparedWorktree {
+        container_path: std::path::PathBuf::from("/ws/.spawn-origin_main"),
+        worktree_path: std::path::PathBuf::from("/ws/.spawn-origin_main/qontinui-runner"),
+        src_tauri: std::path::PathBuf::from("/ws/.spawn-origin_main/qontinui-runner/src-tauri"),
+        schemas_path: std::path::PathBuf::from("/ws/.spawn-origin_main/qontinui-schemas"),
+        requested_ref: "origin/main".to_string(),
+        resolved_sha: "bb421e28c0000000000000000000000000000000".to_string(),
+        schemas_pin_ref: if declared {
+            "9f4f7b6001f2028c2824bd591ed2ef452c140ab7".to_string()
+        } else {
+            "origin/main".to_string()
+        },
+        schemas_pin_declared: declared,
+        schemas_resolved_sha: "9f4f7b6001f2028c2824bd591ed2ef452c140ab7".to_string(),
+    }
+}
+
+#[test]
+fn a_failed_primary_rebuild_names_its_runner_and_schemas_commits() {
+    let e = name_the_primary_rebuild_tree(
+        SupervisorError::BuildFailed("error[E0425]: cannot find type".to_string()),
+        &prepared_for_naming(true),
+    );
+    let SupervisorError::BuildFailed(msg) = e else {
+        panic!("the variant (and so the HTTP status) must be kept");
+    };
+    assert!(
+        msg.contains("bb421e28c0000000000000000000000000000000"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("schemas_sha=9f4f7b6001f2028c2824bd591ed2ef452c140ab7"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("declared in .github/sibling-pins.conf"),
+        "{msg}"
+    );
+    assert!(msg.ends_with("error[E0425]: cannot find type"), "{msg}");
+
+    let fallback = name_the_primary_rebuild_tree(
+        SupervisorError::BuildFailed("x".to_string()),
+        &prepared_for_naming(false),
+    )
+    .to_string();
+    assert!(
+        fallback.contains("pinned to origin/main (no declared pin; origin/main fallback)"),
+        "{fallback}"
+    );
+}
+
+#[test]
+fn naming_the_primary_rebuild_tree_leaves_other_errors_alone() {
+    let e = name_the_primary_rebuild_tree(
+        SupervisorError::Process("spawn failed".to_string()),
+        &prepared_for_naming(true),
+    );
+    assert!(matches!(e, SupervisorError::Process(ref m) if m == "spawn failed"));
+}

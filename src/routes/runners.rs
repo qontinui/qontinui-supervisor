@@ -3679,15 +3679,20 @@ async fn execute_spawn_build(
         .await,
         run_guard,
     );
+    // The build tree is merged on both arms too: a compile failure is exactly
+    // when a caller needs to know which runner commit and which schemas commit
+    // were compiled (`SpawnBuildSideChannel::tree`).
     match result {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
         Err(e) => {
             let (status, mut body) = e.to_status_body();
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
@@ -3779,6 +3784,178 @@ struct SpawnBuildSideChannel {
     /// its boot had ended by THEN ([`crate::dev_action::held_to_own_boot`]), and the
     /// door records its verdict only after the slow work that follows the wait.
     answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tree this spawn's build compiles: the runner tree and the
+    /// `qontinui-schemas` sibling its path-deps resolve to. Set once that tree
+    /// is prepared or validated, so it is known before the build runs. `None`
+    /// for a live-tree spawn, and for any failure that happened before the tree
+    /// was ready.
+    ///
+    /// It is here because a FAILED build needs it most. When a spawn worktree's
+    /// build fails to compile against its schemas sibling (2026-11-11: four
+    /// `E0425`s against schemas `origin/main`, where the runner's own declared
+    /// pin built clean), the caller has to know which schemas commit the build
+    /// used. Before this field, only the success body named it, and every
+    /// `return Err(e)` lost it.
+    tree: Option<SpawnBuildTree>,
+}
+
+/// The tree a spawn-test build compiles, recorded before the build runs: the
+/// runner tree, plus the `qontinui-schemas` sibling its
+/// `../../qontinui-schemas/...` path-deps resolve to.
+///
+/// [`SpawnBuildTree::attach`] is the only thing that writes these fields to a
+/// spawn-test body. The success body and every failure body that follows the
+/// tree's preparation therefore carry the same values under the same keys.
+#[derive(Clone, Debug, PartialEq)]
+enum SpawnBuildTree {
+    /// A managed `.spawn-<ref>/` worktree: the default `origin/main` build or an
+    /// explicit `git_ref`, with the container's own pinned schemas worktree.
+    Managed {
+        requested_ref: String,
+        /// `git rev-parse HEAD` of the runner worktree.
+        resolved_sha: String,
+        /// The response's `source` (`SpawnBuildSource::label`): `origin_main`
+        /// for the default, `worktree` for an explicit ref.
+        source: &'static str,
+        schemas_path: std::path::PathBuf,
+        /// `git rev-parse HEAD` of the pinned schemas worktree.
+        schemas_sha: String,
+        /// The sha the runner tree declared in `.github/sibling-pins.conf`,
+        /// else `origin/main`.
+        schemas_pin_ref: String,
+        /// True when `schemas_pin_ref` came from the declared pin.
+        schemas_pin_declared: bool,
+    },
+    /// A caller-owned `worktree_path` checkout, built in place against its own
+    /// `../qontinui-schemas` sibling.
+    CallerOwned {
+        worktree_path: std::path::PathBuf,
+        resolved_sha: Option<String>,
+        schemas_path: Option<std::path::PathBuf>,
+        schemas_sha: Option<String>,
+        /// The sibling is the SHARED workspace-root checkout (drift hazard).
+        schemas_is_shared: bool,
+    },
+}
+
+impl SpawnBuildTree {
+    fn managed(wt: &crate::spawn_worktree::PreparedWorktree, source: &'static str) -> Self {
+        SpawnBuildTree::Managed {
+            requested_ref: wt.requested_ref.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            source,
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_resolved_sha.clone(),
+            schemas_pin_ref: wt.schemas_pin_ref.clone(),
+            schemas_pin_declared: wt.schemas_pin_declared,
+        }
+    }
+
+    fn caller_owned(wt: &crate::spawn_worktree::ValidatedExistingWorktree) -> Self {
+        SpawnBuildTree::CallerOwned {
+            worktree_path: wt.worktree_path.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_sha.clone(),
+            schemas_is_shared: wt.schemas_is_shared,
+        }
+    }
+
+    /// Merge this tree's provenance fields into a rendered spawn-test body:
+    /// success, a non-2xx `Ok`, or a `SupervisorError::to_status_body()` error.
+    ///
+    /// - `source`: `origin_main` | `worktree` | `worktree_path`.
+    /// - `git_ref` / `git_ref_resolved` (managed only), `worktree_path`
+    ///   (caller-owned only).
+    /// - `git_ref_resolved_sha` / `git_ref_resolved_sha_short`: the runner
+    ///   tree's HEAD. Absent for a caller-owned tree that is not a git checkout.
+    /// - `schemas_path` / `schemas_sha` / `schemas_is_shared`.
+    /// - `schemas_pin_ref` / `schemas_pin_source` (`sibling_pins_conf` |
+    ///   `origin_main_fallback`): managed only, because a caller-owned tree's
+    ///   sibling is whatever the caller checked out.
+    ///
+    /// The values come from the tree, so re-attaching onto a body that already
+    /// carries them changes nothing. A non-object body is left alone rather
+    /// than reshaped, as in [`attach_build_slot_id`].
+    fn attach(&self, body: &mut serde_json::Value) {
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        let mut put = |k: &str, v: serde_json::Value| {
+            obj.insert(k.to_string(), v);
+        };
+        match self {
+            SpawnBuildTree::Managed {
+                requested_ref,
+                resolved_sha,
+                source,
+                schemas_path,
+                schemas_sha,
+                schemas_pin_ref,
+                schemas_pin_declared,
+            } => {
+                put("source", json!(source));
+                put("git_ref", json!(requested_ref));
+                put("git_ref_resolved", json!(requested_ref));
+                put("git_ref_resolved_sha", json!(resolved_sha));
+                put(
+                    "git_ref_resolved_sha_short",
+                    json!(resolved_sha.chars().take(12).collect::<String>()),
+                );
+                put("schemas_path", json!(schemas_path.to_string_lossy()));
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_pin_ref", json!(schemas_pin_ref));
+                put(
+                    "schemas_pin_source",
+                    json!(if *schemas_pin_declared {
+                        "sibling_pins_conf"
+                    } else {
+                        "origin_main_fallback"
+                    }),
+                );
+                // The pinned sibling lives inside the spawn container, never
+                // the shared checkout.
+                put("schemas_is_shared", json!(false));
+            }
+            SpawnBuildTree::CallerOwned {
+                worktree_path,
+                resolved_sha,
+                schemas_path,
+                schemas_sha,
+                schemas_is_shared,
+            } => {
+                put("source", json!("worktree_path"));
+                put("worktree_path", json!(worktree_path.to_string_lossy()));
+                if let Some(sha) = resolved_sha {
+                    put("git_ref_resolved_sha", json!(sha));
+                    put(
+                        "git_ref_resolved_sha_short",
+                        json!(sha.chars().take(12).collect::<String>()),
+                    );
+                }
+                put(
+                    "schemas_path",
+                    json!(schemas_path.as_ref().map(|p| p.to_string_lossy())),
+                );
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_is_shared", json!(schemas_is_shared));
+            }
+        }
+    }
+}
+
+/// Merge the spawn's build tree ([`SpawnBuildSideChannel::tree`]) into an
+/// already-rendered body, success or failure.
+///
+/// With no tree it writes NOTHING. That covers a failure before the tree was
+/// prepared (a `git_ref` whose worktree could not be made, a `worktree_path`
+/// that failed validation), where any `source` would claim a tree the request
+/// never reached. The success body's own `source: "live_tree"` for a live-tree
+/// spawn is written where that body is built, not here.
+fn attach_build_tree(body: &mut serde_json::Value, tree: Option<&SpawnBuildTree>) {
+    if let Some(tree) = tree {
+        tree.attach(body);
+    }
 }
 
 /// Merge `build_slot_id` into an already-rendered error body.
@@ -3904,14 +4081,10 @@ async fn execute_spawn_build_inner(
     );
     // Set when a managed-worktree build occurred — either an explicit `git_ref`
     // or the DEFAULT `origin/main`: (requested_ref, resolved_sha).
-    // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
+    // The response fields (`git_ref`, `git_ref_resolved_sha`, the schemas
+    // pin) come from `side.tree`, set at the same point, so that a failure
+    // body carries them too.
     let mut git_ref_info: Option<(String, String)> = None;
-    // Set alongside `git_ref_info`: which qontinui-schemas commit the managed
-    // worktree's sibling was pinned to, and whether that pin was the runner
-    // tree's declared `.github/sibling-pins.conf` sha or the `origin/main`
-    // fallback. Surfaced as `schemas_path` / `schemas_sha` /
-    // `schemas_pin_ref` / `schemas_pin_source`.
-    let mut git_ref_schemas_info: Option<(std::path::PathBuf, String, String, bool)> = None;
     // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
     // the `cleanup_worktree_on_fail` flag to wipe the spawn container on a
     // downstream cargo failure.
@@ -4040,28 +4213,17 @@ async fn execute_spawn_build_inner(
                                 LogSource::Supervisor,
                                 LogLevel::Info,
                                 format!(
-                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} schemas_sha={} schemas_pin={} ({}) (requester={:?})",
+                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} {} (requester={:?})",
                                     wt.requested_ref,
                                     wt.resolved_sha,
                                     wt.worktree_path,
-                                    wt.schemas_resolved_sha,
-                                    wt.schemas_pin_ref,
-                                    if wt.schemas_pin_declared {
-                                        "declared in .github/sibling-pins.conf"
-                                    } else {
-                                        "no declared pin; origin/main fallback"
-                                    },
+                                    wt.schemas_pin_summary(),
                                     body.requester_id
                                 ),
                             )
                             .await;
                         git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
-                        git_ref_schemas_info = Some((
-                            wt.schemas_path.clone(),
-                            wt.schemas_resolved_sha.clone(),
-                            wt.schemas_pin_ref.clone(),
-                            wt.schemas_pin_declared,
-                        ));
+                        side.tree = Some(SpawnBuildTree::managed(&wt, build_source.label()));
                         // Stash paths for the optional cleanup-on-fail branch
                         // below. `find_repo_root` walks up from the
                         // configured project_dir; if it errors here (the
@@ -4158,6 +4320,7 @@ async fn execute_spawn_build_inner(
                             // Staleness check must inspect the caller-owned
                             // tree whose dist/ the spawned exe embeds.
                             built_root = Some(validated.worktree_path.clone());
+                            side.tree = Some(SpawnBuildTree::caller_owned(&validated));
                             worktree_path_info = Some(validated);
                             Some(src_tauri)
                         }
@@ -5185,80 +5348,34 @@ async fn execute_spawn_build_inner(
         }
     }
 
-    // Provenance for a git_ref build: the requested ref and the SHA the
-    // managed worktree actually resolved to. Only present when a git_ref
-    // build occurred (rebuild:true + git_ref).
-    //
-    // Field shape (kept stable for downstream callers / agents):
-    //   git_ref               — the input ref verbatim (e.g. "origin/main").
-    //   git_ref_resolved      — echo alias of git_ref so callers that want a
-    //                           "resolved" label don't have to special-case.
-    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the
-    //                           prepared worktree.
+    // Build-tree provenance: which runner tree and which schemas sibling were
+    // compiled. A managed worktree (the default `origin/main` build or a
+    // `git_ref`) and a caller-owned `worktree_path` are rendered by
+    // `SpawnBuildTree::attach`, which `execute_spawn_build` also applies to
+    // every failure body. Field shape (kept stable for downstream callers):
+    //   source                — `origin_main` (the default), `worktree` (an
+    //                           explicit ref), `worktree_path`, or `live_tree`.
+    //                           Callers that need a single-field "where did
+    //                           the binary come from?" answer branch on this.
+    //   git_ref / git_ref_resolved
+    //                         — the input ref verbatim, and its echo alias.
+    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the tree.
     //   git_ref_resolved_sha_short
-    //                         — 12-char abbreviated SHA for log-readable
-    //                           comparison against `git rev-parse origin/main
-    //                           | head -c 12`. Always derived from
-    //                           git_ref_resolved_sha; never re-shells out to
-    //                           git so it's a pure presentational helper.
-    //   source                — "worktree" when this build came from the
-    //                           managed detached worktree; absent when the
-    //                           live tree was used. Callers that need a
-    //                           single-field "where did the binary come
-    //                           from?" answer can branch on this.
-    if let Some((requested_ref, resolved_sha)) = &git_ref_info {
-        let short = resolved_sha.chars().take(12).collect::<String>();
-        resp["git_ref"] = json!(requested_ref);
-        resp["git_ref_resolved"] = json!(requested_ref);
-        resp["git_ref_resolved_sha"] = json!(resolved_sha);
-        resp["git_ref_resolved_sha_short"] = json!(short);
-        // Which schemas commit the managed worktree's sibling was built
-        // against: the runner tree's declared pin, or the origin/main fallback.
-        if let Some((schemas_path, schemas_sha, pin_ref, declared)) = &git_ref_schemas_info {
-            resp["schemas_path"] = json!(schemas_path.to_string_lossy());
-            resp["schemas_sha"] = json!(schemas_sha);
-            resp["schemas_pin_ref"] = json!(pin_ref);
-            resp["schemas_pin_source"] = json!(if *declared {
-                "sibling_pins_conf"
-            } else {
-                "origin_main_fallback"
-            });
-            // The pinned sibling lives inside the spawn container, never the
-            // shared checkout — the same field the `worktree_path` arm sets.
-            resp["schemas_is_shared"] = json!(false);
-        }
-        // `origin_main` for the DEFAULT path, `worktree` for an explicitly
-        // requested ref — so a caller can tell "the supervisor picked merged
-        // truth for me" from "I asked for this ref" without re-reading
-        // `git_ref`.
-        resp["source"] = json!(build_source.label());
-    } else if let Some(wt) = &worktree_path_info {
-        // Phase 2 — `worktree_path` provenance. Echo the canonical path, the
-        // worktree's HEAD SHA (when it's a git checkout) reusing the same
-        // `git_ref_resolved_sha`/`_short` field names callers already parse,
-        // and the schemas-sibling drift provenance (`schemas_path`,
-        // `schemas_sha`, `schemas_is_shared`). `source: "worktree_path"`
-        // distinguishes it from a managed `git_ref` worktree.
-        resp["source"] = json!("worktree_path");
-        resp["worktree_path"] = json!(wt.worktree_path.to_string_lossy());
-        if let Some(sha) = &wt.resolved_sha {
-            let short = sha.chars().take(12).collect::<String>();
-            resp["git_ref_resolved_sha"] = json!(sha);
-            resp["git_ref_resolved_sha_short"] = json!(short);
-        }
-        resp["schemas_path"] = match &wt.schemas_path {
-            Some(p) => json!(p.to_string_lossy()),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_sha"] = match &wt.schemas_sha {
-            Some(s) => json!(s),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_is_shared"] = json!(wt.schemas_is_shared);
-    } else {
+    //                         — its 12-char prefix, for comparison against
+    //                           `git rev-parse origin/main | head -c 12`.
+    //   worktree_path         — the caller-owned checkout (that arm only).
+    //   schemas_path / schemas_sha / schemas_is_shared
+    //                         — the schemas sibling the path-deps resolved to.
+    //   schemas_pin_ref / schemas_pin_source
+    //                         — managed worktrees only: the runner tree's
+    //                           declared `.github/sibling-pins.conf` sha
+    //                           (`sibling_pins_conf`), or `origin/main`
+    //                           (`origin_main_fallback`).
+    match &side.tree {
+        Some(tree) => tree.attach(&mut resp),
         // Explicit "live_tree" provenance so callers can always branch on a
         // present field rather than needing missing-field handling.
-        resp["source"] = json!("live_tree");
+        None => resp["source"] = json!("live_tree"),
     }
 
     // Item 8 — build-vintage warning. `source` says WHICH tree was compiled but

@@ -1922,6 +1922,17 @@ failed could not read why or clean up after itself.
 `ui_bridge_url` / `logs_url` / `stop_url` into **both** arms of
 `execute_spawn_build` — the same uniformity contract `attach_build_slot_id`
 already has, and pinned by the same style of test.
+Once the build's tree is prepared (a managed `git_ref` / default `origin/main`
+worktree, or a validated `worktree_path`), a failure body also carries the same
+build-tree fields as the success body: `source`, `git_ref` /
+`git_ref_resolved_sha`, `worktree_path`, `schemas_path` / `schemas_sha` /
+`schemas_is_shared`, and for a managed worktree `schemas_pin_ref` /
+`schemas_pin_source`. One renderer writes them on both arms
+(`SpawnBuildTree::attach`). The fields matter most on a compile failure against
+the schemas sibling, where the caller needs to know which schemas commit was
+built. They describe the tree that was built or attempted, not the exe that ran (`source_exe` says that). A failure before the tree was ready carries none of them. A failed
+primary `origin/main` rebuild names the same two commits in its stored
+`BuildFailed` error (`manager::name_the_primary_rebuild_tree`).
 A build that panics answers the same way, with `status: "panicked"`: `finish_spawn_build`
 catches it where the reservation is known, then frees the dedup key. `submit_spawn`'s own catch
 stays as the backstop that keeps a panic from leaving the submission `Running`.
