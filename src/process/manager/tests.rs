@@ -2104,9 +2104,11 @@ fn temp_restart_keeps_the_instance_state() {
     }
 
     let restart = body_of("pub async fn run_admitted_restart(");
-    let reap = body_of("async fn reap_state_orphaned_by_restart(");
+    let reap = body_of("async fn reap_if_unregistered(");
     assert!(
         restart.contains("orphan_guard.run_now().await;")
+            && body_of("async fn reap_state_orphaned_by_restart(")
+                .contains("reap_if_unregistered(state, managed, runner_id).await;")
             && reap.contains(
                 "if orphaned_by_failed_restart(is_temp_runner(runner_id), still_registered)"
             )
@@ -5970,18 +5972,114 @@ async fn a_restart_whose_stop_removed_nothing_never_reaps_a_peers_kept_state() {
     });
     std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
 
+    // The peer restart still holds the latch: its start is yet to come.
+    managed.runner.write().await.latch_restart();
     let removed = std::sync::atomic::AtomicBool::new(false);
     reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
     assert!(
         config_dir.exists(),
         "a restart whose own stop removed nothing reaped a peer's kept state"
     );
+    managed.runner.write().await.unlatch_restart();
 
     removed.store(true, std::sync::atomic::Ordering::SeqCst);
     reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
     assert!(
         !config_dir.exists(),
         "a restart whose own stop removed the entry left its kept state unowned"
+    );
+}
+
+/// A PLAIN stop that read a restart's latch keeps a `test-*` runner's state and drops
+/// its entry. When that restart then fails, its own stop having found the entry gone,
+/// no restart is left to own the state: once no latch is held, the reap takes it.
+#[tokio::test]
+async fn a_failed_restart_reaps_state_a_plain_stop_kept_for_it_once_no_latch_is_held() {
+    let (state, _root) = restart_test_state();
+    let id = format!("test-plain-stop-kept-state-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_893)),
+        false,
+    ));
+    let Some(config_dir) = instance_config_dir(&id) else {
+        return;
+    };
+    std::fs::create_dir_all(&config_dir).expect("create the kept instance state");
+    let _cleanup = scopeguard::guard(config_dir.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
+
+    // Two restarts latched; the first lets go while the second is still in flight.
+    managed.runner.write().await.latch_restart();
+    managed.runner.write().await.latch_restart();
+    managed.runner.write().await.unlatch_restart();
+    assert!(
+        managed.runner.read().await.restart_requested,
+        "the first restart to finish cleared the latch another restart still holds"
+    );
+    let removed = std::sync::atomic::AtomicBool::new(false);
+    reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+    assert!(
+        config_dir.exists(),
+        "reaped while a restart still held the latch"
+    );
+
+    managed.runner.write().await.unlatch_restart();
+    assert!(!managed.runner.read().await.restart_requested);
+    reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+    assert!(
+        !config_dir.exists(),
+        "state a plain stop kept for a failed restart was left with no owner"
+    );
+}
+
+/// A cancelled restart drops its latch at once while its detached start may still be
+/// running. That start holds the lifecycle lock until it has re-registered the id, so
+/// a peer restart's reap of state it did not keep waits for the lock and then finds
+/// the id registered: it never deletes the pairing copy the start is about to use.
+#[tokio::test]
+async fn a_peer_kept_state_reap_waits_for_a_start_that_is_still_running() {
+    let (state, _root) = restart_test_state();
+    let id = format!("test-start-in-flight-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_895)),
+        false,
+    ));
+    let Some(config_dir) = instance_config_dir(&id) else {
+        return;
+    };
+    std::fs::create_dir_all(&config_dir).expect("create the kept instance state");
+    let _cleanup = scopeguard::guard(config_dir.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
+
+    // The start in flight: it holds the lifecycle lock, and no latch is held.
+    let start = managed.lifecycle.clone().lock_owned().await;
+    let reap = {
+        let (state, managed, id) = (state.clone(), managed.clone(), id.clone());
+        tokio::spawn(async move {
+            let removed = std::sync::atomic::AtomicBool::new(false);
+            reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        config_dir.exists() && !reap.is_finished(),
+        "the reap did not wait for the start holding the lifecycle lock"
+    );
+    // The start re-registers the id, then lets go of the lock.
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.clone(), managed.clone());
+    drop(start);
+    reap.await.expect("the reap task");
+    assert!(
+        config_dir.exists(),
+        "the reap deleted state a start re-registered under the lifecycle lock"
     );
 }
 
@@ -6326,9 +6424,9 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
         &["process", "manager.rs"],
         "pub async fn run_admitted_restart(",
         &[
-            "runner.restart_requested=true;",
+            "runner.latch_restart();",
             "letlatch={",
-            "CleanupIfDropped::new(asyncmove{managed.runner.write().await.restart_requested=false;})",
+            "CleanupIfDropped::new(asyncmove{managed.runner.write().await.unlatch_restart();})",
             "restart_after_gate(",
             "latch.run_now().await;",
         ],
@@ -7932,8 +8030,8 @@ fn rebuild_and_restart_latches_its_restart_and_reaps_what_a_failure_orphans() {
         &squeezed("pub async fn rebuild_and_restart_by_id("),
         &[
             "is_primary()",
-            ".restart_requested=true;",
-            "restart_requested=false;",
+            ".latch_restart();",
+            ".unlatch_restart();",
             "reap_state_orphaned_by_restart(",
             "reap_orphaned_state_once_free(",
             "rebuild_and_restart_latched(",
