@@ -6034,6 +6034,41 @@ async fn a_failed_restart_reaps_state_a_plain_stop_kept_for_it_once_no_latch_is_
     );
 }
 
+/// A cancelled restart's two drop-guards run as separate tasks in no fixed order. The
+/// reap's drop path releases the restart's own latch hold itself (once, whichever guard
+/// gets there first), so a plain-stop-kept state is reaped rather than left behind
+/// because the reap counted the cancelled restart's own hold.
+#[tokio::test]
+async fn a_cancelled_restarts_reap_does_not_count_its_own_latch() {
+    let (state, _root) = restart_test_state();
+    let id = format!("test-own-latch-on-drop-{}", std::process::id());
+    let managed = Arc::new(ManagedRunner::new(
+        temp_config(&id, free_fixed_port(29_897)),
+        false,
+    ));
+    let Some(config_dir) = instance_config_dir(&id) else {
+        return;
+    };
+    std::fs::create_dir_all(&config_dir).expect("create the kept instance state");
+    let _cleanup = scopeguard::guard(config_dir.clone(), |dir| {
+        let _ = std::fs::remove_dir_all(dir);
+    });
+    std::fs::write(config_dir.join("marker.json"), b"{}").expect("write marker");
+
+    managed.runner.write().await.latch_restart();
+    let own = std::sync::atomic::AtomicBool::new(true);
+    let removed = std::sync::atomic::AtomicBool::new(false);
+    reap_orphaned_state_once_free(&state, &managed, &id, &removed, &own).await;
+    assert_eq!(managed.runner.read().await.restart_latches, 0);
+    assert!(
+        !config_dir.exists(),
+        "the reap counted the cancelled restart's own latch and left the state behind"
+    );
+    // The latch guard arriving second releases nothing more.
+    release_restart_latch(&managed, &own).await;
+    assert_eq!(managed.runner.read().await.restart_latches, 0);
+}
+
 /// A cancelled restart drops its latch at once while its detached start may still be
 /// running. That start holds the lifecycle lock until it has re-registered the id, so
 /// a peer restart's reap of state it did not keep waits for the lock and then finds
@@ -6426,7 +6461,7 @@ fn what_must_follow_a_start_or_a_kill_is_wired() {
         &[
             "runner.latch_restart();",
             "letlatch={",
-            "CleanupIfDropped::new(asyncmove{managed.runner.write().await.unlatch_restart();})",
+            "CleanupIfDropped::new(asyncmove{release_restart_latch(&managed,&held).await;})",
             "restart_after_gate(",
             "latch.run_now().await;",
         ],
@@ -8031,7 +8066,7 @@ fn rebuild_and_restart_latches_its_restart_and_reaps_what_a_failure_orphans() {
         &[
             "is_primary()",
             ".latch_restart();",
-            ".unlatch_restart();",
+            "release_restart_latch(&managed,&held).await;",
             "reap_state_orphaned_by_restart(",
             "reap_orphaned_state_once_free(",
             "rebuild_and_restart_latched(",

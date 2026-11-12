@@ -7703,10 +7703,11 @@ pub async fn run_admitted_restart(
     // it, and the latch must not stay up on that runner, where it would silence the
     // serving watchdog for good. So the latch comes off on every exit, a dropped
     // future or a panic included.
+    let latch_held = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let latch = {
-        let managed = managed.clone();
+        let (managed, held) = (managed.clone(), latch_held.clone());
         CleanupIfDropped::new(async move {
-            managed.runner.write().await.unlatch_restart();
+            release_restart_latch(&managed, &held).await;
         })
     };
 
@@ -7725,6 +7726,7 @@ pub async fn run_admitted_restart(
         let (dropped_state, dropped_managed, dropped_id) =
             (state.clone(), managed.clone(), id.clone());
         let (removed, dropped_removed) = (stop_removed_entry.clone(), stop_removed_entry.clone());
+        let dropped_latch = latch_held.clone();
         CleanupIfDropped::new(async move {
             reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
         })
@@ -7734,6 +7736,7 @@ pub async fn run_admitted_restart(
                 &dropped_managed,
                 &dropped_id,
                 &dropped_removed,
+                &dropped_latch,
             )
             .await;
         })
@@ -7868,7 +7871,12 @@ async fn reap_orphaned_state_once_free(
     managed: &Arc<ManagedRunner>,
     runner_id: &str,
     stop_removed_entry: &std::sync::atomic::AtomicBool,
+    own_latch: &std::sync::atomic::AtomicBool,
 ) {
+    // This restart's latch guard is dropped in its own spawned task, unordered with
+    // this one, so release this restart's hold here first (idempotently): otherwise
+    // the latch check below can count it and leave a plain-stop-kept state behind.
+    release_restart_latch(managed, own_latch).await;
     if !is_temp_runner(runner_id) {
         return;
     }
@@ -7877,6 +7885,14 @@ async fn reap_orphaned_state_once_free(
         reap_if_unregistered(state, managed, runner_id).await;
     } else {
         reap_peer_kept_state_unless_latched(state, managed, runner_id).await;
+    }
+}
+
+/// Release one restart's hold on the latch exactly once, whichever of its guards
+/// gets there first (`held` is that restart's own flag).
+async fn release_restart_latch(managed: &Arc<ManagedRunner>, held: &std::sync::atomic::AtomicBool) {
+    if held.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        managed.runner.write().await.unlatch_restart();
     }
 }
 
@@ -8097,10 +8113,11 @@ pub async fn rebuild_and_restart_by_id(
     // serving watchdog does not skip the runner as one being restarted. The latch
     // comes off on every exit.
     managed.runner.write().await.latch_restart();
+    let latch_held = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let mut latch = Some({
-        let managed = managed.clone();
+        let (managed, held) = (managed.clone(), latch_held.clone());
         CleanupIfDropped::new(async move {
-            managed.runner.write().await.unlatch_restart();
+            release_restart_latch(&managed, &held).await;
         })
     });
     // The state the stop kept is reaped when the rebuild or the start fails before
@@ -8114,6 +8131,7 @@ pub async fn rebuild_and_restart_by_id(
         let (dropped_state, dropped_managed, dropped_id) =
             (state.clone(), managed.clone(), id.clone());
         let (removed, dropped_removed) = (stop_removed_entry.clone(), stop_removed_entry.clone());
+        let dropped_latch = latch_held.clone();
         CleanupIfDropped::new(async move {
             reap_state_orphaned_by_restart(&state, &managed, &id, &removed).await;
         })
@@ -8123,6 +8141,7 @@ pub async fn rebuild_and_restart_by_id(
                 &dropped_managed,
                 &dropped_id,
                 &dropped_removed,
+                &dropped_latch,
             )
             .await;
         })
