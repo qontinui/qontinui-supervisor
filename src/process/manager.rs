@@ -7232,18 +7232,11 @@ async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), Sup
 
     let msg = format!(
         "Primary rebuild: building from origin/main worktree (resolved_sha={}, src_tauri={:?}, \
-         schemas_sha={} pinned to {} ({})). This is the default Phase B path — the primary runs \
-         latest-green-main, not the working checkout. Pass from_working_tree:true to compile the \
-         live tree instead.",
+         {}). This is the default Phase B path — the primary runs latest-green-main, not the \
+         working checkout. Pass from_working_tree:true to compile the live tree instead.",
         prepared.resolved_sha,
         prepared.src_tauri,
-        prepared.schemas_resolved_sha,
-        prepared.schemas_pin_ref,
-        if prepared.schemas_pin_declared {
-            "declared in .github/sibling-pins.conf"
-        } else {
-            "no declared pin; origin/main fallback"
-        }
+        prepared.schemas_pin_summary()
     );
     info!("{}", msg);
     state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
@@ -7258,6 +7251,35 @@ async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), Sup
         },
     )
     .await
+    .map_err(|e| name_the_primary_rebuild_tree(e, &prepared))
+}
+
+/// Prefix a failed primary origin/main rebuild's error with the tree it
+/// compiled: the runner commit and the schemas commit with its pin source.
+///
+/// The detached restart stores this error as the build's outcome
+/// (`GET /build/{id}/status`), and a compile error against the schemas
+/// sibling cannot be read without knowing which schemas commit that was
+/// (2026-11-11: four `E0425`s against schemas `origin/main`, where the
+/// runner's own declared pin built clean). The log line before the build
+/// names the tree too, but a poller never sees it.
+///
+/// Only [`SupervisorError::BuildFailed`] is renamed, and its variant is kept,
+/// so the HTTP status the error maps to does not change. Other errors pass
+/// through unchanged.
+fn name_the_primary_rebuild_tree(
+    e: SupervisorError,
+    prepared: &crate::spawn_worktree::PreparedWorktree,
+) -> SupervisorError {
+    match e {
+        SupervisorError::BuildFailed(msg) => SupervisorError::BuildFailed(format!(
+            "primary origin/main rebuild of runner {} against {}: {}",
+            prepared.resolved_sha,
+            prepared.schemas_pin_summary(),
+            msg
+        )),
+        other => other,
+    }
 }
 
 /// Pure gate for [`restart_runner_by_id`]: is an automated restart of this
