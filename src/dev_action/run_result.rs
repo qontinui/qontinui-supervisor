@@ -191,7 +191,8 @@ pub fn start_verdict(probe: SyncProbe) -> StartVerdict {
 ///   checked, and the health wait decides ([`start_verdict`]).
 /// - Any other status is `Errored`, carrying the body's `error` token
 ///   (`runner_died_during_startup`, `runner_started_but_unresponsive`,
-///   `frontend_dist_missing`, `frontend_stale`, the paired-profile failure).
+///   `frontend_dist_missing`, `frontend_build_tree_removed`, `frontend_stale`,
+///   the paired-profile failure).
 /// - An `Err` is [`run_result_for`]'s: `Refused` when it provably ran nothing,
 ///   else `Errored`, `Timeout` and `Process` included: `Timeout` has three raise
 ///   sites (the queue watcher, the cargo timeout, the prewarm) that one variant
@@ -583,6 +584,11 @@ mod tests {
     /// the first date, and then reads it. Source level, for the same reason as the test
     /// above. It reads spellings, so it does not check which argument the date is
     /// passed as.
+    ///
+    /// The slow work differs by door: spawn-named's frontend verdict follows its wait,
+    /// while spawn-test reads its verdict before it starts the runner, under its
+    /// container lock, so what follows its wait is the provenance compare, a `git
+    /// fetch`.
     #[test]
     fn a_spawn_doors_wait_dates_its_answer() {
         fn squeezed(text: &str) -> String {
@@ -593,18 +599,20 @@ mod tests {
         }
 
         let src = include_str!("../routes/runners.rs").replace("\r\n", "\n");
-        for (signature, first_check, stamp, stamps) in [
+        for (signature, first_check, stamp, stamps, slow_work) in [
             (
                 "async fn execute_spawn_build_inner(",
                 "probe_runner_health(",
                 "side.answered_at.get_or_insert_with(chrono::Utc::now);",
                 2,
+                "build_older_than_lkg_json(",
             ),
             (
                 "async fn spawn_named_inner(",
                 "client.get(&health_url)",
                 "answered_at.get_or_insert_with(chrono::Utc::now);",
                 1,
+                "resolve_frontend_stale_for_spawn(",
             ),
         ] {
             let body = squeezed(crate::source_scan::fn_body(&src, signature).expect(signature));
@@ -618,9 +626,7 @@ mod tests {
                     && body.find("client.get(&health_url)").expect("its wait") < last,
                 "{signature} must date an answer it has, not one it is waiting for"
             );
-            let slow_work = body
-                .find("resolve_frontend_stale_for_spawn(")
-                .expect("the slow work after the wait");
+            let slow_work = body.find(slow_work).expect("the slow work after the wait");
             assert!(
                 last < slow_work,
                 "{signature} must date its answer before the slow work after its wait"
@@ -784,6 +790,7 @@ mod tests {
             (500, "runner_died_during_startup"),
             (502, "runner_started_but_unresponsive"),
             (503, "frontend_dist_missing"),
+            (503, "frontend_build_tree_removed"),
             (503, "frontend_stale"),
             (400, "profile_not_found"),
             (500, "profile_apply_failed"),

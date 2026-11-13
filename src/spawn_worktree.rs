@@ -65,7 +65,10 @@
 //! pin (`9f4f7b60`, 6.1.0) built clean. A malformed declared pin is an error,
 //! never a silent fall back to `origin/main`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::process::Command;
 
 use crate::error::SupervisorError;
@@ -726,6 +729,18 @@ pub fn is_managed_runner_worktree(project_dir: &Path, runner_root: &Path) -> boo
 /// On the *reuse* path the container is left in place on a later failure (the
 /// caller may have ongoing state there) — but an OLD FLAT-layout container is
 /// always torn down and rebuilt first.
+///
+/// On success it stamps the container's mtime with the current time
+/// ([`set_dir_mtime`]), so the pruner's retention counts from the container's
+/// LAST USE rather than from its creation. The reuse path writes only inside the
+/// two nested worktrees, never in the container dir itself, so a container
+/// reused every day used to read as old as its creation and was pruned between
+/// uses. A failed preparation stamps nothing, so it never extends a
+/// container's life.
+///
+/// Callers hold the container's lock ([`SpawnContainerLocks`]) across this call
+/// and everything that reads the tree afterwards: this function resets a reused
+/// tree, which must never happen under a build that is reading it.
 pub async fn prepare_worktree(
     project_dir: &Path,
     git_ref: &str,
@@ -898,7 +913,20 @@ pub async fn prepare_worktree(
     };
 
     match finalize.await {
-        Ok(prepared) => Ok(prepared),
+        Ok(prepared) => {
+            // Age is last use (see the doc comment). Best-effort: a container
+            // whose stamp fails ages from an earlier use instead, and while it is
+            // in use its builder's lock keeps it from every sweep regardless.
+            if let Err(e) = set_dir_mtime(&prepared.container_path, SystemTime::now()) {
+                tracing::warn!(
+                    "spawn-worktree: could not stamp {:?} as used now (setting its mtime \
+                     failed: {}); the pruner will age it from an earlier use",
+                    prepared.container_path,
+                    e
+                );
+            }
+            Ok(prepared)
+        }
         Err(e) => {
             if was_fresh {
                 cleanup_fresh_worktree(
@@ -933,15 +961,71 @@ pub async fn prepare_worktree(
 //      `SPAWN_DIR_PREFIX`, and only directly under the derived workspace root
 //      where the supervisor itself creates them. A caller-owned `worktree_path`
 //      tree lives elsewhere and never matches this prefix-under-root filter.
-//   2. Never a container that is the build tree of a currently-active build
-//      (the caller passes the active set).
-//   3. A container younger than the retention window is kept; a container that
-//      is a *dirty* registered worktree is kept until DOUBLE the window (a peer
-//      may have adopted the scratch tree and made edits).
+//   2. Never a container that is IN USE: one whose lock
+//      ([`SpawnContainerLocks`]) a builder holds. The pruner only ever TRIES
+//      the lock, and holds the one it gets until the container is gone.
+//   3. A container used within the retention window is kept (age is the time
+//      since its last use, which `prepare_worktree` stamps on the container's
+//      mtime); a container that is a *dirty* registered worktree is kept until
+//      DOUBLE the window (a peer may have adopted the scratch tree and made
+//      edits).
 
 /// Directory-name prefix of every supervisor-created scratch worktree
 /// container. Centralized so [`prepare_worktree`] and the pruner agree.
 pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
+
+/// The per-container locks that are the ONE signal that a `.spawn-*` container
+/// is in use.
+///
+/// [`prepare_worktree`] REUSES a container by `git checkout --force` + `git
+/// reset --hard`, and the pruner deletes one outright. Either, done while
+/// another build is reading the container, pulls its source out from under the
+/// compiler, or its `dist/` out from under the frontend check that follows the
+/// build: failures that look exactly like code errors, or a healthy runner
+/// refused as `frontend_dist_missing` (2026-11-13). Every default spawn-test
+/// and the primary's origin/main rebuild share one `.spawn-origin_main`
+/// container, so that is the common case, not a rare collision.
+///
+/// So every BUILDER holds its container's lock from before `prepare_worktree`
+/// until it last reads the tree: spawn-test through its frontend verdict, the
+/// primary's origin/main rebuild through its build. Builds of the same ref
+/// serialize, an accepted trade since they would otherwise compile
+/// byte-identical source twice in parallel, and builds of different refs never
+/// contend. The PRUNER only ever `try_lock`s it: a held lock means "in use,
+/// keep", a sweep never waits behind a build that can run for most of an hour,
+/// and it holds the lock it took until the container is gone, so a builder
+/// that arrives meanwhile waits and then materializes a fresh one.
+///
+/// This replaced a hand-maintained set of "active" containers, a snapshot copy
+/// of what the lock already meant. A builder that started after a sweep took
+/// its snapshot was unprotected, the primary's rebuild was never in the set,
+/// and spawn-test took its own container out of it, then swept, before its
+/// frontend check had read the tree.
+///
+/// Keyed by the container path as [`container_path_for_ref`] spells it, which
+/// is also how the pruner's listing of the workspace root spells it: both are
+/// `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`. The map's
+/// `std::sync::Mutex` is never held across an await; the per-container
+/// `tokio::sync::Mutex` is what a build holds. Entries are never evicted: one
+/// empty mutex per container ever seen is negligible, and evicting a lock
+/// another task is queued on is the classic way to reintroduce the race.
+#[derive(Default)]
+pub struct SpawnContainerLocks {
+    locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl SpawnContainerLocks {
+    /// The lock for `container`, created on first use. An `Arc`, so a builder
+    /// can `lock_owned()` it and hold the guard across its whole
+    /// prepare-build-verify sequence, and the pruner can `try_lock_owned()` it.
+    pub fn lock_for(&self, container: &Path) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(container.to_path_buf())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
 
 /// Env var overriding the idle-retention window, in hours. Default
 /// [`DEFAULT_SPAWN_RETENTION_HOURS`]. `0` prunes every idle container
@@ -973,8 +1057,8 @@ fn retention_hours() -> u64 {
 pub struct PruneReport {
     /// Container dirs successfully removed.
     pub removed: Vec<PathBuf>,
-    /// Container dirs inspected but kept (with a short reason), e.g. too young,
-    /// active build, dirty-and-not-double-aged.
+    /// Container dirs inspected but kept (with a short reason), e.g. in use,
+    /// used too recently, dirty-and-not-double-aged.
     pub kept: Vec<(PathBuf, String)>,
     /// Container dirs we attempted to remove but failed (logged + skipped).
     pub failed: Vec<(PathBuf, String)>,
@@ -985,10 +1069,39 @@ pub struct PruneReport {
 /// is in the future relative to `now` (clock skew) — both treated by the caller
 /// as "unknown/zero age ⇒ do not prune", the safe default. `now` is injected so
 /// tests can advance the clock deterministically without touching mtimes.
-fn dir_age(path: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+///
+/// For a `.spawn-*` container this is the time since its LAST USE:
+/// [`prepare_worktree`] stamps the container's mtime on every successful
+/// preparation ([`set_dir_mtime`]).
+fn dir_age(path: &Path, now: SystemTime) -> Option<std::time::Duration> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     now.duration_since(mtime).ok()
+}
+
+/// Set the modification time of the directory `dir` to `when`.
+///
+/// Built on std's `File::set_modified`, the repo's way of setting an mtime
+/// (see the `lkg_coverage` tests); the `filetime` crate is not a dependency.
+/// It needs a handle to the directory itself. On Unix a plain read-only open
+/// gives one, and setting an explicit time needs ownership, not write access.
+/// On Windows `CreateFileW` opens a directory only with
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and `SetFileTime` needs a handle with write
+/// access.
+fn set_dir_mtime(dir: &Path, when: SystemTime) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `FILE_FLAG_BACKUP_SEMANTICS` (winbase.h).
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+    };
+    #[cfg(not(windows))]
+    let handle = std::fs::File::open(dir)?;
+    handle.set_modified(when)
 }
 
 /// True if `dir` is registered as a git worktree of `repo_root` AND has
@@ -1061,12 +1174,13 @@ async fn remove_spawn_container(
 /// `project_dir` is the supervisor's configured runner `src-tauri` (used to
 /// derive the workspace root and the owning repos — the SAME derivation
 /// `prepare_worktree` uses, so the pruner looks exactly where the supervisor
-/// creates these dirs). `active_containers` is the set of container paths a
-/// build is currently using (the active-build exclusion). `now` is injected so
-/// tests can pin time; production passes `SystemTime::now()`.
+/// creates these dirs). `locks` are the supervisor's container locks: a
+/// container whose lock is held is in use and kept ([`SpawnContainerLocks`]).
+/// `now` is injected so tests can pin time; production passes
+/// `SystemTime::now()`.
 ///
 /// Retention:
-/// - A container is "idle" (no active build) AND its mtime is older than the
+/// - A container that is not in use AND was last used longer ago than the
 ///   single window ⇒ prunable, unless it is a dirty registered worktree.
 /// - A dirty registered worktree requires DOUBLE the window before it is
 ///   prunable (a peer may have adopted the scratch tree).
@@ -1076,13 +1190,13 @@ async fn remove_spawn_container(
 /// caller. Returns a [`PruneReport`] for logging/tests.
 pub async fn prune_spawn_worktrees(
     project_dir: &Path,
-    active_containers: &std::collections::HashSet<PathBuf>,
-    now: std::time::SystemTime,
+    locks: &SpawnContainerLocks,
+    now: SystemTime,
 ) -> PruneReport {
     // Delegate to the window-parameterized inner fn with no override, so the
-    // engine resolves the retention window from env exactly as before. Existing
-    // callers (startup sweep, opportunistic sweep) are unchanged.
-    prune_spawn_worktrees_with_window(project_dir, active_containers, now, None).await
+    // engine resolves the retention window from env (the startup sweep and
+    // spawn-test's sweep after its build).
+    prune_spawn_worktrees_with_window(project_dir, locks, now, None).await
 }
 
 /// Same as [`prune_spawn_worktrees`] but with an explicit retention-window
@@ -1096,11 +1210,12 @@ pub async fn prune_spawn_worktrees(
 /// Exists so the `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint can
 /// pass an operator-chosen window WITHOUT changing the env-derived default for
 /// the background sweeps. All selection/safety invariants are identical — only
-/// the window source differs.
+/// the window source differs. In particular `Some(0)` still keeps a container
+/// whose lock is held.
 pub async fn prune_spawn_worktrees_with_window(
     project_dir: &Path,
-    active_containers: &std::collections::HashSet<PathBuf>,
-    now: std::time::SystemTime,
+    locks: &SpawnContainerLocks,
+    now: SystemTime,
     window_hours_override: Option<u64>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
@@ -1187,11 +1302,19 @@ pub async fn prune_spawn_worktrees_with_window(
             continue;
         }
 
-        // Invariant 2: never prune a container with an active build.
-        if active_containers.contains(&path) {
-            report.kept.push((path.clone(), "active build".to_string()));
+        // Invariant 2: never prune a container in use. A builder holds its
+        // container's lock from before `prepare_worktree` until its last read
+        // of the tree, so a held lock IS "in use". Only TRIED here: a sweep
+        // must never wait behind a build. The guard is held through the checks
+        // below and the removal, so a builder that arrives meanwhile waits for
+        // the removal to finish and then materializes a fresh container.
+        let Ok(_held) = locks.lock_for(&path).try_lock_owned() else {
+            report.kept.push((
+                path.clone(),
+                "in use: a build holds its container lock".to_string(),
+            ));
             continue;
-        }
+        };
 
         // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
         let age = match dir_age(&path, now) {
@@ -1206,7 +1329,10 @@ pub async fn prune_spawn_worktrees_with_window(
         if age < retention {
             report.kept.push((
                 path.clone(),
-                format!("younger than retention ({}h)", retention.as_secs() / 3600),
+                format!(
+                    "used within the retention window ({}h)",
+                    retention.as_secs() / 3600
+                ),
             ));
             continue;
         }
@@ -1228,7 +1354,7 @@ pub async fn prune_spawn_worktrees_with_window(
         match remove_spawn_container(&path, &repo_root, schemas_repo_root.as_deref()).await {
             Ok(()) => {
                 tracing::info!(
-                    "spawn-prune: removed stale scratch worktree {:?} (age {}h, retention {}h)",
+                    "spawn-prune: removed stale scratch worktree {:?} (unused for {}h, retention {}h)",
                     path,
                     age.as_secs() / 3600,
                     retention.as_secs() / 3600
@@ -1983,9 +2109,8 @@ mod tests {
     // an injected `now` so retention boundaries are deterministic without
     // touching mtimes.
 
-    use std::collections::HashSet;
     use std::sync::OnceLock;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     /// Serializes tests that read or mutate the process-wide retention env var
     /// so a `set_var("0")` in one test can't bleed into another's
@@ -2013,10 +2138,10 @@ mod tests {
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
         assert!(prepared.container_path.exists());
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 24h old, default 48h window → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(24)).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(24)).await;
         assert!(
             prepared.container_path.exists(),
             "container younger than retention must be kept"
@@ -2025,7 +2150,7 @@ mod tests {
         assert_eq!(r.kept.len(), 1);
 
         // 49h old, default 48h window → removed (clean worktree, single window).
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(49)).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(49)).await;
         assert!(
             !prepared.container_path.exists(),
             "container older than retention must be removed; still present: {:?}",
@@ -2038,6 +2163,61 @@ mod tests {
         );
     }
 
+    /// Age is LAST USE, not creation (plan
+    /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+    /// D2). The reuse path writes only inside the nested worktrees, so a
+    /// container reused that very day still read as old as its creation: "age
+    /// 117h" on 2026-11-13, pruned inside the spawn that had just built in it.
+    #[tokio::test]
+    async fn a_reused_container_ages_from_its_last_use_not_its_creation() {
+        let _g = retention_env_guard().lock().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let created = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        // Created 200h ago and not used since: past even the dirty window (96h).
+        set_dir_mtime(
+            &created.container_path,
+            SystemTime::now() - Duration::from_secs(200 * 3600),
+        )
+        .expect("backdate the container");
+        let idle = dir_age(&created.container_path, SystemTime::now()).expect("an age");
+        assert!(
+            idle >= Duration::from_secs(199 * 3600),
+            "fixture: the backdate must take, read {idle:?}"
+        );
+
+        let reused = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare again (reuse)");
+        let age = dir_age(&reused.container_path, SystemTime::now()).expect("an age");
+        assert!(
+            age < Duration::from_secs(60),
+            "a container prepare_worktree just reused must read as just used, not {age:?} old"
+        );
+
+        // So the default-window sweep keeps it.
+        let r = prune_spawn_worktrees(
+            &src_tauri,
+            &SpawnContainerLocks::default(),
+            SystemTime::now(),
+        )
+        .await;
+        assert!(
+            reused.container_path.exists() && r.removed.is_empty(),
+            "a container used moments ago was pruned: {r:?}"
+        );
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &reused.container_path,
+            &reused.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&reused.schemas_path),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn prune_window_override_maps_to_age_window() {
         let _g = retention_env_guard().lock().await;
@@ -2047,10 +2227,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 12h old, override 24h → kept (younger than the override window).
-        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(24))
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(12), Some(24))
             .await;
         assert!(
             prepared.container_path.exists(),
@@ -2059,7 +2239,7 @@ mod tests {
         assert!(r.removed.is_empty());
 
         // 12h old, override 6h → removed (older than the override window).
-        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(6))
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(12), Some(6))
             .await;
         assert!(
             !prepared.container_path.exists(),
@@ -2068,43 +2248,50 @@ mod tests {
         assert_eq!(r.removed.len(), 1);
     }
 
+    /// A container whose lock is held is in use, and no window prunes it: not
+    /// even `0`, which is what `DELETE /spawn-worktrees?older_than_hours=0`
+    /// passes (plan
+    /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+    /// D1). The lock is the one "in use" signal, so a builder is protected
+    /// whenever it started, with no set of active containers to keep current.
     #[tokio::test]
-    async fn prune_excludes_active_build_container() {
+    async fn prune_keeps_a_container_whose_lock_is_held_even_at_window_zero() {
         let _g = retention_env_guard().lock().await;
-        // An aged container that is in the active-build set is KEPT regardless
-        // of age.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+        let locks = SpawnContainerLocks::default();
 
-        let mut active: HashSet<PathBuf> = HashSet::new();
-        active.insert(prepared.container_path.clone());
-
-        // 999h old but active → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &active, now_plus_hours(999)).await;
+        // A builder holds it, as one does from before its prepare until its
+        // last read of the tree.
+        let held = locks.lock_for(&prepared.container_path).lock_owned().await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), Some(0)).await;
         assert!(
-            prepared.container_path.exists(),
-            "active-build container must never be pruned"
+            prepared.container_path.exists() && r.removed.is_empty(),
+            "a container whose lock is held was pruned: {r:?}"
         );
-        assert!(r.removed.is_empty());
         assert!(
             r.kept
                 .iter()
-                .any(|(p, why)| p == &prepared.container_path && why.contains("active build")),
-            "kept reason must cite the active build; got {:?}",
+                .any(|(p, why)| p == &prepared.container_path && why.contains("in use")),
+            "the kept reason must say it is in use; got {:?}",
             r.kept
         );
 
-        // cleanup
-        let schemas_repo = _root.join("qontinui-schemas");
-        cleanup_fresh_worktree(
-            &find_repo_root(&src_tauri).unwrap(),
-            &prepared.container_path,
-            &prepared.worktree_path,
-            Some(&schemas_repo),
-            Some(&prepared.schemas_path),
-        )
-        .await;
+        // Released, the same sweep removes it: the lock was all that kept it.
+        drop(held);
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), Some(0)).await;
+        assert!(
+            !prepared.container_path.exists(),
+            "fixture: with its lock free, a window of 0 must prune it: {r:?}"
+        );
+        assert_eq!(r.removed, vec![prepared.container_path.clone()]);
+        assert!(
+            locks.lock_for(&prepared.container_path).try_lock().is_ok(),
+            "the sweep must let go of the lock it held while removing the container"
+        );
     }
 
     /// The managed runner worktree is recognised by where it sits, so it is
@@ -2152,8 +2339,8 @@ mod tests {
         let near_miss = root.join(".spawning");
         std::fs::create_dir_all(&near_miss).expect("mkdir near miss");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
-        let _ = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+        let locks = SpawnContainerLocks::default();
+        let _ = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(999)).await;
 
         assert!(decoy.exists(), "non-spawn dir must be untouched");
         assert!(
@@ -2185,10 +2372,10 @@ mod tests {
         )
         .expect("write dirty file");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 50h old: past single 48h window but a dirty tree needs 96h → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(50)).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(50)).await;
         assert!(
             prepared.container_path.exists(),
             "dirty container past single window but under double must be kept"
@@ -2202,7 +2389,7 @@ mod tests {
         );
 
         // 97h old: past double 96h window → removed even though dirty.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(97)).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(97)).await;
         assert!(
             !prepared.container_path.exists(),
             "dirty container past double window must be removed"
@@ -2230,10 +2417,10 @@ mod tests {
         std::fs::write(broken.join("qontinui-runner").join("marker"), "x").expect("write marker");
         assert!(broken.exists());
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
         // Aged well past retention → the `git worktree remove` no-ops (not a
         // registered worktree) and the dir delete fallback removes it.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(999)).await;
         assert!(
             !broken.exists(),
             "broken/unregistered spawn container must be removed via dir-delete fallback"
@@ -2256,11 +2443,11 @@ mod tests {
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // With a 0h window, a brand-new (age ~0) clean container is prunable.
         std::env::set_var(SPAWN_RETENTION_ENV, "0");
-        let r = prune_spawn_worktrees(&src_tauri, &empty, SystemTime::now()).await;
+        let r = prune_spawn_worktrees(&src_tauri, &locks, SystemTime::now()).await;
         std::env::remove_var(SPAWN_RETENTION_ENV);
 
         assert!(

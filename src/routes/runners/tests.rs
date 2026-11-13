@@ -792,6 +792,73 @@ async fn returns_dist_missing_even_when_src_tree_is_empty() {
     assert_eq!(result, Some(FrontendStaleReason::DistMissing));
 }
 
+/// The built tree's root itself is gone: `BuildTreeRemoved`, not
+/// `DistMissing`. On 2026-11-13 the spawn's own sweep had deleted its
+/// `.spawn-origin_main` container, and the verdict read as a missing dist/
+/// with an `npm run build` remedy that could not help, which got a healthy
+/// runner killed (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+/// D3).
+#[tokio::test]
+async fn returns_build_tree_removed_when_the_root_itself_is_absent() {
+    let tmp = TempDir::new().expect("tempdir");
+    let gone = tmp
+        .path()
+        .join(".spawn-origin_main")
+        .join("qontinui-runner");
+    assert_eq!(
+        check_dist_freshness(&gone).await,
+        Some(FrontendStaleReason::BuildTreeRemoved),
+        "an absent root is a removed tree, not a missing dist/"
+    );
+}
+
+/// What a spawn door answers on each refusal: the token, the reason on the
+/// wire, and a remedy that fits the cause. A removed tree's remedy names the
+/// pruner and never sends the caller to rebuild the frontend.
+#[test]
+fn a_frontend_refusal_names_the_remedy_for_its_own_cause() {
+    let root = std::path::Path::new("/ws/.spawn-origin_main/qontinui-runner");
+
+    let removed =
+        super::frontend_refusal_body(FrontendStaleReason::BuildTreeRemoved, None, Some(root));
+    assert_eq!(removed["error"], "frontend_build_tree_removed");
+    assert_eq!(removed["frontend_stale_reason"], "build_tree_removed");
+    assert_eq!(removed["frontend_stale"], true);
+    let message = removed["message"].as_str().expect("a message");
+    assert!(message.contains("pruner"), "{message}");
+    assert!(message.contains(&root.display().to_string()), "{message}");
+    assert!(!message.contains("npm run build"), "{message}");
+
+    let missing = super::frontend_refusal_body(FrontendStaleReason::DistMissing, None, Some(root));
+    assert_eq!(missing["error"], "frontend_dist_missing");
+    assert_eq!(missing["frontend_stale_reason"], "dist_missing");
+    assert!(
+        missing["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("npm run build")),
+        "{missing}"
+    );
+
+    let strict = super::frontend_refusal_body(FrontendStaleReason::SrcDrift, Some(2), Some(root));
+    assert_eq!(strict["error"], "frontend_stale");
+    assert_eq!(strict["frontend_stale_reason"], "src_newer_than_dist");
+    assert_eq!(strict["stale_slot_id"], 2);
+
+    for reason in [
+        FrontendStaleReason::DistMissing,
+        FrontendStaleReason::BuildTreeRemoved,
+    ] {
+        assert!(reason.refuses_unconditionally(), "{reason:?}");
+    }
+    for reason in [
+        FrontendStaleReason::BuildFailed,
+        FrontendStaleReason::SrcDrift,
+    ] {
+        assert!(!reason.refuses_unconditionally(), "{reason:?}");
+    }
+}
+
 #[tokio::test]
 async fn returns_src_drift_when_src_newer_than_dist() {
     // Build dist first, then write src/. The src file's mtime will
@@ -909,6 +976,73 @@ fn frontend_stale_reason_wire_format_is_stable() {
         "src_newer_than_dist"
     );
     assert_eq!(FrontendStaleReason::DistMissing.as_str(), "dist_missing");
+    assert_eq!(
+        FrontendStaleReason::BuildTreeRemoved.as_str(),
+        "build_tree_removed"
+    );
+}
+
+/// D3 at source level (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`):
+/// spawn-test reads its frontend verdict while it still holds its container's
+/// lock, and refuses on it before it starts a runner. The build itself cannot
+/// run in a unit test (`tests/spawn_test_build_result.rs`), so the wiring is
+/// pinned here.
+///
+/// The lock used to be bound inside the rebuild block, so it was released
+/// before the verdict read the built tree: the spawn's own sweep deleted the
+/// container in between, and a healthy runner was started only to be killed
+/// as `frontend_dist_missing` (2026-11-13). The brace walk fails if the guard
+/// is declared in a scope that closes before the verdict.
+#[test]
+fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_starting() {
+    let body: String = fn_source("async fn execute_spawn_build_inner(")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let declared = "letmutcontainer_guard:Option<tokio::sync::OwnedMutexGuard<()>>=None;";
+    let verdict = "resolve_frontend_stale_for_spawn(";
+    let released = "drop(container_guard);";
+    let mut last = 0;
+    for mark in [
+        declared,
+        "container_guard=Some(state.take_spawn_container_lock(&container,\"spawn-test\").await",
+        "crate::spawn_worktree::prepare_worktree(",
+        "run_detailed(build_dir_override.clone()).await",
+        verdict,
+        "crate::spawn_worktree::prune_spawn_worktrees(",
+        released,
+        "frontend_refusal_body(reason,stale_slot_id,checked_root)",
+        "apply_paired_state_for_spawn(",
+        "manager::start_managed_runner(",
+    ] {
+        let at = body[last..]
+            .find(mark)
+            .unwrap_or_else(|| panic!("execute_spawn_build_inner: no {mark} after byte {last}"));
+        last += at + mark.len();
+    }
+    assert_eq!(
+        body.matches(verdict).count(),
+        1,
+        "one frontend verdict, read under the lock; a second one read after the start would \
+         read a tree nothing protects"
+    );
+    let from = body.find(declared).expect("the declaration") + declared.len();
+    let to = body.find(released).expect("the release");
+    let mut depth = 0i32;
+    for c in body[from..to].chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        assert!(
+            depth >= 0,
+            "container_guard's scope closes before it is released, so the verdict between \
+             them is not read under the container lock"
+        );
+    }
 }
 
 /// Pin the default + explicit-true wire shapes for the

@@ -790,43 +790,15 @@ pub struct SupervisorState {
     /// single-flights the *one* live-tree rebuild with no key at all, which is
     /// only correct because there is exactly one such tree.
     pub spawn_test_inflight: RwLock<HashMap<SpawnDedupKey, SpawnInflight>>,
-    /// Spawn-worktree containers (`<workspace_root>/.spawn-<ref>/`) that are
-    /// currently being built. A `git_ref` spawn-test materializes such a
-    /// container, then holds a build-pool slot while compiling the tree inside
-    /// it. The container is the supervisor's to delete once idle, but it is
-    /// NEVER safe to remove while that build is in flight.
-    ///
-    /// [`crate::routes::runners::spawn_test`] inserts the container path before
-    /// the build and removes it after (success or failure). The spawn-worktree
-    /// pruner ([`crate::spawn_worktree::prune_spawn_worktrees`]) consults this
-    /// set as its active-build exclusion: any candidate present here is skipped,
-    /// regardless of age. Keyed by the canonical container path string so the
-    /// pruner's directory enumeration and the build wiring agree on identity.
-    pub active_spawn_worktrees: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-    /// Per-spawn-container **mutual exclusion** for materialize-then-build.
-    ///
-    /// `prepare_worktree` REUSES a container by `git checkout --force` +
-    /// `git reset --hard`. Doing that while another spawn is mid-`cargo build`
-    /// in the same container yanks source files out from under the compiler —
-    /// producing failures that look exactly like code errors. Before
-    /// 2026-07-22 this could only happen when two callers passed the SAME
-    /// explicit `git_ref`; now that `origin/main` is the spawn-test default,
-    /// every default spawn targets one shared `.spawn-origin_main` container,
-    /// so it would be the common case rather than a rare collision.
-    ///
-    /// The guard is held across BOTH the materialization and the build, so a
-    /// container is never reset while a build reads it. Scope is per container
-    /// path: spawns of DIFFERENT refs never contend. Concurrent spawns of the
-    /// SAME ref serialize — an accepted trade, since they would otherwise
-    /// compile byte-identical source twice in parallel for no benefit.
-    ///
-    /// `std::sync::Mutex` guards only the map (never held across an await);
-    /// the per-container `tokio::sync::Mutex` is the async lock actually held
-    /// across the build. Entries are never evicted — one empty mutex per
-    /// distinct ref ever spawned is negligible, and evicting a lock another
-    /// task is queued on is the classic way to reintroduce the race.
-    pub spawn_container_locks:
-        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// The per-container locks that are the one signal that a spawn-worktree
+    /// container (`<workspace_root>/.spawn-<ref>/`) is in use — see
+    /// [`crate::spawn_worktree::SpawnContainerLocks`]. A builder takes its
+    /// container's through [`SupervisorState::take_spawn_container_lock`] and
+    /// holds it from before `prepare_worktree` until it last reads the tree; every
+    /// spawn-worktree sweep (at startup, after a spawn-test build, and
+    /// `DELETE /spawn-worktrees`) is handed the whole set, only tries each
+    /// lock, and keeps a container whose lock is held.
+    pub spawn_container_locks: crate::spawn_worktree::SpawnContainerLocks,
     /// Cached build-artifact footprint snapshot (plan
     /// `2026-06-05-supervisor-build-artifact-footprint`). Walking the GB-scale
     /// `target-pool/slot-*` + `.spawn-*` trees is minutes-slow, so the snapshot
@@ -2088,8 +2060,7 @@ impl SupervisorState {
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
             spawn_test_inflight: RwLock::new(HashMap::new()),
-            active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
-            spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawn_container_locks: crate::spawn_worktree::SpawnContainerLocks::default(),
             footprint: RwLock::new(None),
             origin_drift: RwLock::new(None),
         }
@@ -2176,22 +2147,37 @@ impl SupervisorState {
         let _ = self.health_tx.send(());
     }
 
-    /// Get (creating on first use) the mutual-exclusion lock for a spawn
-    /// container. See [`SupervisorState::spawn_container_locks`] for why this
-    /// exists — in short, `prepare_worktree` hard-resets a reused container and
-    /// must never do so while a build is reading it.
+    /// Take the lock on a spawn container, which a builder holds from before
+    /// `prepare_worktree` until it last reads the tree. See
+    /// [`crate::spawn_worktree::SpawnContainerLocks`] — in short,
+    /// `prepare_worktree` hard-resets a reused container and a sweep deletes
+    /// one, and neither may happen while a build is reading it.
     ///
-    /// Returns an `Arc` so the caller can `lock_owned()` and hold the guard
-    /// across the whole materialize+build sequence. The map mutex is released
-    /// before the caller ever awaits, so this never blocks the runtime.
-    pub fn spawn_container_lock(&self, container: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self
-            .spawn_container_locks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.entry(container.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// When another build holds it, the caller waits until that build is done
+    /// with the tree, and the log says so first, naming `taker`: the wait can
+    /// last that build's whole run, and a primary rebuild waits with the
+    /// primary already stopped. The map mutex is released before any await, so
+    /// this never blocks the runtime.
+    pub async fn take_spawn_container_lock(
+        &self,
+        container: &std::path::Path,
+        taker: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = self.spawn_container_locks.lock_for(container);
+        if let Ok(guard) = lock.clone().try_lock_owned() {
+            return guard;
+        }
+        self.logs
+            .emit(
+                LogSource::Supervisor,
+                LogLevel::Info,
+                format!(
+                    "{taker}: waiting for spawn container {container:?}: another build holds \
+                     its lock, and this one goes on once that build is done with the tree"
+                ),
+            )
+            .await;
+        lock.lock_owned().await
     }
 
     /// Future that completes when a shutdown is signaled on `shutdown_tx`.
@@ -2681,6 +2667,57 @@ mod tests {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         assert_eq!(state.config.port, DEFAULT_SUPERVISOR_PORT);
+    }
+
+    /// A builder whose spawn container another build holds waits until that
+    /// build lets go, and says so in the log before it waits: the wait can last
+    /// a whole build, and a primary rebuild sits it out with the primary
+    /// already stopped. An uncontended take logs nothing.
+    #[tokio::test]
+    async fn take_spawn_container_lock_waits_for_the_holder_and_logs_the_wait() {
+        async fn logged(state: &SupervisorState, taker: &str) -> bool {
+            let wanted = format!("{taker}: waiting for spawn container");
+            state
+                .logs
+                .history()
+                .await
+                .iter()
+                .any(|entry| entry.message.contains(&wanted))
+        }
+        let state = Arc::new(SupervisorState::new(make_test_config()));
+        let container = PathBuf::from("/tmp/test/.spawn-origin_main");
+
+        let held = state.take_spawn_container_lock(&container, "first").await;
+        assert!(
+            !logged(&state, "first").await,
+            "an uncontended take has nothing to wait for"
+        );
+
+        let waiter = tokio::spawn({
+            let (state, container) = (state.clone(), container.clone());
+            async move {
+                let _guard = state.take_spawn_container_lock(&container, "second").await;
+            }
+        });
+        let budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + budget;
+        while !logged(&state, "second").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the contended take logged no wait within {budget:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "the second build took a lock the first still holds"
+        );
+
+        drop(held);
+        tokio::time::timeout(budget, waiter)
+            .await
+            .expect("the second build goes on once the first lets go")
+            .expect("the waiting task ran to its end");
     }
 
     #[tokio::test]

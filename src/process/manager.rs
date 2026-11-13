@@ -7226,7 +7226,22 @@ async fn after_stop_seam(runner_id: &str) {
 /// next operator restart self-documents which commit the primary will run
 /// (Phase B verification is deferred to that real restart — it can't be
 /// exercised against the live primary from a session).
+///
+/// It builds in `.spawn-origin_main`, the container every default spawn-test
+/// builds in, so it holds that container's lock
+/// ([`crate::spawn_worktree::SpawnContainerLocks`]) from before
+/// `prepare_worktree` until its build is done. Unlocked, its `checkout
+/// --force` / `reset --hard` could reset a spawn-test's tree mid-build, a
+/// spawn-test could reset this one, and any sweep could delete the container
+/// under this build, since nothing else marked it in use.
 async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), SupervisorError> {
+    // Released when this function returns, the build done: the exe it
+    // produced lives in the build slot, not in the container.
+    let container =
+        crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, "origin/main")?;
+    let _container_guard = state
+        .take_spawn_container_lock(&container, "Primary rebuild")
+        .await;
     let prepared =
         crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
 
