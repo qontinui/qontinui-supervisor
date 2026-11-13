@@ -4121,13 +4121,21 @@ async fn execute_spawn_build_inner(
     // machinery (the type-level guarantee from the plan).
     let mut worktree_path_info: Option<crate::spawn_worktree::ValidatedExistingWorktree> = None;
 
-    // Set to the spawn container path of a `git_ref` build that materialized a
-    // fresh `.spawn-*` container, so we can (a) mark it active for the duration
-    // of the build (the pruner's active-build exclusion) and (b) run an
-    // opportunistic prune sweep after the build, scrubbing OTHER stale
-    // containers this new one's parent dir accumulated. `None` for live-tree /
-    // worktree_path builds (no supervisor-owned scratch container involved).
-    let mut active_spawn_container: Option<std::path::PathBuf> = None;
+    // The lock on this spawn's managed `.spawn-<ref>` container
+    // (`SupervisorState::take_spawn_container_lock`), the one signal that the
+    // container is in use. Taken before `prepare_worktree` materializes or
+    // resets the tree, held through the build AND the frontend verdict that
+    // reads the built tree, then dropped explicitly once nothing reads the
+    // container any more. While it is held, a same-ref spawn-test or a primary
+    // rebuild waits instead of resetting the tree, and every sweep keeps the
+    // container as in use. Declared here, at function scope, because the
+    // verdict is read after the rebuild block: a guard scoped to that block
+    // ended before the verdict, which let a sweep (or a queued same-ref build)
+    // delete or rebuild the tree the verdict then read (2026-11-13: a healthy
+    // runner killed as `frontend_dist_missing`). `None` for the live tree and a
+    // caller-owned `worktree_path`, which the supervisor neither resets nor
+    // prunes.
+    let mut container_guard: Option<tokio::sync::OwnedMutexGuard<()>> = None;
 
     // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
     // runner root of the tree that was actually built. The spawned exe embeds
@@ -4199,31 +4207,22 @@ async fn execute_spawn_build_inner(
         // Any git failure aborts the request (no silent fallback to the live
         // tree — provenance is the whole point). Release the placeholder port
         // on failure so it doesn't leak.
-        // Held across BOTH materialize and build so a concurrent spawn of the
-        // same ref can't `git reset --hard` the container out from under this
-        // build (the race the default-origin/main flip made common — see
-        // `SupervisorState::spawn_container_locks`). `None` for the non-managed
-        // sources (live tree / caller-owned worktree_path): those are not
-        // reset by the supervisor, so they need no guard. The guard drops at
-        // the end of this function scope, after the build completes.
-        let _container_guard: Option<tokio::sync::OwnedMutexGuard<()>> =
-            match build_source.managed_ref() {
-                Some(git_ref) => {
-                    match crate::spawn_worktree::container_path_for_ref(
-                        &state.config.project_dir,
-                        git_ref,
-                    ) {
-                        Ok(container) => {
-                            Some(state.spawn_container_lock(&container).lock_owned().await)
-                        }
-                        // Can't derive the container path (malformed layout) —
-                        // prepare_worktree below will surface the real error;
-                        // proceed unguarded rather than 500 here.
-                        Err(_) => None,
-                    }
-                }
-                None => None,
-            };
+        //
+        // The container's lock first (see `container_guard`). A container path
+        // that cannot be derived (malformed layout) takes no lock:
+        // `prepare_worktree` fails on the same derivation before it touches
+        // anything, and surfaces the real error.
+        if let Some(git_ref) = build_source.managed_ref() {
+            if let Ok(container) =
+                crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, git_ref)
+            {
+                container_guard = Some(
+                    state
+                        .take_spawn_container_lock(&container, "spawn-test")
+                        .await,
+                );
+            }
+        }
         let build_dir_override = match build_source.managed_ref() {
             Some(git_ref) => {
                 match crate::spawn_worktree::prepare_worktree(&state.config.project_dir, git_ref)
@@ -4271,15 +4270,6 @@ async fn execute_spawn_build_inner(
                                 schemas_wt_path: Some(wt.schemas_path.clone()),
                             });
                         }
-                        // Mark this container active so the pruner never reaps
-                        // it while the build below is in flight. Removed after
-                        // the build completes (success or failure) — see the
-                        // unregister + opportunistic-sweep block after the build.
-                        {
-                            let mut active = state.active_spawn_worktrees.lock().unwrap();
-                            active.insert(wt.container_path.clone());
-                        }
-                        active_spawn_container = Some(wt.container_path.clone());
                         // The staleness check must inspect the tree whose
                         // dist/ the spawned exe embeds. That is the runner
                         // worktree root (`<ws>/.spawn-<ref>/qontinui-runner`),
@@ -4655,58 +4645,61 @@ async fn execute_spawn_build_inner(
                     // Fall through to exe-resolution + spawn below. If the
                     // resolution fails, we'll surface 500 there.
                 } else {
-                    // Release the placeholder port reservation.
-                    if let Some(container) = active_spawn_container.take() {
-                        state
-                            .active_spawn_worktrees
-                            .lock()
-                            .unwrap()
-                            .remove(&container);
-                    }
+                    // Release the placeholder port reservation. (Returning
+                    // drops `container_guard`: nothing will read the tree.)
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
                     return Err(e);
                 }
             }
         }
+    }
 
-        // Build finished (success, or stale-fallback that didn't early-return).
-        // Unregister the active spawn container so the pruner may reap it once
-        // it ages out, then run an OPPORTUNISTIC prune sweep: a freshly-built
-        // `.spawn-*` container is the natural trigger to scrub OTHER stale
-        // scratch containers its parent dir accumulated. Best-effort + bounded
-        // — the sweep itself never fails the spawn request.
-        if let Some(container) = active_spawn_container.take() {
+    // The frontend verdict, read while `container_guard` still holds the
+    // managed container: the built tree's `dist/` cannot be deleted by a sweep
+    // or emptied by a queued same-ref build's `vite build` between the build
+    // and this read. Invariant: it inspects the tree whose dist/ the spawned
+    // exe embeds — the provenance build tree (`built_root`) when a
+    // `git_ref`/`worktree_path` build happened, the live tree otherwise. It is
+    // ACTED on below, before any runner starts.
+    let checked_root = built_root.as_deref().or(state.config.project_dir.parent());
+    let (frontend_stale, stale_reason, stale_slot_id) =
+        resolve_frontend_stale_for_spawn(state, checked_root).await;
+
+    // A managed build is the natural trigger to scrub OTHER stale scratch
+    // containers the workspace root accumulated: an OPPORTUNISTIC sweep. It
+    // runs while this spawn still holds its own container's lock, so it keeps
+    // that container as in use like any other a build holds. Best-effort +
+    // bounded — the sweep itself never fails the spawn request.
+    if git_ref_info.is_some() {
+        let report = crate::spawn_worktree::prune_spawn_worktrees(
+            &state.config.project_dir,
+            &state.spawn_container_locks,
+            std::time::SystemTime::now(),
+        )
+        .await;
+        if !report.removed.is_empty() || !report.failed.is_empty() {
             state
-                .active_spawn_worktrees
-                .lock()
-                .unwrap()
-                .remove(&container);
-
-            let active_now: std::collections::HashSet<std::path::PathBuf> =
-                state.active_spawn_worktrees.lock().unwrap().clone();
-            let report = crate::spawn_worktree::prune_spawn_worktrees(
-                &state.config.project_dir,
-                &active_now,
-                std::time::SystemTime::now(),
-            )
-            .await;
-            if !report.removed.is_empty() || !report.failed.is_empty() {
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Info,
-                        format!(
-                            "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
-                            report.removed.len(),
-                            report.failed.len()
-                        ),
-                    )
-                    .await;
-            }
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!(
+                        "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
+                        report.removed.len(),
+                        report.failed.len()
+                    ),
+                )
+                .await;
         }
     }
+
+    // Nothing reads the managed container after this point: the exe and its
+    // sidecars are deployed from the build slot, the runner runs in the live
+    // tree, and the provenance compares below run in the runner repo
+    // (`provenance_compare_root`). Release it so a queued same-ref build can
+    // start, and so a sweep may prune it once it ages out.
+    drop(container_guard);
 
     // `allow_stale_fallback` is the caller explicitly saying "run whatever
     // exists". Carry it to the start path so `unverified_exe_gate` allows a
@@ -4769,6 +4762,25 @@ async fn execute_spawn_build_inner(
     // mark the build_result as reusing-stale so callers can detect it.
     if matches!(build_succeeded, Some(false)) {
         build_reused_stale = true;
+    }
+
+    // Refuse on the frontend verdict BEFORE starting a runner — never start
+    // one only to kill it. `DistMissing` and `BuildTreeRemoved` refuse
+    // unconditionally (`FrontendStaleReason::refuses_unconditionally`): a
+    // runner that embeds no frontend serves a blank screen at every route,
+    // and one whose built tree is gone embeds a frontend nobody can verify.
+    // The stale-but-functional reasons refuse only under `frontend_strict`.
+    // Placed after the exe checks above, so a spawn with no runner binary at
+    // all still says so.
+    if let Some(reason) =
+        stale_reason.filter(|reason| reason.refuses_unconditionally() || body.frontend_strict)
+    {
+        let mut runners = state.runners.write().await;
+        runners.remove(id);
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_root),
+        ));
     }
 
     // Log label only — this value never reaches `RunnerConfig` (the
@@ -5101,75 +5113,6 @@ async fn execute_spawn_build_inner(
             .and_then(|p| crate::process::manager::binary_meta(&p))
     };
 
-    // Determine if the slot we used for the binary has a stale frontend
-    // baked in (build failure) OR if `src/` is newer than `dist/index.html`
-    // (someone forgot to `npm run build`). Either way, the runner ships with
-    // a UI that doesn't reflect current source.
-    //
-    // Invariant: the staleness check must inspect the tree whose dist/ the
-    // spawned exe embeds — the provenance build tree (`built_root`) when a
-    // `git_ref`/`worktree_path` build happened, the live tree otherwise.
-    let (frontend_stale, stale_reason, stale_slot_id) = resolve_frontend_stale_for_spawn(
-        state,
-        built_root.as_deref().or(state.config.project_dir.parent()),
-    )
-    .await;
-
-    // Short-circuit with 503 before reporting success when the spawned
-    // runner would serve a broken or stale UI. Two triggers:
-    //
-    //  1. `DistMissing` — ALWAYS hard-fails, regardless of `frontend_strict`.
-    //     A missing `dist/index.html` is not "stale but functional": the
-    //     runner has NO embedded frontend and serves `asset not found:
-    //     index.html` at every route — a blank screen. Returning
-    //     `status=healthy` here lies to the caller (a manual-test run caught
-    //     exactly this: gutted `node_modules/.bin` + empty `dist/` → the
-    //     freshly-built runner embedded a blank frontend, yet spawn-test only
-    //     warned and reported healthy). A blank UI is never healthy, so the
-    //     default path must refuse the spawn, not warn-and-serve.
-    //
-    //  2. Any other `frontend_stale` reason (`BuildFailed` / `SrcDrift`) —
-    //     hard-fails only when the caller opted into strict-frontend
-    //     enforcement via `frontend_strict: true`. These are stale-but-
-    //     functional (the UI renders, just not the latest source), so the
-    //     default stays warn-and-serve for back-compat.
-    let dist_missing = matches!(stale_reason, Some(FrontendStaleReason::DistMissing));
-    if frontend_stale && (dist_missing || body.frontend_strict) {
-        // Stop the runner we just spawned — we will not ship a broken/stale
-        // UI to the caller. `force: true` for the same reason as the
-        // failed-probe teardown above: nothing has ever run on this runner.
-        let _ = manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
-        {
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-        }
-        state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let message = if dist_missing {
-            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
-             missing, so the runner would embed no frontend and serve a blank screen \
-             (`asset not found: index.html`) at every route. Run \
-             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
-             unconditional: a missing dist is never reported as healthy."
-                .to_string()
-        } else {
-            format!(
-                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
-                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
-                 or pass {{\"frontend_strict\": false}} to override.",
-                reason_str
-            )
-        };
-        let body = json!({
-            "error": if dist_missing { "frontend_dist_missing" } else { "frontend_stale" },
-            "message": message,
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
-    }
-
     // Item A: assemble the build_result JSON object. `slot_id` reads
     // last_successful_slot AFTER the build (or after the no-op when
     // !attempted) so stale-fallback runs report the slot whose exe is
@@ -5492,19 +5435,7 @@ async fn execute_spawn_build_inner(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
 
         // The legacy `X-Frontend-Stale: 1` response header can't ride a stored
         // submission outcome, so the sync handler re-attaches it by branching on
@@ -5527,6 +5458,13 @@ async fn execute_spawn_build_inner(
 ///   `supervisor-frontend-build-silent-success.md`. Surface it loudly
 ///   instead so callers learn the runner will serve `asset not found:
 ///   index.html`.
+/// - `BuildTreeRemoved`: the built tree's root itself does not exist, so
+///   nothing can say which frontend the binary embeds. Reporting that as
+///   `DistMissing` claimed a blank UI it had not observed, and its `npm run
+///   build` remedy sent the operator after a dist/ that was never the problem
+///   (2026-11-13: the spawn's own sweep had deleted the container). A managed
+///   build reads its verdict while it holds the container's lock, so it no
+///   longer reaches this; it is the honest answer for anything else.
 ///
 /// Reported back to callers via `frontend_stale_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5534,6 +5472,7 @@ enum FrontendStaleReason {
     BuildFailed,
     SrcDrift,
     DistMissing,
+    BuildTreeRemoved,
 }
 
 impl FrontendStaleReason {
@@ -5542,7 +5481,107 @@ impl FrontendStaleReason {
             FrontendStaleReason::BuildFailed => "build_failed",
             FrontendStaleReason::SrcDrift => "src_newer_than_dist",
             FrontendStaleReason::DistMissing => "dist_missing",
+            FrontendStaleReason::BuildTreeRemoved => "build_tree_removed",
         }
+    }
+
+    /// Whether a spawn door refuses on this reason whatever `frontend_strict`
+    /// says. `DistMissing` is not "stale but functional": the runner has NO
+    /// embedded frontend and serves `asset not found: index.html` at every
+    /// route — a blank screen, never healthy (a manual-test run caught a
+    /// gutted `node_modules/.bin` + empty `dist/` reported healthy). With
+    /// `BuildTreeRemoved` nobody can say which frontend it embeds, and an
+    /// UNKNOWN is not reported as healthy either. `BuildFailed` / `SrcDrift`
+    /// are stale but functional (the UI renders, just not the latest source),
+    /// so they refuse only when the caller opts in with `frontend_strict`.
+    fn refuses_unconditionally(self) -> bool {
+        matches!(
+            self,
+            FrontendStaleReason::DistMissing | FrontendStaleReason::BuildTreeRemoved
+        )
+    }
+}
+
+/// The 503 body a spawn door answers with when it refuses a spawn on its
+/// frontend verdict: `reason` refuses unconditionally, or the caller asked
+/// for `frontend_strict`. `checked_root` is the tree the verdict read.
+///
+/// `error` is a token per refusal (`frontend_dist_missing`,
+/// `frontend_build_tree_removed`, `frontend_stale` for a strict refusal),
+/// and each message names the remedy that fits its own cause. A removed tree
+/// is not a dist/ problem, so its message never recommends rebuilding the
+/// frontend.
+fn frontend_refusal_body(
+    reason: FrontendStaleReason,
+    stale_slot_id: Option<usize>,
+    checked_root: Option<&std::path::Path>,
+) -> serde_json::Value {
+    let (error, message) = match reason {
+        FrontendStaleReason::DistMissing => (
+            "frontend_dist_missing",
+            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
+             missing, so the runner would embed no frontend and serve a blank screen \
+             (`asset not found: index.html`) at every route. Run \
+             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
+             unconditional: a missing dist is never reported as healthy."
+                .to_string(),
+        ),
+        FrontendStaleReason::BuildTreeRemoved => (
+            "frontend_build_tree_removed",
+            format!(
+                "frontend_build_tree_removed: refusing to spawn — the tree this spawn built \
+                 ({}) no longer exists, so nothing can say which frontend the runner would \
+                 embed. Its dist/ was never the problem: retry the spawn, which materializes \
+                 the tree again. A managed `.spawn-<ref>` container is removed only by the \
+                 spawn-worktree pruner (the startup sweep, the sweep after a spawn-test \
+                 build, `DELETE /spawn-worktrees`), which keeps a container while a build \
+                 holds its lock, or by `cleanup_worktree_on_fail`; a `worktree_path` tree \
+                 only by its owner.",
+                checked_root.map_or_else(
+                    || "unresolved".to_string(),
+                    |root| root.display().to_string()
+                ),
+            ),
+        ),
+        FrontendStaleReason::BuildFailed | FrontendStaleReason::SrcDrift => (
+            "frontend_stale",
+            format!(
+                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
+                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
+                 or pass {{\"frontend_strict\": false}} to override.",
+                reason.as_str()
+            ),
+        ),
+    };
+    json!({
+        "error": error,
+        "message": message,
+        "frontend_stale": true,
+        "frontend_stale_reason": reason.as_str(),
+        "stale_slot_id": stale_slot_id,
+    })
+}
+
+/// The `warnings` entry of a spawn served with a stale frontend, the same at
+/// both spawn doors. The doors answer a reason that refuses unconditionally
+/// with [`frontend_refusal_body`] instead, so only `BuildFailed` / `SrcDrift`
+/// reach this from them; the other arms describe their reason all the same.
+fn frontend_stale_warning(
+    reason: Option<FrontendStaleReason>,
+    stale_slot_id: Option<usize>,
+) -> String {
+    match reason {
+        Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
+            Some(sid) => format!(
+                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                sid
+            ),
+            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        },
+        Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+        Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
+        Some(FrontendStaleReason::BuildTreeRemoved) => "frontend_stale: the tree this spawn built no longer exists, so nothing can say which frontend the runner embeds. Retry the spawn, which materializes the tree again.".to_string(),
+        None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
     }
 }
 
@@ -5586,7 +5625,9 @@ async fn resolve_frontend_stale_for_spawn(
         return (true, Some(FrontendStaleReason::BuildFailed), None);
     }
 
-    // (2) On-disk dist/ check — handles two cases:
+    // (2) On-disk dist/ check — handles three cases:
+    //   - the built tree itself is gone (`BuildTreeRemoved`): its dist/ says
+    //     nothing about what the binary embeds.
     //   - `dist/index.html` is missing entirely (the silent-success bug:
     //     prior to 2026-05-11 this returned "not stale" and the runner
     //     went on to serve `asset not found: index.html`).
@@ -5607,8 +5648,12 @@ async fn resolve_frontend_stale_for_spawn(
 /// return the appropriate `FrontendStaleReason` (or `None` if the dist on
 /// disk genuinely covers the current source).
 ///
-/// Three outcomes:
+/// Four outcomes:
 ///
+/// - `Some(BuildTreeRemoved)` — `runner_root` itself is gone (positively
+///   absent, not merely unreadable), so its dist/ says nothing about the
+///   frontend the binary embeds. Read as `DistMissing` before, it sent a
+///   caller after an `npm run build` that could not help.
 /// - `Some(DistMissing)` — `dist/index.html` doesn't exist on disk. Prior
 ///   to 2026-05-11 this silently returned "not stale", which let the
 ///   runner spawn with no embedded frontend and serve `asset not found:
@@ -5622,6 +5667,12 @@ async fn resolve_frontend_stale_for_spawn(
 ///   to).
 async fn check_dist_freshness(runner_root: &std::path::Path) -> Option<FrontendStaleReason> {
     use std::time::SystemTime;
+
+    // Only a positive answer of absence counts: an error reading the root is
+    // left to the dist/ check below, as it was before this arm existed.
+    if matches!(runner_root.try_exists(), Ok(false)) {
+        return Some(FrontendStaleReason::BuildTreeRemoved);
+    }
 
     let dist_index = runner_root.join("dist").join("index.html");
     let src_root = runner_root.join("src");
@@ -6355,23 +6406,26 @@ async fn spawn_named_inner(
 
     // spawn-named has no provenance selectors — it always builds the live
     // tree, so the live tree IS the built tree here.
+    let checked_root = state.config.project_dir.parent();
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state, state.config.project_dir.parent()).await;
+        resolve_frontend_stale_for_spawn(&state, checked_root).await;
 
-    // DistMissing hard-fail (symmetric with spawn_test). A missing
+    // The unconditional refusals, symmetric with spawn_test
+    // (`FrontendStaleReason::refuses_unconditionally`). A missing
     // `dist/index.html` means the runner embeds NO frontend and serves a
-    // blank screen (`asset not found: index.html`) at every route — never a
+    // blank screen (`asset not found: index.html`) at every route, and a
+    // removed tree means nobody can say which frontend it embeds — never a
     // `healthy` outcome. Unlike `SrcDrift`/`BuildFailed` (stale-but-
-    // functional), this is unconditional. Tear the named runner back down
-    // (stop, drop from the registry, AND remove the just-persisted settings
-    // entry so it doesn't resurrect on the next supervisor restart) and
-    // return 503 instead of reporting a blank UI as healthy.
-    if frontend_stale && matches!(stale_reason, Some(FrontendStaleReason::DistMissing)) {
+    // functional), these do not wait for an opt-in. Tear the named runner
+    // back down (stop, drop from the registry, AND remove the just-persisted
+    // settings entry so it doesn't resurrect on the next supervisor restart)
+    // and return 503 instead of reporting it as healthy.
+    if let Some(reason) = stale_reason.filter(|reason| reason.refuses_unconditionally()) {
         // `force: true`: a NAMED runner, so the gate would otherwise apply —
         // but this is the teardown of a runner spawned moments ago that we are
-        // refusing to hand back because it embeds no frontend. It has never
-        // hosted a session, and leaving it running while also returning 503
-        // would leak it.
+        // refusing to hand back because of its frontend. It has never hosted
+        // a session, and leaving it running while also returning 503 would
+        // leak it.
         let _ = manager::stop_runner_by_id(&state, &id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
@@ -6380,18 +6434,10 @@ async fn spawn_named_inner(
         let settings_path = settings::settings_path(&state.config);
         settings::remove_runner(&settings_path, &id);
         state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let body = json!({
-            "error": "frontend_dist_missing",
-            "message": "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html \
-                is missing, so the runner would embed no frontend and serve a blank screen \
-                (`asset not found: index.html`) at every route. Run \
-                `cd qontinui-runner && npm run build` to rebuild dist/, then retry.",
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_root),
+        ));
     }
 
     // Item A: assemble build_result alongside the existing top-level
@@ -6448,19 +6494,7 @@ async fn spawn_named_inner(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
         // The handler adds the `X-Frontend-Stale: 1` header for this body.
         return Ok((axum::http::StatusCode::OK, resp));
     }
@@ -6878,9 +6912,10 @@ pub async fn list_builds(
 
 #[derive(Deserialize, Default)]
 pub struct PruneSpawnQuery {
-    /// Retention window override in hours. A container is prunable once its
-    /// mtime is older than this (dirty registered worktrees need DOUBLE). When
-    /// omitted, the engine resolves the window from
+    /// Retention window override in hours. A container is prunable once it
+    /// was last used longer ago than this (its mtime, which `prepare_worktree`
+    /// stamps on every use; dirty registered worktrees need DOUBLE) and no
+    /// build holds it. When omitted, the engine resolves the window from
     /// `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS` / its 48h default.
     #[serde(default)]
     pub older_than_hours: Option<u64>,
@@ -6891,10 +6926,11 @@ pub struct PruneSpawnQuery {
 ///
 /// Thin wrapper over the existing engine
 /// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
-/// owns ALL selection + safety (prefix-under-root filter, active-build
-/// exclusion, age + dirty double-retention). This handler only:
-///   1. passes the LIVE active-container set from state (same source the
-///      opportunistic sweep uses),
+/// owns ALL selection + safety (prefix-under-root filter, the in-use
+/// exclusion, last-use age + dirty double-retention). This handler only:
+///   1. passes the supervisor's container locks, so a container a build holds
+///      is kept as in use — even under `older_than_hours=0`, which otherwise
+///      prunes every container at once,
 ///   2. forwards the optional `older_than_hours` window override,
 ///   3. measures container sizes BEFORE the delete so it can report
 ///      `bytes_freed`,
@@ -6927,13 +6963,9 @@ pub async fn prune_spawn_worktrees_endpoint(
             Err(_) => std::collections::HashMap::new(),
         };
 
-    // Live active-build container set — mirror the opportunistic sweep.
-    let active_now: std::collections::HashSet<std::path::PathBuf> =
-        state.active_spawn_worktrees.lock().unwrap().clone();
-
     let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
         &state.config.project_dir,
-        &active_now,
+        &state.spawn_container_locks,
         std::time::SystemTime::now(),
         query.older_than_hours,
     )

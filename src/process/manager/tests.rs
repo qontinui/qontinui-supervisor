@@ -6280,6 +6280,50 @@ fn failed_at_exe_resolution(err: &SupervisorError) -> bool {
     }
 }
 
+/// The primary's origin/main rebuild builds in `.spawn-origin_main`, the container
+/// every default spawn-test builds in, so it holds that container's lock from before
+/// `prepare_worktree` resets the tree until its build is done (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+/// D1). Unlocked, it could reset a spawn-test's tree mid-build, and any sweep could
+/// delete the container under it. Source level, because the rebuild compiles the
+/// runner. The guard must be a NAMED binding: `let _ =` would drop it at once.
+#[test]
+fn the_primary_rebuild_holds_its_spawn_container_lock_across_prepare_and_build() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let sig = "async fn primary_rebuild_from_origin_main(";
+    let body: String = crate::source_scan::fn_body(&src, sig)
+        .unwrap_or_else(|| panic!("{sig} exists"))
+        .split_whitespace()
+        .collect();
+    let in_order = |marks: &[&str]| {
+        let mut last = 0;
+        for mark in marks {
+            let at = body[last..]
+                .find(mark)
+                .unwrap_or_else(|| panic!("{sig}: no {mark} after byte {last}"));
+            last += at + mark.len();
+        }
+    };
+    in_order(&[
+        "container_path_for_ref(&state.config.project_dir,\"origin/main\")?;",
+        "let_container_guard=state.take_spawn_container_lock(&container,",
+        "crate::spawn_worktree::prepare_worktree(&state.config.project_dir,\"origin/main\")",
+        "crate::build_monitor::run_cargo_build_with_dir(",
+    ]);
+    assert!(
+        !body.contains("drop(_container_guard)"),
+        "{sig} must hold its container lock until its build is done"
+    );
+}
+
 /// `rebuild_and_restart_by_id` cannot run in a unit test, since it builds. Its start
 /// must be told, as the other restart's is, what its own stop removed, read right
 /// after that stop and before the rebuild, which can take most of an hour.
