@@ -2870,7 +2870,8 @@ async fn mint_spawn_action(
 }
 
 /// The git repo root whose object db + refs the spawn-response provenance
-/// compares must be run in: the tree that was ACTUALLY compiled.
+/// compares must be run in: one that holds the tree that was ACTUALLY
+/// compiled.
 ///
 /// `built_root` is `Some(<runner root>)` for a provenance build (`git_ref` /
 /// `worktree_path`) and `None` for a live-tree build. Running an ancestry
@@ -2880,21 +2881,43 @@ async fn mint_spawn_action(
 /// guaranteed to exist in the canonical object db, and its `origin/main` is not
 /// guaranteed to be the same ref, so the compare is at best coincidentally
 /// right. Probing the built tree makes the sha always resolvable there.
+///
+/// A managed `.spawn-<ref>` container's runner worktree is the exception: it
+/// is a linked worktree OF the runner repo, sharing that repo's object store
+/// and refs, so the runner repo resolves its sha and its `origin/main` alike —
+/// and the runner repo outlives the container. These compares run after the
+/// spawn has released the container's lock, when a sweep may already have
+/// deleted it, and a compare run in a deleted tree fails quietly
+/// (`not_computable`, a `null` warning) and drops the stale-build warning.
 fn provenance_compare_root(
     state: &SharedState,
     built_root: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
-    match built_root {
-        Some(root) => root.to_path_buf(),
-        // `project_dir` is the runner's `src-tauri`; git resolves upward from
-        // any subdir, but use the repo root for parity with the other drift
-        // call sites.
-        None => state
+    // `project_dir` is the runner's `src-tauri`; git resolves upward from any
+    // subdir, but use the repo root for parity with the other drift call
+    // sites.
+    let live_repo_root = || {
+        state
             .config
             .project_dir
             .parent()
             .unwrap_or(&state.config.project_dir)
-            .to_path_buf(),
+            .to_path_buf()
+    };
+    match built_root {
+        Some(root)
+            if crate::spawn_worktree::is_managed_runner_worktree(
+                &state.config.project_dir,
+                root,
+            ) =>
+        {
+            // The repo `prepare_worktree` added the worktree to. It resolved
+            // then, so a miss now is the live layout itself gone.
+            crate::spawn_worktree::find_repo_root(&state.config.project_dir)
+                .unwrap_or_else(|_| live_repo_root())
+        }
+        Some(root) => root.to_path_buf(),
+        None => live_repo_root(),
     }
 }
 
