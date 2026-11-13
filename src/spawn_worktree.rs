@@ -679,6 +679,29 @@ pub fn runner_worktree_path_for_ref(
     Ok(container_path_for_ref(project_dir, git_ref)?.join("qontinui-runner"))
 }
 
+/// Whether `runner_root` is the runner worktree of a managed spawn container:
+/// `<workspace_root>/.spawn-<ref>/qontinui-runner`, directly under the
+/// workspace root `project_dir` derives, which is where [`prepare_worktree`]
+/// puts it and where the pruner looks. Decided from the path alone, so it also
+/// answers for a container that has since been deleted.
+///
+/// Such a tree is a linked worktree of the runner repo ([`find_repo_root`]): it
+/// shares that repo's object store and refs, so the sha it was built at, and
+/// `origin/main`, resolve in the runner repo as well, which outlives the
+/// container.
+pub fn is_managed_runner_worktree(project_dir: &Path, runner_root: &Path) -> bool {
+    let Some(container) = runner_root.parent() else {
+        return false;
+    };
+    runner_root.file_name() == Some(std::ffi::OsStr::new("qontinui-runner"))
+        && container
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SPAWN_DIR_PREFIX))
+        && derive_workspace_root(project_dir)
+            .is_ok_and(|workspace_root| container.parent() == Some(workspace_root.as_path()))
+}
+
 /// Ensure a managed, *isolated* detached worktree set for `git_ref` exists.
 /// Idempotent: a subsequent call for the same ref reuses the existing
 /// container, force-resets the runner worktree to the ref, and re-pins the
@@ -2082,6 +2105,35 @@ mod tests {
             Some(&prepared.schemas_path),
         )
         .await;
+    }
+
+    /// The managed runner worktree is recognised by where it sits, so it is
+    /// still recognised once a sweep has deleted it.
+    #[test]
+    fn a_managed_runner_worktree_is_recognised_by_its_place_alone() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let src_tauri = root.join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir runner/src-tauri");
+        std::fs::create_dir_all(root.join("qontinui-schemas")).expect("mkdir schemas");
+
+        let managed = runner_worktree_path_for_ref(&src_tauri, "origin/main").expect("a path");
+        assert!(!managed.exists(), "fixture: never materialized");
+        assert!(is_managed_runner_worktree(&src_tauri, &managed));
+
+        for not_managed in [
+            root.join("qontinui-runner"),
+            root.join(".spawn-origin_main").join("qontinui-schemas"),
+            root.join(".spawning").join("qontinui-runner"),
+            root.join("elsewhere")
+                .join(".spawn-origin_main")
+                .join("qontinui-runner"),
+        ] {
+            assert!(
+                !is_managed_runner_worktree(&src_tauri, &not_managed),
+                "{not_managed:?} is not a managed container's runner worktree"
+            );
+        }
     }
 
     #[tokio::test]

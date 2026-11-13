@@ -2079,6 +2079,61 @@ async fn build_older_than_lkg_compares_in_the_override_tree_not_the_canonical_ch
     );
 }
 
+/// A managed `.spawn-<ref>` container's provenance compare runs in the RUNNER
+/// REPO, which shares the container worktree's object store and refs and
+/// outlives it (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+/// D4). These compares run after the spawn has released the container's lock,
+/// when a sweep may already have deleted it; run in the deleted tree, the
+/// compare failed quietly as `not_computable` and the stale-build warning was
+/// dropped.
+#[tokio::test]
+async fn build_older_than_lkg_compares_a_deleted_managed_container_in_the_runner_repo() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let workspace = tmp.path();
+    let runner = workspace.join("qontinui-runner");
+    std::fs::create_dir_all(runner.join("src-tauri")).unwrap();
+    std::fs::create_dir_all(workspace.join("qontinui-schemas")).unwrap();
+    git_in(&runner, &["init", "-q", "-b", "main"]);
+    git_in(&runner, &["config", "user.email", "test@example.com"]);
+    git_in(&runner, &["config", "user.name", "test"]);
+    let built = commit_file(&runner, "seed.txt");
+    commit_file(&runner, "a.txt");
+    let lkg_sha = commit_file(&runner, "b.txt");
+
+    let state = make_state_at(&runner);
+    seed_lkg(&state, Some(lkg_sha.clone())).await;
+    // The spawn's managed worktree, a linked worktree of the runner repo at
+    // the commit it built...
+    let built_root = crate::spawn_worktree::runner_worktree_path_for_ref(
+        &state.config.project_dir,
+        "origin/main",
+    )
+    .expect("a managed worktree path");
+    git_in(
+        &runner,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            built_root.to_str().expect("a utf-8 path"),
+            &built,
+        ],
+    );
+    // ...whose container a sweep then deleted.
+    std::fs::remove_dir_all(built_root.parent().expect("its container")).unwrap();
+
+    let out = super::build_older_than_lkg_json(&state, Some(&built), Some(&built_root)).await;
+    assert_eq!(
+        out["older"],
+        serde_json::json!(true),
+        "the compare must run in the runner repo, which still holds the deleted tree's history: \
+         {out}"
+    );
+    assert_eq!(out["behind_count"], serde_json::json!(2), "{out}");
+    assert_eq!(out["lkg_sha"], serde_json::json!(lkg_sha));
+}
+
 /// Best-effort: an LKG with no recorded sha (legacy sidecar / failed git
 /// probe) reports a reason, never a false staleness alarm.
 #[tokio::test]
