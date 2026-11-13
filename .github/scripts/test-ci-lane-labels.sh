@@ -106,6 +106,9 @@ fail_case "$ci" "a variable declared twice" "declared more than once"
 decl="$work/decltable.toml"
 sed 's/^\[\[variables\]\]$/[variables]/' "$real_decl" > "$decl"; decl_applied decltable
 fail_case "$ci" "variables written as a single table" "array of tables"
+decl="$work/declnontable.toml"
+printf 'variables = ["x"]\n' > "$decl"
+fail_case "$ci" "a declaration entry that is not a table" "is not a table"
 decl="$work/absent.toml"
 rc=0; python3 -I -B "$check" "$ci" "$decl" > /dev/null 2>&1 || rc=$?
 if [ "$rc" -eq 2 ]; then echo "ok   - a missing declaration exits 2"; else echo "FAIL - missing declaration exited $rc, want 2"; fail=1; fi
