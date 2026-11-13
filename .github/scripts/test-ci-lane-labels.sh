@@ -47,6 +47,16 @@ fail_case "$(mutate floor "|| '\[\"ubuntu-latest\"\]'" "|| '[\"ubuntu-24.04\"]'"
   "one runs-on floor drifts" "floor literal"
 fail_case "$(mutate unrouted 'needs.route.outputs.labels) ||' 'needs.other.outputs.labels) ||')" \
   "a runs-on stops reading route's output" "does not read needs.route.outputs.labels"
+# A routed job with two coord-pools lines: only one may vouch for the pool.
+python3 -I - "$ci" "$work/dupe.yml" <<'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+m = re.search(r"^ +# coord-pools:.*\n", s, re.M)
+open(sys.argv[2], "w").write(s[:m.end()] + m.group(0) + s[m.end():])
+PY
+fail_case "$work/dupe.yml" "a routed job with two coord-pools lines" "lines, want 1"
+fail_case "$(mutate nolane "_CI_LINUX_LANE == 'self-hosted'" "_CI_LINUX_LANE == 'forced'")" \
+  "a routed runs-on forces the pool under no lane variable" "under no"
 # A job that hardcodes the pool outside the router.
 cp "$ci" "$work/hardcoded.yml"
 printf '  sneaky:\n    runs-on: [self-hosted, Linux, X64, ram-16g]\n    steps:\n      - run: true\n' >> "$work/hardcoded.yml"
