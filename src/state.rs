@@ -2182,6 +2182,40 @@ impl SupervisorState {
         }
     }
 
+    /// Sweep stale `.spawn-*` containers
+    /// ([`crate::spawn_worktree::prune_spawn_worktrees_with_window`]) on a task of
+    /// its own, and wait for it. The one door every sweep goes through: at
+    /// startup, after a spawn-test build, and `DELETE /spawn-worktrees`.
+    ///
+    /// The sweep holds a container's lock until that container's removal is
+    /// done, and the removal outlives a dropped future (a `git worktree
+    /// remove` child, a blocking `remove_dir_all`). Run inline, a caller that
+    /// went away midway (an HTTP client hanging up) would release the lock
+    /// while the deleting went on, and a builder waiting on it would
+    /// materialize into a half-removed tree. On its own task, such a caller
+    /// drops only its wait.
+    pub async fn sweep_spawn_worktrees(
+        self: &Arc<Self>,
+        window_hours_override: Option<u64>,
+    ) -> crate::spawn_worktree::PruneReport {
+        let state = self.clone();
+        let sweep = tokio::spawn(async move {
+            crate::spawn_worktree::prune_spawn_worktrees_with_window(
+                &state.config.project_dir,
+                &state.spawn_container_locks,
+                std::time::SystemTime::now(),
+                window_hours_override,
+            )
+            .await
+        });
+        match sweep.await {
+            Ok(report) => report,
+            // Nothing aborts the sweep's task, so a join error is its panic:
+            // carry it on, as if the sweep had run inline.
+            Err(failed) => std::panic::resume_unwind(failed.into_panic()),
+        }
+    }
+
     /// Future that completes when a shutdown is signaled on `shutdown_tx`.
     ///
     /// Long-lived streams (SSE handlers, polling loops) call this to learn

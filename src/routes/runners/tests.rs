@@ -1012,7 +1012,7 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
         "crate::spawn_worktree::prepare_worktree(",
         "letmutbuild_result=run_detailed(build_dir_override.clone(),",
         verdict,
-        "crate::spawn_worktree::prune_spawn_worktrees(",
+        "state.sweep_spawn_worktrees(None).await",
         released,
         "frontend_refusal_body(reason,stale_slot_id,checked_root)",
         "apply_paired_state_for_spawn(",
@@ -1107,6 +1107,64 @@ async fn a_spawn_tests_container_wait_honours_no_wait_and_its_queue_budget() {
     super::take_container_for_spawn(&state, container, "spawn-test test-2", false, Some(budget))
         .await
         .expect("a free container is taken within any budget");
+}
+
+/// W1 (review round 1 of plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`):
+/// `DELETE /spawn-worktrees` runs its sweep on a task of its own, so a client
+/// that hangs up mid-sweep drops only its wait. The sweep keeps the lock of the
+/// container it is removing until the removal is done: a builder that takes
+/// that lock next finds the container gone, never half-removed.
+#[tokio::test]
+async fn a_delete_spawn_worktrees_hang_up_leaves_the_removal_to_finish_under_its_lock() {
+    let tmp = TempDir::new().expect("tempdir");
+    let runner = tmp.path().join("qontinui-runner");
+    // `find_repo_root`'s marker; the sweep's git calls fail on it and fall
+    // through to the directory delete, as on a broken registration.
+    fs::create_dir_all(runner.join(".git")).expect("mkdir .git");
+    fs::create_dir_all(runner.join("src-tauri")).expect("mkdir src-tauri");
+    fs::create_dir_all(tmp.path().join("qontinui-schemas")).expect("mkdir schemas");
+    let container = tmp.path().join(".spawn-origin_main");
+    for i in 0..200 {
+        write_file(
+            &container
+                .join("qontinui-runner")
+                .join("src")
+                .join(format!("f{i}.ts")),
+            b"export {};",
+        );
+    }
+    let state = make_state_at(&runner);
+
+    let request = tokio::spawn(super::prune_spawn_worktrees_endpoint(
+        axum::extract::State(state.clone()),
+        axum::extract::Query(super::PruneSpawnQuery {
+            older_than_hours: Some(0),
+        }),
+    ));
+    // Hang up the moment the sweep holds the container: on this single-threaded
+    // runtime nothing runs between the read and the abort.
+    let budget = crate::test_clock::poll_budget(Duration::from_secs(30));
+    let deadline = std::time::Instant::now() + budget;
+    while state.spawn_container_locks.holder(&container).as_deref()
+        != Some(crate::spawn_worktree::SPAWN_SWEEP_TAKER)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sweep did not take the container within {budget:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    request.abort();
+
+    let _builder = state
+        .spawn_container_locks
+        .take(&container, "a builder")
+        .await;
+    assert!(
+        !container.exists(),
+        "a builder took the container's lock while its removal was unfinished"
+    );
 }
 
 /// Pin the default + explicit-true wire shapes for the

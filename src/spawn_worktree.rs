@@ -954,7 +954,7 @@ pub async fn prepare_worktree(
 //
 // Safety is the whole point — getting it wrong deletes a checkout. The
 // predicate is intentionally conservative and layered (see
-// [`prune_spawn_worktrees`]). The three never-touch invariants are enforced
+// [`prune_spawn_worktrees_with_window`]). The three never-touch invariants are enforced
 // structurally, not by comment:
 //
 //   1. Only directories whose name starts with the supervisor's own
@@ -1299,7 +1299,15 @@ async fn remove_spawn_container(
 /// creates these dirs). `locks` are the supervisor's container locks: a
 /// container whose lock is held is in use and kept ([`SpawnContainerLocks`]).
 /// `now` is injected so tests can pin time; production passes
-/// `SystemTime::now()`.
+/// `SystemTime::now()`. `window_hours_override`:
+/// - `None` ⇒ resolve the window from [`SPAWN_RETENTION_ENV`] / the default
+///   (the startup sweep and spawn-test's sweep after its build);
+/// - `Some(h)` ⇒ use `h` hours as the single retention window (and `2*h` as the
+///   dirty-worktree double-retention window), so
+///   `DELETE /spawn-worktrees?older_than_hours=<h>` can pass an
+///   operator-chosen window without changing the background default.
+///   `Some(0)` prunes every idle container immediately, and still keeps a
+///   container whose lock is held.
 ///
 /// Retention:
 /// - A container that is not in use AND was last used longer ago than the
@@ -1307,33 +1315,16 @@ async fn remove_spawn_container(
 /// - A dirty registered worktree requires DOUBLE the window before it is
 ///   prunable (a peer may have adopted the scratch tree).
 ///
+/// It holds a container's lock until that container's removal is done, so it
+/// must not be dropped midway: a `git worktree remove` child and a blocking
+/// `remove_dir_all` would go on deleting with the lock already released, and a
+/// builder waiting on it would materialize into a half-removed tree. Run it
+/// through `SupervisorState::sweep_spawn_worktrees`, which runs it on a task
+/// of its own.
+///
 /// Best-effort throughout: a failure to derive roots, stat a dir, or remove a
 /// dir is logged and skipped — this never returns an error and never fails the
 /// caller. Returns a [`PruneReport`] for logging/tests.
-pub async fn prune_spawn_worktrees(
-    project_dir: &Path,
-    locks: &SpawnContainerLocks,
-    now: SystemTime,
-) -> PruneReport {
-    // Delegate to the window-parameterized inner fn with no override, so the
-    // engine resolves the retention window from env (the startup sweep and
-    // spawn-test's sweep after its build).
-    prune_spawn_worktrees_with_window(project_dir, locks, now, None).await
-}
-
-/// Same as [`prune_spawn_worktrees`] but with an explicit retention-window
-/// override (in hours). `window_hours_override`:
-/// - `None` ⇒ resolve the window from [`SPAWN_RETENTION_ENV`] / the default
-///   (the behavior of [`prune_spawn_worktrees`]);
-/// - `Some(h)` ⇒ use `h` hours as the single retention window (and `2*h` as the
-///   dirty-worktree double-retention window). `Some(0)` prunes every idle
-///   container immediately, subject to the dirty double-retention rule.
-///
-/// Exists so the `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint can
-/// pass an operator-chosen window WITHOUT changing the env-derived default for
-/// the background sweeps. All selection/safety invariants are identical — only
-/// the window source differs. In particular `Some(0)` still keeps a container
-/// whose lock is held.
 pub async fn prune_spawn_worktrees_with_window(
     project_dir: &Path,
     locks: &SpawnContainerLocks,
@@ -2224,7 +2215,7 @@ mod tests {
         );
     }
 
-    // ---------- prune_spawn_worktrees (Phase 4) ----------
+    // ---------- prune_spawn_worktrees_with_window (Phase 4) ----------
     //
     // These build a real workspace fixture, materialize one or more genuine
     // `.spawn-*` containers via `prepare_worktree`, and drive the pruner with
@@ -2263,7 +2254,8 @@ mod tests {
         let locks = SpawnContainerLocks::default();
 
         // 24h old, default 48h window → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(24)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(24), None).await;
         assert!(
             prepared.container_path.exists(),
             "container younger than retention must be kept"
@@ -2272,7 +2264,8 @@ mod tests {
         assert_eq!(r.kept.len(), 1);
 
         // 49h old, default 48h window → removed (clean worktree, single window).
-        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(49)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(49), None).await;
         assert!(
             !prepared.container_path.exists(),
             "container older than retention must be removed; still present: {:?}",
@@ -2319,10 +2312,11 @@ mod tests {
         );
 
         // So the default-window sweep keeps it.
-        let r = prune_spawn_worktrees(
+        let r = prune_spawn_worktrees_with_window(
             &src_tauri,
             &SpawnContainerLocks::default(),
             SystemTime::now(),
+            None,
         )
         .await;
         assert!(
@@ -2519,7 +2513,8 @@ mod tests {
         std::fs::create_dir_all(&near_miss).expect("mkdir near miss");
 
         let locks = SpawnContainerLocks::default();
-        let _ = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(999)).await;
+        let _ =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(999), None).await;
 
         assert!(decoy.exists(), "non-spawn dir must be untouched");
         assert!(
@@ -2554,7 +2549,8 @@ mod tests {
         let locks = SpawnContainerLocks::default();
 
         // 50h old: past single 48h window but a dirty tree needs 96h → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(50)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(50), None).await;
         assert!(
             prepared.container_path.exists(),
             "dirty container past single window but under double must be kept"
@@ -2568,7 +2564,8 @@ mod tests {
         );
 
         // 97h old: past double 96h window → removed even though dirty.
-        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(97)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(97), None).await;
         assert!(
             !prepared.container_path.exists(),
             "dirty container past double window must be removed"
@@ -2599,7 +2596,8 @@ mod tests {
         let locks = SpawnContainerLocks::default();
         // Aged well past retention → the `git worktree remove` no-ops (not a
         // registered worktree) and the dir delete fallback removes it.
-        let r = prune_spawn_worktrees(&src_tauri, &locks, now_plus_hours(999)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(999), None).await;
         assert!(
             !broken.exists(),
             "broken/unregistered spawn container must be removed via dir-delete fallback"
@@ -2626,7 +2624,8 @@ mod tests {
 
         // With a 0h window, a brand-new (age ~0) clean container is prunable.
         std::env::set_var(SPAWN_RETENTION_ENV, "0");
-        let r = prune_spawn_worktrees(&src_tauri, &locks, SystemTime::now()).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), None).await;
         std::env::remove_var(SPAWN_RETENTION_ENV);
 
         assert!(
