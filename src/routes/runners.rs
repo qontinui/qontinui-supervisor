@@ -3246,8 +3246,10 @@ pub async fn spawn_test(
     // would pick the same free port — the second spawn would then collide.
     //
     // We insert the ManagedRunner before the (potentially long) build so
-    // subsequent scanners see the reservation. If the build fails, the
-    // placeholder is removed.
+    // subsequent scanners see the reservation. A `PlaceholderReservation`
+    // owns it from the insert on and gives it back on every outcome that does
+    // not start the runner — every refusal, `Ok` or `Err`, a panic and a
+    // cancelled future alike.
     //
     // We also keep an Arc to the ManagedRunner for the rest of this handler
     // so the eventual start call uses it directly, bypassing an id-based
@@ -3255,7 +3257,7 @@ pub async fn spawn_test(
     // possible when a concurrent path (reaper, stop_all, failed probe on a
     // sibling spawn) removes our id between insertion and start. Smoke tests
     // hit this ~1 in 10 times under load.
-    let (id, port, managed, in_flight_guard) = {
+    let (id, port, managed, in_flight_guard, reservation) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -3316,7 +3318,8 @@ pub async fn spawn_test(
         // `submit_spawn` clears the marker through `Drop`.
         let in_flight_guard = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
         runners.insert(id.clone(), managed.clone());
-        (id, port, managed, in_flight_guard)
+        let reservation = PlaceholderReservation::new(&state, &id, &managed);
+        (id, port, managed, in_flight_guard, reservation)
     };
 
     // friction-1: stamp the owning requester onto the runner so `GET /runners`
@@ -3381,8 +3384,6 @@ pub async fn spawn_test(
     //   return the stored outcome. Both paths share one state machine.
     let want_async = body.r#async;
     let exec_state = state.clone();
-    let exec_managed = managed.clone();
-    let exec_id = id.clone();
     let agent_id = body.requester_id.clone();
     // S3: label the submission with the build's ACTUAL source root, not the
     // supervisor's live `project_dir`. Derived from the request's provenance
@@ -3412,18 +3413,10 @@ pub async fn spawn_test(
             // probe → wait pipeline; released when this future completes or
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
-            let runner_id = exec_id.clone();
+            let runner_id = reservation.id.clone();
             let (status, body_json, stderr_tail) = finish_spawn_build(
                 &exec_release_state,
-                execute_spawn_build(
-                    exec_state,
-                    body,
-                    exec_id,
-                    port,
-                    exec_managed,
-                    no_wait,
-                    run_guard,
-                ),
+                execute_spawn_build(exec_state, body, reservation, port, no_wait, run_guard),
                 &runner_id,
                 port,
                 release_key,
@@ -3647,9 +3640,15 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 ///
 /// Returns `(StatusCode, body)` rather than a `Response` so the result can be
 /// stored on the submission's terminal state and rebuilt into a `Response`
-/// later. On any internal `SupervisorError` the placeholder port reservation
-/// is released (as the inline path did) and the error is rendered to its
-/// canonical `(status, body)` via [`SupervisorError::to_status_body`].
+/// later. An internal `SupervisorError` is rendered to its canonical
+/// `(status, body)` via [`SupervisorError::to_status_body`].
+///
+/// **It releases the placeholder reservation, whatever the inner fn
+/// answered.** The inner fn disarms `reservation` only once
+/// `manager::start_managed_runner` has returned `Ok`; every other outcome — an
+/// `Err`, or an `Ok` with a pre-start refusal such as the frontend 503 — leaves
+/// it armed, and the awaited [`PlaceholderReservation::release`] here gives
+/// the port back before the caller sees the answer.
 ///
 /// `no_wait` mirrors the `X-Queue-Mode: no-wait` header semantics for the
 /// build-pool-full short-circuit.
@@ -3663,13 +3662,13 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 async fn execute_spawn_build(
     state: SharedState,
     body: SpawnTestRequest,
-    id: String,
+    mut reservation: PlaceholderReservation,
     port: u16,
-    managed: Arc<ManagedRunner>,
     no_wait: bool,
     run_guard: RunResultGuard,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let action_id = run_guard.record().action_id;
+    let id = reservation.id.clone();
     let mut side = SpawnBuildSideChannel::default();
     // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
     // placeholder insert and moves its guard into the future that awaits this
@@ -3684,9 +3683,17 @@ async fn execute_spawn_build(
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
     let result = execute_spawn_build_inner(
-        &state, body, &id, port, &managed, no_wait, action_id, &mut side,
+        &state,
+        body,
+        &mut reservation,
+        port,
+        no_wait,
+        action_id,
+        &mut side,
     )
     .await;
+    // One owner of the release: a no-op once the start succeeded.
+    reservation.release().await;
     record_start_verdict(
         &state,
         &id,
@@ -3756,6 +3763,102 @@ impl SpawnInFlightGuard {
 impl Drop for SpawnInFlightGuard {
     fn drop(&mut self) {
         self.managed.set_spawn_in_flight(None);
+    }
+}
+
+/// RAII owner of a spawn-test's placeholder registry entry — the port
+/// reservation `spawn_test` inserts before any admission decision.
+///
+/// **It releases on ANY outcome unless disarmed**, and it is disarmed only once
+/// `manager::start_managed_runner` has returned `Ok` (from then on the runner
+/// may be running and its id is the caller's handle on it). So every refusal
+/// gives the port back — an `Err`, a pre-start `Ok((non-2xx, body))`, a panic,
+/// a cancelled future — through one owner instead of a `runners.remove(id)` at
+/// each return, one of which (the no-wait `BuildPoolFull`) was missing and
+/// leaked a never-started placeholder per refused spawn.
+///
+/// Ordinary paths call the awaited [`Self::release`] at the chokepoint
+/// (`execute_spawn_build`), so the entry is gone before the caller is answered.
+/// `Drop` is the backstop for a panic or cancellation, and mirrors
+/// `build_monitor::SlotGuard`: it cannot await the registry's lock, so it
+/// tries it, and on contention hands the removal to a task — only when a
+/// tokio runtime is current, since `tokio::spawn` outside one panics. Either
+/// way it removes the entry only while it is still THIS reservation's
+/// `ManagedRunner` (`Arc::ptr_eq`), never a later entry under the same id.
+struct PlaceholderReservation {
+    state: SharedState,
+    id: String,
+    managed: Arc<ManagedRunner>,
+    armed: bool,
+}
+
+impl PlaceholderReservation {
+    /// Take ownership of the placeholder `managed`, registered under `id`.
+    fn new(state: &SharedState, id: &str, managed: &Arc<ManagedRunner>) -> Self {
+        Self {
+            state: state.clone(),
+            id: id.to_string(),
+            managed: Arc::clone(managed),
+            armed: true,
+        }
+    }
+
+    /// The runner started: from here its entry is the caller's, not ours.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Give the reservation back now, unless disarmed. Idempotent.
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let mut runners = self.state.runners.write().await;
+        remove_if_reserved(&mut runners, &self.id, &self.managed);
+    }
+}
+
+/// Remove `id` from `runners` only while it still maps to `managed`.
+fn remove_if_reserved(
+    runners: &mut std::collections::HashMap<String, Arc<ManagedRunner>>,
+    id: &str,
+    managed: &Arc<ManagedRunner>,
+) {
+    if runners
+        .get(id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, managed))
+    {
+        runners.remove(id);
+    }
+}
+
+impl Drop for PlaceholderReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut runners) = self.state.runners.try_write() {
+            remove_if_reserved(&mut runners, &self.id, &self.managed);
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "spawn-test placeholder {} could not be released: its registry lock was held \
+                 and no tokio runtime is current; the stale sweep will reap it",
+                self.id
+            );
+            return;
+        };
+        let (state, id, managed) = (
+            self.state.clone(),
+            self.id.clone(),
+            Arc::clone(&self.managed),
+        );
+        handle.spawn(async move {
+            let mut runners = state.runners.write().await;
+            remove_if_reserved(&mut runners, &id, &managed);
+        });
     }
 }
 
@@ -4003,8 +4106,8 @@ fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usiz
 /// A panic skips everything `execute_spawn_build` would have attached, so it is
 /// caught here, where the reservation is known: it answers `panicked` naming the
 /// runner, which a caller needs to follow or stop it, since the process may
-/// already be running. A placeholder that never started is left to the stale
-/// sweep.
+/// already be running. A placeholder that never started is released by its
+/// [`PlaceholderReservation`] as the panic unwinds through the build future.
 async fn finish_spawn_build<F>(
     state: &SharedState,
     build: F,
@@ -4212,19 +4315,22 @@ fn spawn_queue_timeout_message(
 }
 
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
-/// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
-/// removal on the error paths below is unchanged.
-#[allow(clippy::too_many_arguments)]
+/// flow is preserved verbatim from the pre-Item-6 handler. It never removes the
+/// placeholder itself: it disarms `reservation` once the runner has started,
+/// and the caller releases it on every other outcome.
 async fn execute_spawn_build_inner(
     state: &SharedState,
     body: SpawnTestRequest,
-    id: &str,
+    reservation: &mut PlaceholderReservation,
     port: u16,
-    managed: &Arc<ManagedRunner>,
     no_wait: bool,
     action_id: uuid::Uuid,
     side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
+    let id_owned = reservation.id.clone();
+    let id = id_owned.as_str();
+    let managed_owned = Arc::clone(&reservation.managed);
+    let managed = &managed_owned;
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
     // `body.rebuild` is false, `attempted` stays false and `succeeded`
@@ -4349,8 +4455,8 @@ async fn execute_spawn_build_inner(
         // path (`origin/main`) as well as the explicit-`git_ref` path — the
         // shared checkout is only compiled on an explicit `from_working_tree`.
         // Any git failure aborts the request (no silent fallback to the live
-        // tree — provenance is the whole point). Release the placeholder port
-        // on failure so it doesn't leak.
+        // tree — provenance is the whole point). The caller's reservation
+        // gives the placeholder port back on every such refusal.
         //
         // The container's lock first (see `container_guard`), under the
         // caller's queue contract (`take_container_for_spawn`): its wait is a
@@ -4384,11 +4490,7 @@ async fn execute_spawn_build_inner(
                         build_queue_budget = budget_left;
                         container_wait = wait;
                     }
-                    Err(e) => {
-                        let mut runners = state.runners.write().await;
-                        runners.remove(id);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
         }
@@ -4447,11 +4549,7 @@ async fn execute_spawn_build_inner(
                         built_root = Some(wt.worktree_path.clone());
                         Some(wt.src_tauri)
                     }
-                    Err(e) => {
-                        let mut runners = state.runners.write().await;
-                        runners.remove(id);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             // No managed worktree. If `worktree_path` was supplied (mutually
@@ -4506,11 +4604,7 @@ async fn execute_spawn_build_inner(
                             worktree_path_info = Some(validated);
                             Some(src_tauri)
                         }
-                        Err(e) => {
-                            let mut runners = state.runners.write().await;
-                            runners.remove(id);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 None => None,
@@ -4530,10 +4624,10 @@ async fn execute_spawn_build_inner(
             .await;
 
         // Run the build, optionally bounded by a queue timeout.
-        // On any failure (build error, timeout, etc.), remove the placeholder
-        // we reserved above so the port doesn't leak — UNLESS the caller
-        // opted into `allow_stale_fallback`, in which case we keep the
-        // placeholder and fall through to spawn from the previous slot exe.
+        // On any failure (build error, timeout, etc.) return the error, and
+        // the caller's reservation frees the placeholder's port — UNLESS the
+        // caller opted into `allow_stale_fallback`, in which case we fall
+        // through to spawn from the previous slot exe.
         // Phase 3: `frontend_only` FORCES a fresh `pnpm run build` in the
         // isolated override tree even when the dist-present idempotency gate
         // would otherwise skip it (a TS edit after the tree's last build would
@@ -4831,10 +4925,9 @@ async fn execute_spawn_build_inner(
                     // Fall through to exe-resolution + spawn below. If the
                     // resolution fails, we'll surface 500 there.
                 } else {
-                    // Release the placeholder port reservation. (Returning
-                    // drops `container_guard`: nothing will read the tree.)
-                    let mut runners = state.runners.write().await;
-                    runners.remove(id);
+                    // The caller's reservation frees the placeholder's port.
+                    // (Returning drops `container_guard`: nothing will read
+                    // the tree.)
                     return Err(e);
                 }
             }
@@ -4931,22 +5024,16 @@ async fn execute_spawn_build_inner(
                     )
                     .await;
             }
-            Err(e) => {
-                let mut runners = state.runners.write().await;
-                runners.remove(id);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 
     // Check that a runner binary exists in some build slot (or at the legacy path).
     // Without this check, a fresh supervisor would succeed the request only to
-    // fail inside `start_managed_runner` with a less helpful error. If the check
-    // fails, remove the placeholder we reserved above so the port frees up.
+    // fail inside `start_managed_runner` with a less helpful error. A refusal
+    // here frees the placeholder's port through the caller's reservation.
     // Skip when use_lkg pinned an override above — we already verified that path.
     if !body.use_lkg && manager::resolve_source_exe(state).await.is_err() {
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
         return Err(SupervisorError::Process(
             "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
@@ -4967,12 +5054,11 @@ async fn execute_spawn_build_inner(
     // and one whose built tree is gone embeds a frontend nobody can verify.
     // The stale-but-functional reasons refuse only under `frontend_strict`.
     // Placed after the exe checks above, so a spawn with no runner binary at
-    // all still says so.
+    // all still says so. An `Ok` refusal still frees the placeholder's port:
+    // the reservation is released on every outcome that started no runner.
     if let Some(reason) =
         stale_reason.filter(|reason| reason.refuses_unconditionally() || body.frontend_strict)
     {
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
         return Ok((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
             frontend_refusal_body(reason, stale_slot_id, checked_tree),
@@ -4994,8 +5080,8 @@ async fn execute_spawn_build_inner(
     // Either way the files land in THIS runner's per-instance config dir
     // BEFORE the runner starts — the dir the spawn exports as
     // `QONTINUI_SECURE_STORAGE_DIR`, and the only one the child reads its
-    // pairing from. On failure release the placeholder port and return the
-    // structured error body.
+    // pairing from. On failure return the structured error body; the caller's
+    // reservation frees the placeholder's port.
     //
     // Reported on the spawn-test response as `paired_state`, plus the legacy
     // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
@@ -5023,16 +5109,13 @@ async fn execute_spawn_build_inner(
         }
         Err((status, body_json)) => {
             // The copy may have already created the destination instance dir
-            // before a `fs::copy` failed. We are about to drop this runner
-            // from the registry, and the instance-dir reaper only visits
-            // REGISTERED runners — so the dir would leak forever. `id` is
-            // uuid-unique, so nothing else owns this path.
+            // before a `fs::copy` failed. The reservation is about to drop
+            // this runner from the registry, and the instance-dir reaper only
+            // visits REGISTERED runners — so the dir would leak forever. `id`
+            // is uuid-unique, so nothing else owns this path.
             if let Some(dest) = crate::process::instance_config_dir(id) {
                 let _ = std::fs::remove_dir_all(&dest);
             }
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-            drop(runners);
             return Ok((status, body_json));
         }
     };
@@ -5051,17 +5134,20 @@ async fn execute_spawn_build_inner(
     )
     .await
     {
-        // Clean up on failure — the registry entry AND the instance dir the
-        // paired-state copy just populated (it holds a copy of the
-        // operator's credential store, and the instance-dir reaper only
-        // visits registered runners, so it would otherwise leak forever).
+        // Clean up on failure — the instance dir the paired-state copy just
+        // populated (it holds a copy of the operator's credential store, and
+        // the instance-dir reaper only visits registered runners, so it would
+        // otherwise leak forever). The registry entry goes with the
+        // reservation, which is still armed.
         if let Some(dest) = crate::process::instance_config_dir(id) {
             let _ = std::fs::remove_dir_all(&dest);
         }
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
         return Err(e);
     }
+    // Started: the runner may be running, and its id is the caller's handle on
+    // it, so no later outcome gives the reservation back. A failure from here
+    // on stops the runner and removes its entry itself (the probe below).
+    reservation.disarm();
 
     state
         .logs

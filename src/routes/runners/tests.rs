@@ -5714,3 +5714,230 @@ async fn a_spawn_named_hung_up_during_its_health_wait_is_torn_down_on_dist_missi
         "the torn-down runner's process is still alive"
     );
 }
+
+/// A spawn-test placeholder exactly as `spawn_test` reserves one: a temp
+/// runner config under a fresh `test-*` id, inserted into the registry before
+/// any admission decision. Returns the id, the port and the registered `Arc`.
+async fn reserve_spawn_test_placeholder(
+    state: &crate::state::SharedState,
+    port: u16,
+) -> (String, Arc<crate::state::ManagedRunner>) {
+    let id = format!("test-{}", super::uuid_simple());
+    let mut config = crate::config::RunnerConfig::default_primary();
+    config.id = id.clone();
+    config.name = crate::process::temp_runner_instance_name(&id);
+    config.port = port;
+    config.kind = super::RunnerKind::Temp { id: id.clone() };
+    config.protected = true;
+    let managed = Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+        config, false, None,
+    ));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.clone(), managed.clone());
+    (id, managed)
+}
+
+/// The run guard `spawn_test` hands `execute_spawn_build`, minted the same way.
+async fn spawn_test_run_guard(
+    state: &crate::state::SharedState,
+    managed: &Arc<crate::state::ManagedRunner>,
+) -> crate::dev_action::RunResultGuard {
+    let minted = super::mint_spawn_action(state, "test".to_string(), None, managed.clone()).await;
+    crate::dev_action::RunResultGuard::arm(minted.record.clone(), "the test future")
+}
+
+/// A `rebuild: true` spawn-test under `X-Queue-Mode: no-wait` with every build
+/// slot busy answers 503 `build_pool_full` — and gives back the port it
+/// reserved. It used to be the one early refusal that skipped the release, so
+/// each refused no-wait spawn parked a never-started placeholder on one of the
+/// 23 temp ports until a sweep reaped it, and a harness retrying on 503 walked
+/// the range to "No available ports" while the pool was merely busy.
+#[tokio::test]
+async fn a_no_wait_refusal_releases_its_placeholder() {
+    let state = make_state();
+    let _only_permit = state
+        .build_pool
+        .permits
+        .clone()
+        .try_acquire_owned()
+        .expect("make_state's pool has one free permit");
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let run_guard = spawn_test_run_guard(&state, &managed).await;
+    let body: super::SpawnTestRequest =
+        serde_json::from_value(serde_json::json!({"rebuild": true})).expect("a spawn-test body");
+
+    let reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+    let (status, body, _stderr) =
+        super::execute_spawn_build(state.clone(), body, reservation, 9877, true, run_guard).await;
+
+    assert_eq!(status.as_u16(), 503, "body: {body}");
+    assert_eq!(body["error"], "build_pool_full", "body: {body}");
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "a refused no-wait spawn left its never-started placeholder {id} holding port 9877"
+    );
+}
+
+/// A refusal answered `Ok` — the frontend 503, decided before any runner
+/// starts — gives the reservation back too. The guard releases on every
+/// outcome that started no runner, not only on `Err`. The empty runner tree has
+/// no `dist/`, so the verdict is `DistMissing`, which refuses unconditionally;
+/// a stub slot exe gets the spawn past the binary check to that verdict.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_frontend_refusal_answered_ok_releases_its_placeholder() {
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let slot_exe = state.config.runner_exe_path_for_slot(0);
+    std::fs::create_dir_all(slot_exe.parent().expect("a slot debug dir")).expect("mkdir slot");
+    std::fs::copy("/bin/bash", &slot_exe).expect("copy bash as the stub exe");
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let run_guard = spawn_test_run_guard(&state, &managed).await;
+    let body: super::SpawnTestRequest =
+        serde_json::from_value(serde_json::json!({"rebuild": false})).expect("a spawn-test body");
+    let reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+
+    let (status, body, _stderr) =
+        super::execute_spawn_build(state.clone(), body, reservation, 9877, false, run_guard).await;
+
+    assert_eq!(status.as_u16(), 503, "body: {body}");
+    assert_eq!(body["error"], "frontend_dist_missing", "body: {body}");
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "a frontend refusal answered Ok left its never-started placeholder {id} registered"
+    );
+}
+
+/// The guard must not over-release: a spawn whose runner STARTED keeps its
+/// registry entry, since its process may be running and the id is the caller's
+/// only handle on it. A stub exe (bash, ending itself after a minute) is the
+/// runner; the health probe is skipped (`health_probe_timeout_ms: 0`) so the
+/// spawn answers as soon as the start returns.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_started_spawn_keeps_its_runner_registered() {
+    let (state, root) = state_over_an_empty_runner_tree();
+    let runner_root = state.config.runner_npm_dir();
+    std::fs::create_dir_all(runner_root.join("dist")).expect("mkdir dist");
+    std::fs::write(runner_root.join("dist").join("index.html"), "<html></html>")
+        .expect("write dist/index.html");
+    let slot_exe = state.config.runner_exe_path_for_slot(0);
+    std::fs::create_dir_all(slot_exe.parent().expect("a slot debug dir")).expect("mkdir slot");
+    std::fs::copy("/bin/bash", &slot_exe).expect("copy bash as the stub exe");
+    let script = root.path().join("spawn-stub.env");
+    std::fs::write(&script, SPAWN_STUB_SCRIPT).expect("write the stub's script");
+
+    // A concurrent test's fork can hold the stub copy's write descriptor until
+    // its exec, which fails the start with ETXTBSY. That attempt proves
+    // nothing about the guard, so it is run again.
+    let mut started: Option<(String, serde_json::Value)> = None;
+    let mut last_body = serde_json::Value::Null;
+    for _ in 0..20 {
+        let port = free_port_nothing_holds();
+        let (id, managed) = reserve_spawn_test_placeholder(&state, port).await;
+        let run_guard = spawn_test_run_guard(&state, &managed).await;
+        let body: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({
+            "rebuild": false,
+            "allow_stale_fallback": true,
+            "health_probe_timeout_ms": 0,
+            "extra_env": {"BASH_ENV": script.display().to_string()},
+        }))
+        .expect("a spawn-test body");
+        let reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+        let (status, body, _stderr) =
+            super::execute_spawn_build(state.clone(), body, reservation, port, false, run_guard)
+                .await;
+        if status.is_success() {
+            started = Some((id, body));
+            break;
+        }
+        last_body = body;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let Some((id, body)) = started else {
+        panic!("no attempt started the stub runner; last answer: {last_body}");
+    };
+    let registered = state.runners.read().await.contains_key(&id);
+    let _ = crate::process::manager::stop_runner_by_id(
+        &state,
+        &id,
+        true,
+        crate::process::manager::CloseIntent::Kill,
+    )
+    .await;
+    assert!(
+        registered,
+        "a spawn whose runner started lost its registry entry to the reservation: {body}"
+    );
+}
+
+/// The guard's `Drop` is the backstop for a panic or a cancelled future: an
+/// armed reservation dropped without `release` still removes its entry, at
+/// once when the registry lock is free and through a spawned task when it is
+/// held.
+#[tokio::test]
+async fn a_dropped_reservation_releases_its_placeholder() {
+    let state = make_state();
+    let (free_id, free) = reserve_spawn_test_placeholder(&state, 9877).await;
+    drop(super::PlaceholderReservation::new(&state, &free_id, &free));
+    assert!(
+        !state.runners.read().await.contains_key(&free_id),
+        "a reservation dropped with the lock free kept its placeholder"
+    );
+
+    let (held_id, held) = reserve_spawn_test_placeholder(&state, 9878).await;
+    let lock = state.runners.write().await;
+    drop(super::PlaceholderReservation::new(&state, &held_id, &held));
+    assert!(
+        lock.contains_key(&held_id),
+        "removed while the lock was held"
+    );
+    drop(lock);
+    let mut released = false;
+    for _ in 0..200 {
+        if !state.runners.read().await.contains_key(&held_id) {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        released,
+        "a reservation dropped while the registry lock was held never released its placeholder"
+    );
+}
+
+/// A reservation removes its id only while the registry still maps it to the
+/// SAME `ManagedRunner`. A different entry registered under that id since is
+/// not its to remove, released or dropped.
+#[tokio::test]
+async fn a_reservation_never_removes_an_entry_it_does_not_own() {
+    let state = make_state();
+    let (id, original) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let mut released = super::PlaceholderReservation::new(&state, &id, &original);
+    let dropped = super::PlaceholderReservation::new(&state, &id, &original);
+    let replacement = Arc::new(crate::state::ManagedRunner::new_with_log_dir(
+        original.config.clone(),
+        false,
+        None,
+    ));
+    state
+        .runners
+        .write()
+        .await
+        .insert(id.clone(), replacement.clone());
+
+    released.release().await;
+    drop(dropped);
+
+    let registry = state.runners.read().await;
+    let kept = registry
+        .get(&id)
+        .expect("the replacement entry was removed");
+    assert!(
+        Arc::ptr_eq(kept, &replacement),
+        "the registry no longer holds the replacement entry"
+    );
+}
