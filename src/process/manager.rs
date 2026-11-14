@@ -7228,20 +7228,17 @@ async fn after_stop_seam(runner_id: &str) {
 /// exercised against the live primary from a session).
 ///
 /// It builds in `.spawn-origin_main`, the container every default spawn-test
-/// builds in, so it holds that container's lock
-/// ([`crate::spawn_worktree::SpawnContainerLocks`]) from before
-/// `prepare_worktree` until its build is done. Unlocked, its `checkout
-/// --force` / `reset --hard` could reset a spawn-test's tree mid-build, a
-/// spawn-test could reset this one, and any sweep could delete the container
-/// under this build, since nothing else marked it in use.
-async fn primary_rebuild_from_origin_main(state: &SharedState) -> Result<(), SupervisorError> {
-    // Released when this function returns, the build done: the exe it
-    // produced lives in the build slot, not in the container.
-    let container =
-        crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, "origin/main")?;
-    let _container_guard = state
-        .take_spawn_container_lock(&container, "Primary rebuild")
-        .await;
+/// builds in, so it runs under that container's lock
+/// ([`crate::spawn_worktree::SpawnContainerLocks`]), which its caller took
+/// before stopping the primary (`take_origin_main_container`) and holds until
+/// this build returns: `_container` is that guard, so this cannot be called
+/// without it. Unlocked, its `checkout --force` / `reset --hard` could reset a
+/// spawn-test's tree mid-build, a spawn-test could reset this one, and any
+/// sweep could delete the container under this build.
+async fn primary_rebuild_from_origin_main(
+    state: &SharedState,
+    _container: &crate::spawn_worktree::SpawnContainerGuard,
+) -> Result<(), SupervisorError> {
     let prepared =
         crate::spawn_worktree::prepare_worktree(&state.config.project_dir, "origin/main").await?;
 
@@ -7585,6 +7582,10 @@ pub struct AdmittedRestart {
     runner_id: String,
     rebuild: bool,
     source: RestartSource,
+    /// The readiness override the restart was admitted with, for the gate a
+    /// primary rebuild asks again when it had to wait for its spawn container
+    /// (`take_origin_main_container`).
+    force: bool,
     started: std::time::Instant,
 }
 
@@ -7682,6 +7683,7 @@ pub async fn admit_restart(
         runner_id: runner_id.to_string(),
         rebuild,
         source,
+        force,
         started: restart_start,
     })
 }
@@ -7704,6 +7706,7 @@ pub async fn run_admitted_restart(
         runner_id,
         rebuild,
         source,
+        force,
         started: restart_start,
     } = admitted;
     let runner_id = runner_id.as_str();
@@ -7767,6 +7770,7 @@ pub async fn run_admitted_restart(
         rebuild,
         build_tree,
         intent,
+        force,
         initiated_by,
         &mut acted,
         &stop_removed_entry,
@@ -7918,6 +7922,43 @@ pub(crate) fn orphaned_by_failed_restart(is_temp: bool, still_registered: bool) 
     is_temp && !still_registered
 }
 
+/// The label a primary rebuild holds `.spawn-origin_main` under.
+const PRIMARY_REBUILD_TAKER: &str = "the primary's origin/main rebuild";
+
+/// Take `.spawn-origin_main` for a primary rebuild, before the primary is
+/// stopped. Free, it is taken at once and the readiness verdict the restart
+/// was admitted on is still fresh. Held, the wait is logged and can last a
+/// spawn-test's whole build, after which that verdict is stale: sessions may
+/// have started on the primary meanwhile. So the gate is asked again once the
+/// container is taken, before anything stops, and a refusal releases it.
+async fn take_origin_main_container(
+    state: &SharedState,
+    managed: &Arc<ManagedRunner>,
+    force: bool,
+    intent: CloseIntent,
+) -> Result<crate::spawn_worktree::SpawnContainerGuard, SupervisorError> {
+    let container =
+        crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, "origin/main")?;
+    if let Ok(guard) = state
+        .spawn_container_locks
+        .try_take(&container, PRIMARY_REBUILD_TAKER)
+    {
+        return Ok(guard);
+    }
+    let guard = state
+        .take_spawn_container_lock(&container, PRIMARY_REBUILD_TAKER)
+        .await;
+    crate::restart_readiness::enforce(
+        state,
+        managed,
+        crate::restart_readiness::GateAction::Restart,
+        force,
+        intent,
+    )
+    .await?;
+    Ok(guard)
+}
+
 /// The stop → (build) → start body of [`restart_runner_by_id`], run only
 /// after the readiness gate admitted the request and `restart_requested` was
 /// latched. Returns the build duration (`None` when no rebuild was asked for).
@@ -7940,10 +7981,25 @@ async fn restart_after_gate(
     rebuild: bool,
     build_tree: BuildTree,
     intent: CloseIntent,
+    force: bool,
     initiated_by: Option<uuid::Uuid>,
     acted: &mut bool,
     stop_removed_entry: &std::sync::atomic::AtomicBool,
 ) -> Result<Option<f64>, SupervisorError> {
+    // A primary rebuild of origin/main builds in `.spawn-origin_main`, the
+    // container every default spawn-test builds in. Take it BEFORE the stop
+    // and hold it across the stop, the prepare and the build: a wait for it
+    // can last a spawn-test's whole build, and that wait must pass with the
+    // primary still serving, not stopped. After such a wait the readiness
+    // verdict this restart was admitted on is stale, so
+    // `take_origin_main_container` asks the gate again, before anything stops.
+    let container_guard =
+        if rebuild && build_tree.compiles_origin_main(managed.config.kind().is_primary()) {
+            Some(take_origin_main_container(state, managed, force, intent).await?)
+        } else {
+            None
+        };
+
     // Stop on EVIDENCE OF LIFE, not on `running`. For a user-managed runner
     // `running` mirrors the last `/health` probe, so a wedged primary — the
     // process alive and holding its port, the API silent — reads
@@ -7975,7 +8031,9 @@ async fn restart_after_gate(
         // evaluated (and logged) at the restart boundary in the caller;
         // re-probing here would pay a second HTTP round trip and, worse,
         // could refuse a restart the caller was already granted because a
-        // session appeared in between. One decision per operator request.
+        // session appeared in between. One decision per operator request —
+        // unless the request waited for its spawn container first, in which
+        // case `take_origin_main_container` already asked again.
         // `intent` rides along so a handoff restart's close-request carries
         // the handoff body and gets the extended graceful wait.
         *acted = true;
@@ -8003,16 +8061,17 @@ async fn restart_after_gate(
     let build_duration = if rebuild {
         *acted = true;
         let build_start = std::time::Instant::now();
-        let build_origin_main = build_tree.compiles_origin_main(managed.config.kind().is_primary());
-        if build_origin_main {
-            primary_rebuild_from_origin_main(state).await?;
-        } else {
-            crate::build_monitor::run_cargo_build(state).await?;
+        match &container_guard {
+            Some(container) => primary_rebuild_from_origin_main(state, container).await?,
+            None => crate::build_monitor::run_cargo_build(state).await?,
         }
         Some(build_start.elapsed().as_secs_f64())
     } else {
         None
     };
+    // Done with the container: the exe the build produced is in the build
+    // slot, and the start below reads nothing from the tree.
+    drop(container_guard);
 
     // Start.
     //
