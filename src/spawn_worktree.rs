@@ -1009,12 +1009,12 @@ pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
 /// caller that will not wait, or stops waiting, can say which build it is
 /// waiting for.
 ///
-/// Keyed by the container path ([`lock_key`]). [`container_path_for_ref`] and
-/// the pruner's listing of the workspace root both spell it
-/// `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`, from the same
-/// `project_dir`, so only the case of the ref part can differ between two
-/// spellings of one directory: on a case-insensitive filesystem refs that
-/// differ only in case share one container. The map's `std::sync::Mutex` is
+/// Keyed by the container path, lowercased ([`lock_key`]).
+/// [`container_path_for_ref`] and the pruner's listing of the workspace root
+/// both spell it `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`,
+/// from the same `project_dir`, so only the case of the ref part can differ
+/// between two spellings of one directory: on a case-insensitive filesystem
+/// refs that differ only in case share one container. The map's `std::sync::Mutex` is
 /// never held across an await; the per-container `tokio::sync::Mutex` is what
 /// a build holds. Entries are never evicted: one empty mutex per container ever
 /// seen is negligible, and evicting a lock another task is queued on is the
@@ -1086,19 +1086,14 @@ impl std::fmt::Display for ContainerHeld {
     }
 }
 
-/// Whether this platform's filesystems ignore case in paths by default (NTFS,
-/// APFS), so that two spellings of one directory must share one lock.
-const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
-
-/// The lock map's key for `container`: its path, lowercased when paths are
-/// case-insensitive. A parameter rather than a direct `cfg!`, so both arms are
-/// tested on every platform.
-fn lock_key(container: &Path, case_insensitive: bool) -> PathBuf {
-    if case_insensitive {
-        PathBuf::from(container.to_string_lossy().to_lowercase())
-    } else {
-        container.to_path_buf()
-    }
+/// The lock map's key for `container`: its path, lowercased on every
+/// platform. Whether case matters is a property of the filesystem, not of the
+/// OS: a Linux or WSL workspace can sit on a case-insensitive mount (`/mnt/c`
+/// over drvfs, an ext4 casefold directory), where refs that differ only in
+/// case name one directory, and two locks on it would let two builds reset one
+/// tree. Folding where case does matter costs only that such refs serialize.
+fn lock_key(container: &Path) -> PathBuf {
+    PathBuf::from(container.to_string_lossy().to_lowercase())
 }
 
 impl SpawnContainerLocks {
@@ -1106,7 +1101,7 @@ impl SpawnContainerLocks {
     fn lock_for(&self, container: &Path) -> Arc<ContainerLock> {
         let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
         locks
-            .entry(lock_key(container, CASE_INSENSITIVE_PATHS))
+            .entry(lock_key(container))
             .or_insert_with(|| {
                 Arc::new(ContainerLock {
                     mutex: Arc::new(tokio::sync::Mutex::new(())),
@@ -2440,23 +2435,28 @@ mod tests {
         }
     }
 
-    /// Two spellings of one container share one lock exactly where paths are
-    /// case-insensitive: refs differing only in case name one directory there.
+    /// Two spellings of one container share one lock on every platform: a
+    /// Linux or WSL workspace can sit on a case-insensitive mount too, where
+    /// refs differing only in case name one directory. A different ref still
+    /// gets a lock of its own.
     #[test]
-    fn lock_keys_fold_case_only_where_paths_ignore_case() {
+    fn lock_keys_fold_case_on_every_platform() {
         let upper = Path::new("/W/.spawn-Origin_Main");
         let lower = Path::new("/w/.spawn-origin_main");
-        assert_eq!(lock_key(upper, true), lock_key(lower, true));
-        assert_ne!(lock_key(upper, false), lock_key(lower, false));
-        assert_eq!(lock_key(upper, false), upper);
+        assert_eq!(lock_key(upper), lock_key(lower));
+        assert_eq!(lock_key(lower), lower);
 
         let locks = SpawnContainerLocks::default();
         let _held = locks.try_take(upper, "first").expect("free");
-        assert_eq!(
-            locks.try_take(lower, "second").is_err(),
-            CASE_INSENSITIVE_PATHS,
-            "the other spelling must find the same lock iff paths ignore case here"
-        );
+        let refused = locks
+            .try_take(lower, "second")
+            .err()
+            .expect("the other spelling finds the same lock");
+        assert_eq!(refused.holder.as_deref(), Some("first"));
+        assert_eq!(locks.holder(lower).as_deref(), Some("first"));
+        locks
+            .try_take(Path::new("/w/.spawn-feature_x"), "third")
+            .expect("another ref's container has a lock of its own");
     }
 
     /// A held container names its holder to whoever is refused it, until that

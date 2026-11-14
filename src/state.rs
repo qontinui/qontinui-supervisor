@@ -2708,8 +2708,7 @@ mod tests {
 
     /// A builder whose spawn container another build holds waits until that
     /// build lets go, and says so in the log before it waits: the wait can last
-    /// a whole build, and a primary rebuild sits it out with the primary
-    /// already stopped. An uncontended take logs nothing.
+    /// a whole build. An uncontended take logs nothing.
     #[tokio::test]
     async fn take_spawn_container_lock_waits_for_the_holder_and_logs_the_wait() {
         async fn logged(state: &SupervisorState, taker: &str) -> bool {

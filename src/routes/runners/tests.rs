@@ -1137,10 +1137,175 @@ async fn a_spawn_tests_container_wait_honours_no_wait_and_its_queue_budget() {
     let taken = super::take_container_for_spawn(&state, container, "spawn-test test-2", true, None)
         .await
         .expect("a free container is taken under no-wait");
+    assert!(taken.wait.is_none(), "a free container is no wait");
     drop(taken);
-    super::take_container_for_spawn(&state, container, "spawn-test test-2", false, Some(budget))
+    let taken = super::take_container_for_spawn(
+        &state,
+        container,
+        "spawn-test test-2",
+        false,
+        Some(budget),
+    )
+    .await
+    .expect("a free container is taken within any budget");
+    assert_eq!(
+        taken.budget_left,
+        Some(budget),
+        "a free container leaves the build all of its budget"
+    );
+}
+
+/// Waits, yielding, until the log names `wanted`. Yields rather than sleeps,
+/// so a paused tokio clock does not move while it waits.
+async fn yield_until_logged(state: &crate::state::SharedState, wanted: &str) {
+    for _ in 0..10_000 {
+        if state
+            .logs
+            .history()
+            .await
+            .iter()
+            .any(|entry| entry.message.contains(wanted))
+        {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the log never named {wanted:?}");
+}
+
+/// Review round 2 of plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`:
+/// a container that comes free only as `queue_timeout_secs` runs out leaves the
+/// build nothing to queue with, so the spawn answers 504 there and then, naming
+/// the build it waited for, instead of starting the build's queue watcher on a
+/// zero timer. One that comes free earlier hands on exactly what is left, and
+/// says whom it waited for. On a paused clock, so both are exact.
+#[tokio::test(start_paused = true)]
+async fn a_container_wait_that_spends_the_queue_budget_is_a_504_naming_its_holder() {
+    let state = make_state();
+    let container = std::path::PathBuf::from("/tmp/test/.spawn-origin_main");
+    let budget = Duration::from_secs(60);
+    let wait_for = |taker: &'static str| {
+        let (state, container) = (state.clone(), container.clone());
+        tokio::spawn(async move {
+            super::take_container_for_spawn(&state, &container, taker, false, Some(budget))
+                .await
+                .map(|taken| (taken.budget_left, taken.wait))
+        })
+    };
+
+    // The holder lets go just as the budget runs out.
+    let held = state
+        .spawn_container_locks
+        .try_take(&container, "spawn-test test-1")
+        .expect("free");
+    let waiter = wait_for("spawn-test test-2");
+    yield_until_logged(&state, "spawn-test test-2: waiting for spawn container").await;
+    drop(held);
+    tokio::time::advance(budget).await;
+    match waiter.await.expect("the waiter ran") {
+        Err(crate::error::SupervisorError::Timeout(message)) => {
+            assert!(
+                message.contains("all of queue_timeout_secs=60"),
+                "{message}"
+            );
+            assert!(
+                message.contains("held by spawn-test test-1 when the wait began"),
+                "{message}"
+            );
+            assert!(
+                message.contains("never queued for a cargo build slot"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a 504 for the spent budget, got {other:?}"),
+    }
+    assert_eq!(
+        state.spawn_container_locks.holder(&container),
+        None,
+        "the 504 lets go of the container it took"
+    );
+
+    // The holder lets go with 15 s of the budget left.
+    let held = state
+        .spawn_container_locks
+        .try_take(&container, "spawn-test test-1")
+        .expect("free");
+    let waiter = wait_for("spawn-test test-3");
+    yield_until_logged(&state, "spawn-test test-3: waiting for spawn container").await;
+    tokio::time::advance(Duration::from_secs(45)).await;
+    drop(held);
+    let (left, wait) = waiter
         .await
-        .expect("a free container is taken within any budget");
+        .expect("the waiter ran")
+        .expect("taken with budget to spare");
+    assert_eq!(left, Some(Duration::from_secs(15)));
+    let wait = wait.expect("a held container is a wait");
+    assert_eq!(wait.waited, Duration::from_secs(45));
+    assert_eq!(wait.held.holder.as_deref(), Some("spawn-test test-1"));
+}
+
+/// Review round 2 of plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`:
+/// a build whose own queue wait runs out after a wait for its container says
+/// how the caller's `queue_timeout_secs` was split between the two, rather
+/// than charging all of it to the slot (or the frontend lock). Without a
+/// container wait the message is the phase's own. The first attempt carries the
+/// container wait and queues with what it left; the poisoned-slot retry queues
+/// afresh with the whole budget, so its message carries none.
+#[test]
+fn a_build_queue_timeout_splits_its_budget_with_the_container_wait() {
+    let wait = super::ContainerWait {
+        container: std::path::PathBuf::from("/ws/.spawn-origin_main"),
+        held: crate::spawn_worktree::ContainerHeld {
+            holder: Some("spawn-test test-1".to_string()),
+        },
+        waited: Duration::from_millis(45_400),
+    };
+    assert_eq!(
+        super::spawn_queue_timeout_message(BuildPhase::AwaitingSlot, 60, None, 2),
+        BuildPhase::AwaitingSlot.timeout_message(60, 2)
+    );
+    let slot = super::spawn_queue_timeout_message(BuildPhase::AwaitingSlot, 60, Some(&wait), 2);
+    assert!(slot.contains("waited 15s for a cargo build slot"), "{slot}");
+    assert!(
+        slot.contains("after 45s of queue_timeout_secs=60"),
+        "{slot}"
+    );
+    assert!(
+        slot.contains("spawn container \"/ws/.spawn-origin_main\""),
+        "{slot}"
+    );
+    assert!(
+        slot.contains("held by spawn-test test-1 when the wait began"),
+        "{slot}"
+    );
+    assert!(!slot.contains("waited 60s"), "{slot}");
+    let npm = super::spawn_queue_timeout_message(BuildPhase::AwaitingNpmLock, 60, Some(&wait), 2);
+    assert!(
+        npm.contains("waited 15s, blocked on the frontend (pnpm) lock with 2 cargo permits free"),
+        "{npm}"
+    );
+    assert!(npm.contains("after 45s of queue_timeout_secs=60"), "{npm}");
+
+    let left = super::queue_budget_left(Duration::from_secs(60), &wait).expect("budget left");
+    assert_eq!(left, Duration::from_millis(14_600));
+
+    let body: String = fn_source("async fn execute_spawn_build_inner(")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    for wiring in [
+        "SupervisorError::Timeout(spawn_queue_timeout_message(phase,secs,container_wait.as_ref(),",
+        "letmutbuild_result=run_detailed(build_dir_override.clone(),build_queue_budget,container_wait,)",
+        "run_detailed(build_dir_override.clone(),queue_budget,None)",
+    ] {
+        assert!(
+            body.contains(wiring),
+            "execute_spawn_build_inner: no {wiring}"
+        );
+    }
 }
 
 /// W1 (review round 1 of plan
