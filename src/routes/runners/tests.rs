@@ -1001,7 +1001,7 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(str::split_whitespace)
         .collect();
-    let declared = "letmutcontainer_guard:Option<tokio::sync::OwnedMutexGuard<()>>=None;";
+    let declared = "letmutcontainer_guard:Option<crate::spawn_worktree::SpawnContainerGuard>=None;";
     let verdict = "resolve_frontend_stale_for_spawn(";
     let released = "drop(container_guard);";
     let mut last = 0;
