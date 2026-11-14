@@ -6274,3 +6274,57 @@ async fn a_start_that_returns_err_still_releases_its_placeholder() {
         "a start that returned Err left its placeholder registered"
     );
 }
+
+/// A start that returned `Err` leaves a never-started placeholder, so when the
+/// caller's release is then cancelled on the registry lock, `Drop` must still
+/// remove it rather than keep it as an entered start.
+#[tokio::test]
+async fn a_release_cancelled_after_a_failed_start_still_releases_on_drop() {
+    let state = make_state();
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let mut reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+    reservation.entering_start();
+    reservation.start_failed();
+
+    let lock = state.runners.write().await;
+    let cancelled = tokio::time::timeout(Duration::from_millis(50), reservation.release()).await;
+    assert!(
+        cancelled.is_err(),
+        "the release finished while the lock was held"
+    );
+    drop(lock);
+    drop(reservation);
+
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "a failed start whose release was cancelled leaked its placeholder"
+    );
+}
+
+/// The failed-start mark is cleared by the start's `Err` arm, right where the
+/// start is called: pinned so a refactor cannot drop it from that path.
+#[test]
+fn a_failed_start_clears_its_entered_mark_before_returning() {
+    let inner: String = fn_source("async fn execute_spawn_build_inner(")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let entered = inner
+        .find("reservation.entering_start();")
+        .expect("the start is marked as entered");
+    let start = inner[entered..]
+        .find("manager::start_managed_runner(")
+        .expect("the start follows the mark")
+        + entered;
+    let failed = inner[start..]
+        .find("reservation.start_failed();returnErr(e);")
+        .expect("the start's Err arm clears the mark before returning");
+    let disarm = inner[start..]
+        .find("reservation.disarm();")
+        .expect("a started runner disarms the reservation");
+    assert!(
+        failed < disarm,
+        "start_failed must sit in the Err arm, before the disarm"
+    );
+}

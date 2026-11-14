@@ -3836,8 +3836,8 @@ impl Drop for SpawnInFlightGuard {
 /// child was spawned; removing the entry then would orphan a live process,
 /// and `finish_spawn_build`'s `panicked` answer tells the caller to stop the
 /// runner by this id, which needs the entry. A start that RETURNS `Err` is
-/// different: the explicit [`Self::release`] still removes it, as the inline
-/// cleanup did before.
+/// different: [`Self::start_failed`] clears the mark, so the explicit
+/// [`Self::release`] — or `Drop`, if that release is cancelled — removes it.
 struct PlaceholderReservation {
     state: SharedState,
     id: String,
@@ -3863,6 +3863,14 @@ impl PlaceholderReservation {
     /// abandoning a spawned child, so it no longer removes the entry.
     fn entering_start(&mut self) {
         self.start_entered = true;
+    }
+
+    /// The start RETURNED `Err`: it hands back no runner, so the entry is a
+    /// never-started placeholder again and `Drop` must remove it — a release
+    /// cancelled on the registry lock after a failed start would otherwise
+    /// leave it to the stale sweep.
+    fn start_failed(&mut self) {
+        self.start_entered = false;
     }
 
     /// The runner started: from here its entry is the caller's, not ours.
@@ -5262,6 +5270,7 @@ async fn execute_spawn_build_inner(
         if let Some(dest) = crate::process::instance_config_dir(id) {
             let _ = std::fs::remove_dir_all(&dest);
         }
+        reservation.start_failed();
         return Err(e);
     }
     // Started: the runner may be running, and its id is the caller's handle on
