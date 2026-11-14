@@ -732,8 +732,9 @@ pub fn is_managed_runner_worktree(project_dir: &Path, runner_root: &Path) -> boo
 ///
 /// On success it stamps the container's mtime with the current time
 /// ([`set_dir_mtime`]), so the pruner's retention counts from the container's
-/// LAST USE rather than from its creation. The reuse path writes only inside the
-/// two nested worktrees, never in the container dir itself, so a container
+/// LAST USE rather than from its creation. When both nested worktrees already
+/// exist, the reuse path writes only inside them (a missing schemas worktree is
+/// re-created inside the container, which does touch it), so a container
 /// reused every day used to read as old as its creation and was pruned between
 /// uses. A failed preparation stamps nothing, so it never extends a
 /// container's life.
@@ -981,8 +982,8 @@ pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
 /// reset --hard`, and the pruner deletes one outright. Either, done while
 /// another build is reading the container, pulls its source out from under the
 /// compiler, or its `dist/` out from under the frontend check that follows the
-/// build: failures that look exactly like code errors, or a healthy runner
-/// refused as `frontend_dist_missing` (plan
+/// build: failures that look exactly like code errors, or a frontend check
+/// that finds no dist/ in a tree that was built (plan
 /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
 /// Every default spawn-test and the primary's origin/main rebuild share one
 /// `.spawn-origin_main` container, so that is the common case, not a rare
@@ -2280,9 +2281,9 @@ mod tests {
 
     /// Age is LAST USE, not creation (plan
     /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
-    /// D2). The reuse path writes only inside the nested worktrees, so a
-    /// container reused that very day still read as old as its creation: "age
-    /// 117h" on 2026-11-13, pruned inside the spawn that had just built in it.
+    /// D2). The reuse path writes only inside the nested worktrees, so without
+    /// the stamp a container reused that very day read as old as its creation,
+    /// and a sweep pruned it between uses.
     #[tokio::test]
     async fn a_reused_container_ages_from_its_last_use_not_its_creation() {
         let _g = retention_env_guard().lock().await;

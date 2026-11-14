@@ -4174,10 +4174,10 @@ async fn execute_spawn_build_inner(
     // container as in use. Declared here, at function scope, because the
     // verdict is read after the rebuild block: a guard scoped to that block
     // ended before the verdict, which let a sweep (or a queued same-ref build)
-    // delete or rebuild the tree the verdict then read (2026-11-13: a healthy
-    // runner killed as `frontend_dist_missing`). `None` for the live tree and a
-    // caller-owned `worktree_path`, which the supervisor neither resets nor
-    // prunes.
+    // delete or rebuild the tree the verdict then read (plan
+    // `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+    // `None` for the live tree and a caller-owned `worktree_path`, which the
+    // supervisor neither resets nor prunes.
     let mut container_guard: Option<crate::spawn_worktree::SpawnContainerGuard> = None;
 
     // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
@@ -4730,17 +4730,37 @@ async fn execute_spawn_build_inner(
     // or emptied by a queued same-ref build's `vite build` between the build
     // and this read. Invariant: it inspects the tree whose dist/ the spawned
     // exe embeds — the provenance build tree (`built_root`) when a
-    // `git_ref`/`worktree_path` build happened, the live tree otherwise. It is
-    // ACTED on below, before any runner starts.
-    let checked_root = built_root.as_deref().or(state.config.project_dir.parent());
+    // `git_ref`/`worktree_path` build happened, the live tree otherwise. A
+    // build that failed into the stale fallback embedded no tree at all: its
+    // exe is a previous build's, so no tree on disk speaks for it (and
+    // `cleanup_worktree_on_fail` may have just removed this one) and only the
+    // slot's own frontend flag is read. It is ACTED on below, before any
+    // runner starts.
+    let checked_tree = if matches!(build_succeeded, Some(false)) {
+        None
+    } else {
+        match (built_root.as_deref(), git_ref_info.is_some()) {
+            (Some(root), true) => Some(CheckedTree::Managed(root)),
+            (Some(root), false) => Some(CheckedTree::CallerOwned(root)),
+            (None, _) => state.config.project_dir.parent().map(CheckedTree::Live),
+        }
+    };
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(state, checked_root).await;
+        resolve_frontend_stale_for_spawn(state, checked_tree.map(CheckedTree::root)).await;
+
+    // Nothing reads the managed container after this point: the exe and its
+    // sidecars are deployed from the build slot, the runner runs in the live
+    // tree, and the provenance compares below run in the runner repo
+    // (`provenance_compare_root`). Release it so a queued same-ref build can
+    // start, and so a sweep may prune it once it ages out.
+    drop(container_guard);
 
     // A managed build is the natural trigger to scrub OTHER stale scratch
     // containers the workspace root accumulated: an OPPORTUNISTIC sweep. It
-    // runs while this spawn still holds its own container's lock, so it keeps
-    // that container as in use like any other a build holds. Best-effort +
-    // bounded — the sweep itself never fails the spawn request.
+    // runs after this spawn released its own container, so a queued same-ref
+    // build does not wait for it; that container stays, since
+    // `prepare_worktree` stamped it used minutes ago. Best-effort + bounded —
+    // the sweep itself never fails the spawn request.
     if git_ref_info.is_some() {
         let report = state.sweep_spawn_worktrees(None).await;
         if !report.removed.is_empty() || !report.failed.is_empty() {
@@ -4758,13 +4778,6 @@ async fn execute_spawn_build_inner(
                 .await;
         }
     }
-
-    // Nothing reads the managed container after this point: the exe and its
-    // sidecars are deployed from the build slot, the runner runs in the live
-    // tree, and the provenance compares below run in the runner repo
-    // (`provenance_compare_root`). Release it so a queued same-ref build can
-    // start, and so a sweep may prune it once it ages out.
-    drop(container_guard);
 
     // `allow_stale_fallback` is the caller explicitly saying "run whatever
     // exists". Carry it to the start path so `unverified_exe_gate` allows a
@@ -4844,7 +4857,7 @@ async fn execute_spawn_build_inner(
         runners.remove(id);
         return Ok((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            frontend_refusal_body(reason, stale_slot_id, checked_root),
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
         ));
     }
 
@@ -5527,9 +5540,14 @@ async fn execute_spawn_build_inner(
 ///   nothing can say which frontend the binary embeds. Reporting that as
 ///   `DistMissing` claimed a blank UI it had not observed, and its `npm run
 ///   build` remedy sent the operator after a dist/ that was never the problem
-///   (2026-11-13: the spawn's own sweep had deleted the container). A managed
-///   build reads its verdict while it holds the container's lock, so it no
-///   longer reaches this; it is the honest answer for anything else.
+///   (plan
+///   `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+///   A managed build reads its verdict while it holds the container's lock,
+///   so no sweep removes its tree first; it still meets this when something
+///   outside the supervisor removed the tree. A caller-owned `worktree_path`
+///   meets it when its owner removed it, and the live tree when that checkout
+///   is gone. A build that failed into the stale fallback never reads a tree
+///   here: its exe is a previous build's.
 ///
 /// Reported back to callers via `frontend_stale_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5567,19 +5585,58 @@ impl FrontendStaleReason {
     }
 }
 
+/// The tree a spawn door's frontend verdict reads, and so who can bring it
+/// back when it is gone ([`FrontendStaleReason::BuildTreeRemoved`]).
+#[derive(Clone, Copy, Debug)]
+enum CheckedTree<'a> {
+    /// A managed `.spawn-<ref>` container's runner worktree: a spawn
+    /// materializes it again.
+    Managed(&'a std::path::Path),
+    /// A caller-owned `worktree_path` checkout: only its owner can restore it.
+    CallerOwned(&'a std::path::Path),
+    /// The live runner checkout the supervisor's `--project-dir` names.
+    Live(&'a std::path::Path),
+}
+
+impl<'a> CheckedTree<'a> {
+    fn root(self) -> &'a std::path::Path {
+        match self {
+            CheckedTree::Managed(root)
+            | CheckedTree::CallerOwned(root)
+            | CheckedTree::Live(root) => root,
+        }
+    }
+
+    /// What brings this tree back once it is gone. Only a managed container
+    /// comes back with a retry.
+    fn remedy_when_removed(self) -> &'static str {
+        match self {
+            CheckedTree::Managed(_) => {
+                "Retry the spawn: it materializes the container again. The spawn-worktree sweeps (the startup sweep, the sweep after a spawn-test build, `DELETE /spawn-worktrees`) keep a container while a build holds its lock, so something outside the supervisor removed it."
+            }
+            CheckedTree::CallerOwned(_) => {
+                "The supervisor never creates or removes a `worktree_path` tree, so a retry of this request cannot help: restore that checkout, or pass a `worktree_path` that exists."
+            }
+            CheckedTree::Live(_) => {
+                "It is the live runner checkout the supervisor's `--project-dir` names, so a retry cannot help: restore that checkout."
+            }
+        }
+    }
+}
+
 /// The 503 body a spawn door answers with when it refuses a spawn on its
 /// frontend verdict: `reason` refuses unconditionally, or the caller asked
-/// for `frontend_strict`. `checked_root` is the tree the verdict read.
+/// for `frontend_strict`. `checked` is the tree the verdict read.
 ///
 /// `error` is a token per refusal (`frontend_dist_missing`,
 /// `frontend_build_tree_removed`, `frontend_stale` for a strict refusal),
 /// and each message names the remedy that fits its own cause. A removed tree
 /// is not a dist/ problem, so its message never recommends rebuilding the
-/// frontend.
+/// frontend, and it offers a retry only where a retry brings the tree back.
 fn frontend_refusal_body(
     reason: FrontendStaleReason,
     stale_slot_id: Option<usize>,
-    checked_root: Option<&std::path::Path>,
+    checked: Option<CheckedTree<'_>>,
 ) -> serde_json::Value {
     let (error, message) = match reason {
         FrontendStaleReason::DistMissing => (
@@ -5596,16 +5653,12 @@ fn frontend_refusal_body(
             format!(
                 "frontend_build_tree_removed: refusing to spawn — the tree this spawn built \
                  ({}) no longer exists, so nothing can say which frontend the runner would \
-                 embed. Its dist/ was never the problem: retry the spawn, which materializes \
-                 the tree again. A managed `.spawn-<ref>` container is removed only by the \
-                 spawn-worktree pruner (the startup sweep, the sweep after a spawn-test \
-                 build, `DELETE /spawn-worktrees`), which keeps a container while a build \
-                 holds its lock, or by `cleanup_worktree_on_fail`; a `worktree_path` tree \
-                 only by its owner.",
-                checked_root.map_or_else(
+                 embed, and its dist/ was never the problem. {}",
+                checked.map_or_else(
                     || "unresolved".to_string(),
-                    |root| root.display().to_string()
+                    |tree| tree.root().display().to_string()
                 ),
+                checked.map_or("", CheckedTree::remedy_when_removed),
             ),
         ),
         FrontendStaleReason::BuildFailed | FrontendStaleReason::SrcDrift => (
@@ -5645,7 +5698,7 @@ fn frontend_stale_warning(
         },
         Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
         Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-        Some(FrontendStaleReason::BuildTreeRemoved) => "frontend_stale: the tree this spawn built no longer exists, so nothing can say which frontend the runner embeds. Retry the spawn, which materializes the tree again.".to_string(),
+        Some(FrontendStaleReason::BuildTreeRemoved) => "frontend_stale: the tree this spawn built no longer exists, so nothing can say which frontend the runner embeds.".to_string(),
         None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
     }
 }
@@ -6470,10 +6523,16 @@ async fn spawn_named_inner(
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
     // spawn-named has no provenance selectors — it always builds the live
-    // tree, so the live tree IS the built tree here.
-    let checked_root = state.config.project_dir.parent();
+    // tree, so the live tree IS the built tree here. As at spawn-test, a
+    // build that failed into the stale fallback reuses a previous build's
+    // exe, which no tree on disk speaks for: only the slot's flag is read.
+    let checked_tree = if build_reused_stale {
+        None
+    } else {
+        state.config.project_dir.parent().map(CheckedTree::Live)
+    };
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state, checked_root).await;
+        resolve_frontend_stale_for_spawn(&state, checked_tree.map(CheckedTree::root)).await;
 
     // The unconditional refusals, symmetric with spawn_test
     // (`FrontendStaleReason::refuses_unconditionally`). A missing
@@ -6501,7 +6560,7 @@ async fn spawn_named_inner(
         state.notify_health_change();
         return Ok((
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            frontend_refusal_body(reason, stale_slot_id, checked_root),
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
         ));
     }
 
