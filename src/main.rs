@@ -658,12 +658,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_for_prune = state.clone();
         tokio::spawn(async move {
-            let report = spawn_worktree::prune_spawn_worktrees(
-                &state_for_prune.config.project_dir,
-                &state_for_prune.spawn_container_locks,
-                std::time::SystemTime::now(),
-            )
-            .await;
+            let report = state_for_prune.sweep_spawn_worktrees(None).await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
                 state_for_prune
                     .logs

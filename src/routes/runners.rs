@@ -4742,12 +4742,7 @@ async fn execute_spawn_build_inner(
     // that container as in use like any other a build holds. Best-effort +
     // bounded — the sweep itself never fails the spawn request.
     if git_ref_info.is_some() {
-        let report = crate::spawn_worktree::prune_spawn_worktrees(
-            &state.config.project_dir,
-            &state.spawn_container_locks,
-            std::time::SystemTime::now(),
-        )
-        .await;
+        let report = state.sweep_spawn_worktrees(None).await;
         if !report.removed.is_empty() || !report.failed.is_empty() {
             state
                 .logs
@@ -6998,9 +6993,11 @@ pub struct PruneSpawnQuery {
 /// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
 /// owns ALL selection + safety (prefix-under-root filter, the in-use
 /// exclusion, last-use age + dirty double-retention). This handler only:
-///   1. passes the supervisor's container locks, so a container a build holds
-///      is kept as in use — even under `older_than_hours=0`, which otherwise
-///      prunes every container at once,
+///   1. runs it through `SupervisorState::sweep_spawn_worktrees`, on a task of
+///      its own and with the supervisor's container locks, so a container a
+///      build holds is kept as in use — even under `older_than_hours=0`, which
+///      otherwise prunes every container at once — and a client that hangs up
+///      mid-sweep cannot cut a removal short,
 ///   2. forwards the optional `older_than_hours` window override,
 ///   3. measures container sizes BEFORE the delete so it can report
 ///      `bytes_freed`,
@@ -7033,13 +7030,10 @@ pub async fn prune_spawn_worktrees_endpoint(
             Err(_) => std::collections::HashMap::new(),
         };
 
-    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
-        &state.config.project_dir,
-        &state.spawn_container_locks,
-        std::time::SystemTime::now(),
-        query.older_than_hours,
-    )
-    .await;
+    // On a task of its own: a client that hangs up mid-sweep drops only its
+    // wait, so the sweep holds each container's lock until that container's
+    // removal is done (`SupervisorState::sweep_spawn_worktrees`).
+    let report = state.sweep_spawn_worktrees(query.older_than_hours).await;
 
     let bytes_freed: u64 = report
         .removed
