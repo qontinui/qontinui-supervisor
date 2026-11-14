@@ -982,16 +982,18 @@ pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
 /// another build is reading the container, pulls its source out from under the
 /// compiler, or its `dist/` out from under the frontend check that follows the
 /// build: failures that look exactly like code errors, or a healthy runner
-/// refused as `frontend_dist_missing` (2026-11-13). Every default spawn-test
-/// and the primary's origin/main rebuild share one `.spawn-origin_main`
-/// container, so that is the common case, not a rare collision.
+/// refused as `frontend_dist_missing` (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+/// Every default spawn-test and the primary's origin/main rebuild share one
+/// `.spawn-origin_main` container, so that is the common case, not a rare
+/// collision.
 ///
 /// So every BUILDER holds its container's lock from before `prepare_worktree`
 /// until it last reads the tree: spawn-test through its frontend verdict, the
 /// primary's origin/main rebuild through its build. Builds of the same ref
 /// serialize, an accepted trade since they would otherwise compile
 /// byte-identical source twice in parallel, and builds of different refs never
-/// contend. The PRUNER only ever `try_lock`s it: a held lock means "in use,
+/// contend. The PRUNER only ever TRIES the lock: a held lock means "in use,
 /// keep", a sweep never waits behind a build that can run for most of an hour,
 /// and it holds the lock it took until the container is gone, so a builder
 /// that arrives meanwhile waits and then materializes a fresh one.
@@ -1002,30 +1004,144 @@ pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
 /// and spawn-test took its own container out of it, then swept, before its
 /// frontend check had read the tree.
 ///
-/// Keyed by the container path as [`container_path_for_ref`] spells it, which
-/// is also how the pruner's listing of the workspace root spells it: both are
-/// `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`. The map's
-/// `std::sync::Mutex` is never held across an await; the per-container
-/// `tokio::sync::Mutex` is what a build holds. Entries are never evicted: one
-/// empty mutex per container ever seen is negligible, and evicting a lock
-/// another task is queued on is the classic way to reintroduce the race.
+/// A held lock carries its holder's label ([`SpawnContainerGuard`]), so a
+/// caller that will not wait, or stops waiting, can say which build it is
+/// waiting for.
+///
+/// Keyed by the container path ([`lock_key`]). [`container_path_for_ref`] and
+/// the pruner's listing of the workspace root both spell it
+/// `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`, from the same
+/// `project_dir`, so only the case of the ref part can differ between two
+/// spellings of one directory: on a case-insensitive filesystem refs that
+/// differ only in case share one container. The map's `std::sync::Mutex` is
+/// never held across an await; the per-container `tokio::sync::Mutex` is what
+/// a build holds. Entries are never evicted: one empty mutex per container ever
+/// seen is negligible, and evicting a lock another task is queued on is the
+/// classic way to reintroduce the race.
 #[derive(Default)]
 pub struct SpawnContainerLocks {
-    locks: std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    locks: std::sync::Mutex<HashMap<PathBuf, Arc<ContainerLock>>>,
 }
 
-impl SpawnContainerLocks {
-    /// The lock for `container`, created on first use. An `Arc`, so a builder
-    /// can `lock_owned()` it and hold the guard across its whole
-    /// prepare-build-verify sequence, and the pruner can `try_lock_owned()` it.
-    pub fn lock_for(&self, container: &Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks
-            .entry(container.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+/// One spawn container's lock, and the label of whoever holds it.
+struct ContainerLock {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Set right after the lock is taken and cleared just before it is
+    /// released, so `None` means free, or held for the instant before its new
+    /// holder labels it.
+    holder: std::sync::Mutex<Option<String>>,
+}
+
+impl ContainerLock {
+    fn holder(&self) -> Option<String> {
+        self.holder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
 }
+
+/// A held spawn container lock. Dropping it lets the container go: it clears
+/// the holder's label, then releases the lock.
+pub struct SpawnContainerGuard {
+    lock: Arc<ContainerLock>,
+    // Dropped after `Drop::drop` has cleared the label, so a new holder's
+    // label is never cleared by the old one.
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SpawnContainerGuard {
+    fn labelled(
+        lock: Arc<ContainerLock>,
+        held: tokio::sync::OwnedMutexGuard<()>,
+        taker: &str,
+    ) -> Self {
+        *lock.holder.lock().unwrap_or_else(|e| e.into_inner()) = Some(taker.to_string());
+        SpawnContainerGuard { lock, _held: held }
+    }
+}
+
+impl Drop for SpawnContainerGuard {
+    fn drop(&mut self) {
+        *self.lock.holder.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// A container another build holds: [`SpawnContainerLocks::try_take`]'s
+/// refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerHeld {
+    /// The holder's label, `None` for the instant before a new holder labels
+    /// the lock it has just taken.
+    pub holder: Option<String>,
+}
+
+impl std::fmt::Display for ContainerHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.holder {
+            Some(holder) => write!(f, "held by {holder}"),
+            None => f.write_str("held by another build"),
+        }
+    }
+}
+
+/// Whether this platform's filesystems ignore case in paths by default (NTFS,
+/// APFS), so that two spellings of one directory must share one lock.
+const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
+
+/// The lock map's key for `container`: its path, lowercased when paths are
+/// case-insensitive. A parameter rather than a direct `cfg!`, so both arms are
+/// tested on every platform.
+fn lock_key(container: &Path, case_insensitive: bool) -> PathBuf {
+    if case_insensitive {
+        PathBuf::from(container.to_string_lossy().to_lowercase())
+    } else {
+        container.to_path_buf()
+    }
+}
+
+impl SpawnContainerLocks {
+    /// The lock for `container`, created on first use.
+    fn lock_for(&self, container: &Path) -> Arc<ContainerLock> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(lock_key(container, CASE_INSENSITIVE_PATHS))
+            .or_insert_with(|| {
+                Arc::new(ContainerLock {
+                    mutex: Arc::new(tokio::sync::Mutex::new(())),
+                    holder: std::sync::Mutex::new(None),
+                })
+            })
+            .clone()
+    }
+
+    /// Take `container`'s lock for `taker` if it is free, without waiting.
+    pub fn try_take(
+        &self,
+        container: &Path,
+        taker: &str,
+    ) -> Result<SpawnContainerGuard, ContainerHeld> {
+        let lock = self.lock_for(container);
+        match lock.mutex.clone().try_lock_owned() {
+            Ok(held) => Ok(SpawnContainerGuard::labelled(lock, held, taker)),
+            Err(_) => Err(ContainerHeld {
+                holder: lock.holder(),
+            }),
+        }
+    }
+
+    /// Take `container`'s lock for `taker`, waiting while another build holds
+    /// it.
+    pub async fn take(&self, container: &Path, taker: &str) -> SpawnContainerGuard {
+        let lock = self.lock_for(container);
+        let held = lock.mutex.clone().lock_owned().await;
+        SpawnContainerGuard::labelled(lock, held, taker)
+    }
+}
+
+/// The label the spawn-worktree sweep holds a container under while it
+/// decides on it and removes it.
+pub const SPAWN_SWEEP_TAKER: &str = "the spawn-worktree sweep";
 
 /// Env var overriding the idle-retention window, in hours. Default
 /// [`DEFAULT_SPAWN_RETENTION_HOURS`]. `0` prunes every idle container
@@ -1308,12 +1424,12 @@ pub async fn prune_spawn_worktrees_with_window(
         // must never wait behind a build. The guard is held through the checks
         // below and the removal, so a builder that arrives meanwhile waits for
         // the removal to finish and then materializes a fresh container.
-        let Ok(_held) = locks.lock_for(&path).try_lock_owned() else {
-            report.kept.push((
-                path.clone(),
-                "in use: a build holds its container lock".to_string(),
-            ));
-            continue;
+        let _held = match locks.try_take(&path, SPAWN_SWEEP_TAKER) {
+            Ok(guard) => guard,
+            Err(held) => {
+                report.kept.push((path.clone(), format!("in use: {held}")));
+                continue;
+            }
         };
 
         // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
@@ -2264,7 +2380,7 @@ mod tests {
 
         // A builder holds it, as one does from before its prepare until its
         // last read of the tree.
-        let held = locks.lock_for(&prepared.container_path).lock_owned().await;
+        let held = locks.take(&prepared.container_path, "a test build").await;
         let r =
             prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), Some(0)).await;
         assert!(
@@ -2272,10 +2388,10 @@ mod tests {
             "a container whose lock is held was pruned: {r:?}"
         );
         assert!(
-            r.kept
-                .iter()
-                .any(|(p, why)| p == &prepared.container_path && why.contains("in use")),
-            "the kept reason must say it is in use; got {:?}",
+            r.kept.iter().any(|(p, why)| p == &prepared.container_path
+                && why.contains("in use")
+                && why.contains("a test build")),
+            "the kept reason must say it is in use, and by whom; got {:?}",
             r.kept
         );
 
@@ -2289,7 +2405,7 @@ mod tests {
         );
         assert_eq!(r.removed, vec![prepared.container_path.clone()]);
         assert!(
-            locks.lock_for(&prepared.container_path).try_lock().is_ok(),
+            locks.try_take(&prepared.container_path, "a probe").is_ok(),
             "the sweep must let go of the lock it held while removing the container"
         );
     }
@@ -2321,6 +2437,53 @@ mod tests {
                 "{not_managed:?} is not a managed container's runner worktree"
             );
         }
+    }
+
+    /// Two spellings of one container share one lock exactly where paths are
+    /// case-insensitive: refs differing only in case name one directory there.
+    #[test]
+    fn lock_keys_fold_case_only_where_paths_ignore_case() {
+        let upper = Path::new("/W/.spawn-Origin_Main");
+        let lower = Path::new("/w/.spawn-origin_main");
+        assert_eq!(lock_key(upper, true), lock_key(lower, true));
+        assert_ne!(lock_key(upper, false), lock_key(lower, false));
+        assert_eq!(lock_key(upper, false), upper);
+
+        let locks = SpawnContainerLocks::default();
+        let _held = locks.try_take(upper, "first").expect("free");
+        assert_eq!(
+            locks.try_take(lower, "second").is_err(),
+            CASE_INSENSITIVE_PATHS,
+            "the other spelling must find the same lock iff paths ignore case here"
+        );
+    }
+
+    /// A held container names its holder to whoever is refused it, until that
+    /// holder lets go.
+    #[test]
+    fn a_held_container_names_its_holder_until_it_is_released() {
+        let locks = SpawnContainerLocks::default();
+        let container = Path::new("/ws/.spawn-origin_main");
+        let held = locks
+            .try_take(container, "spawn-test test-1")
+            .expect("free");
+        let refused = locks
+            .try_take(container, "primary rebuild")
+            .err()
+            .expect("held");
+        assert_eq!(refused.holder.as_deref(), Some("spawn-test test-1"));
+        assert_eq!(refused.to_string(), "held by spawn-test test-1");
+        drop(held);
+        let retaken = locks
+            .try_take(container, "primary rebuild")
+            .expect("free once its holder let go");
+        let refused = locks.try_take(container, "a probe").err().expect("held");
+        assert_eq!(
+            refused.holder.as_deref(),
+            Some("primary rebuild"),
+            "the new holder's label, not a stale one"
+        );
+        drop(retaken);
     }
 
     #[tokio::test]

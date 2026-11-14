@@ -4135,7 +4135,7 @@ async fn execute_spawn_build_inner(
     // runner killed as `frontend_dist_missing`). `None` for the live tree and a
     // caller-owned `worktree_path`, which the supervisor neither resets nor
     // prunes.
-    let mut container_guard: Option<tokio::sync::OwnedMutexGuard<()>> = None;
+    let mut container_guard: Option<crate::spawn_worktree::SpawnContainerGuard> = None;
 
     // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
     // runner root of the tree that was actually built. The spawned exe embeds

@@ -2162,22 +2162,24 @@ impl SupervisorState {
         &self,
         container: &std::path::Path,
         taker: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        let lock = self.spawn_container_locks.lock_for(container);
-        if let Ok(guard) = lock.clone().try_lock_owned() {
-            return guard;
+    ) -> crate::spawn_worktree::SpawnContainerGuard {
+        let locks = &self.spawn_container_locks;
+        match locks.try_take(container, taker) {
+            Ok(guard) => guard,
+            Err(held) => {
+                self.logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "{taker}: waiting for spawn container {container:?}, {held}; this \
+                             build goes on once that one is done with the tree"
+                        ),
+                    )
+                    .await;
+                locks.take(container, taker).await
+            }
         }
-        self.logs
-            .emit(
-                LogSource::Supervisor,
-                LogLevel::Info,
-                format!(
-                    "{taker}: waiting for spawn container {container:?}: another build holds \
-                     its lock, and this one goes on once that build is done with the tree"
-                ),
-            )
-            .await;
-        lock.lock_owned().await
     }
 
     /// Future that completes when a shutdown is signaled on `shutdown_tx`.
@@ -2711,6 +2713,15 @@ mod tests {
         assert!(
             !waiter.is_finished(),
             "the second build took a lock the first still holds"
+        );
+        assert!(
+            state
+                .logs
+                .history()
+                .await
+                .iter()
+                .any(|entry| entry.message.contains("held by first")),
+            "the wait must name the build it waits for"
         );
 
         drop(held);
