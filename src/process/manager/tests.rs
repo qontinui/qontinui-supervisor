@@ -6281,14 +6281,17 @@ fn failed_at_exe_resolution(err: &SupervisorError) -> bool {
 }
 
 /// The primary's origin/main rebuild builds in `.spawn-origin_main`, the container
-/// every default spawn-test builds in, so it holds that container's lock from before
-/// `prepare_worktree` resets the tree until its build is done (plan
+/// every default spawn-test builds in (plan
 /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
-/// D1). Unlocked, it could reset a spawn-test's tree mid-build, and any sweep could
-/// delete the container under it. Source level, because the rebuild compiles the
-/// runner. The guard must be a NAMED binding: `let _ =` would drop it at once.
+/// D1, and review round 1, W2). `restart_after_gate` takes that container BEFORE it
+/// stops the primary and holds it across the stop, the prepare and the build, so a
+/// wait for it passes with the primary still serving; after such a wait the
+/// readiness gate is asked again, before anything stops. Source level, because the
+/// rebuild compiles the runner. The guard must be a named binding (`let _ =` would
+/// drop it at once), its scope must reach the build, and nothing may release it
+/// early: its only uses are its binding, the build it is lent to, and its drop.
 #[test]
-fn the_primary_rebuild_holds_its_spawn_container_lock_across_prepare_and_build() {
+fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_through_the_build() {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
@@ -6298,12 +6301,16 @@ fn the_primary_rebuild_holds_its_spawn_container_lock_across_prepare_and_build()
     .expect("read manager.rs")
     .replace("\r\n", "\n");
     let src = crate::source_scan::production_span(&src).to_string();
-    let sig = "async fn primary_rebuild_from_origin_main(";
-    let body: String = crate::source_scan::fn_body(&src, sig)
-        .unwrap_or_else(|| panic!("{sig} exists"))
-        .split_whitespace()
-        .collect();
-    let in_order = |marks: &[&str]| {
+    let body_of = |sig: &str| -> &str {
+        crate::source_scan::fn_body(&src, sig).unwrap_or_else(|| panic!("{sig} exists"))
+    };
+    let squeezed = |body: &str| -> String {
+        body.lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect()
+    };
+    let in_order = |sig: &str, body: &str, marks: &[&str]| {
         let mut last = 0;
         for mark in marks {
             let at = body[last..]
@@ -6312,15 +6319,73 @@ fn the_primary_rebuild_holds_its_spawn_container_lock_across_prepare_and_build()
             last += at + mark.len();
         }
     };
-    in_order(&[
-        "container_path_for_ref(&state.config.project_dir,\"origin/main\")?;",
-        "let_container_guard=state.take_spawn_container_lock(&container,",
-        "crate::spawn_worktree::prepare_worktree(&state.config.project_dir,\"origin/main\")",
-        "crate::build_monitor::run_cargo_build_with_dir(",
-    ]);
+
+    let sig = "async fn restart_after_gate(";
+    in_order(
+        sig,
+        &squeezed(body_of(sig)),
+        &[
+            "letcontainer_guard=",
+            "Some(take_origin_main_container(state,managed,force,intent).await?)",
+            "stop_runner_by_id(state,runner_id,true,intent).await?;",
+            "primary_rebuild_from_origin_main(state,container).await?",
+            "drop(container_guard);",
+            "start_managed_runner(",
+        ],
+    );
+    let code: String = crate::source_scan::code_only(body_of(sig))
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        code.matches("container_guard").count(),
+        3,
+        "{sig}: container_guard is bound, lent to the build and dropped, and used no other way"
+    );
+    let bound = "letcontainer_guard=";
+    let from = code.find(bound).expect("the binding") + bound.len();
+    let to = code.find("drop(container_guard);").expect("the drop");
+    let mut depth = 0i32;
+    for c in code[from..to].chars() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            _ => {}
+        }
+        assert!(
+            depth >= 0,
+            "{sig}: container_guard's scope closes before its drop, so the build is not under it"
+        );
+    }
+
+    let sig = "async fn take_origin_main_container(";
+    in_order(
+        sig,
+        &squeezed(body_of(sig)),
+        &[
+            ".try_take(&container,PRIMARY_REBUILD_TAKER)",
+            ".take_spawn_container_lock(&container,PRIMARY_REBUILD_TAKER)",
+            "crate::restart_readiness::enforce(",
+            "Ok(guard)",
+        ],
+    );
+
+    let sig = "async fn primary_rebuild_from_origin_main(";
+    let rebuild = squeezed(body_of(sig));
     assert!(
-        !body.contains("drop(_container_guard)"),
-        "{sig} must hold its container lock until its build is done"
+        rebuild.contains("_container:&crate::spawn_worktree::SpawnContainerGuard"),
+        "{sig} must take the guard its caller holds"
+    );
+    assert!(
+        !rebuild.contains("take_spawn_container_lock("),
+        "{sig} must not take the container itself: its caller did, before the stop"
+    );
+    in_order(
+        sig,
+        &rebuild,
+        &[
+            "crate::spawn_worktree::prepare_worktree(&state.config.project_dir,\"origin/main\")",
+            "crate::build_monitor::run_cargo_build_with_dir(",
+        ],
     );
 }
 

@@ -246,6 +246,54 @@ pub(crate) fn fn_body<'t>(text: &'t str, signature: &str) -> Option<&'t str> {
     None
 }
 
+/// `text` with every comment dropped and every string and char literal
+/// emptied (`""`, `' '`), so a guard reading code structure (braces,
+/// identifiers) is not misled by what a comment or a message says. Lifetimes
+/// and labels stay. Offsets are not kept.
+pub(crate) fn code_only(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = skip_block_comment(&text[i..])
+                    .map_or(bytes.len(), |rest| text.len() - rest.len());
+            }
+            b'"' => {
+                out.push_str("\"\"");
+                i = skip_string(bytes, i + 1).unwrap_or(bytes.len());
+            }
+            b'r' | b'b' | b'c' if !is_ident_byte(bytes, i.wrapping_sub(1)) => {
+                match raw_or_prefixed_string(bytes, i) {
+                    Some(end) => {
+                        out.push_str("\"\"");
+                        i = end.unwrap_or(bytes.len());
+                    }
+                    None => {
+                        out.push(char::from(bytes[i]));
+                        i += 1;
+                    }
+                }
+            }
+            b'\'' => {
+                let end = skip_char_or_lifetime(text, i);
+                out.push_str(if end == i + 1 { "'" } else { "' '" });
+                i = end;
+            }
+            _ => {
+                let ch = text[i..].chars().next().expect("i is a char boundary");
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    out
+}
+
 /// The `(`/`[` and `<` nesting a signature prefix leaves open (`->` is not a
 /// closing `>`).
 fn open_brackets(signature: &str) -> (usize, usize) {
@@ -345,7 +393,27 @@ fn skip_char_or_lifetime(text: &str, i: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{fn_body, is_test_only_file, production_span};
+    use super::{code_only, fn_body, is_test_only_file, production_span};
+
+    /// A brace or an identifier inside a comment or a literal is not code.
+    #[test]
+    fn code_only_drops_comments_and_empties_literals() {
+        let src = "let a = \"{ not code }\"; // trailing { comment\n\
+                   let b = r#\"}\"#; /* block { */ let c = '{';\n\
+                   let d: &'static str = b\"}\"; let e = '\\'';\n";
+        let code = code_only(src);
+        assert!(!code.contains('{') && !code.contains('}'), "{code}");
+        assert!(
+            !code.contains("comment") && !code.contains("block"),
+            "{code}"
+        );
+        assert!(code.contains("let a = \"\";"), "{code}");
+        assert!(code.contains("&'static str"), "a lifetime stays: {code}");
+        assert!(
+            code.contains("let e = ' ';"),
+            "an escaped char empties: {code}"
+        );
+    }
 
     #[test]
     fn production_span_is_the_same_for_inline_and_extracted_tests() {

@@ -2154,10 +2154,11 @@ impl SupervisorState {
     /// one, and neither may happen while a build is reading it.
     ///
     /// When another build holds it, the caller waits until that build is done
-    /// with the tree, and the log says so first, naming `taker`: the wait can
-    /// last that build's whole run, and a primary rebuild waits with the
-    /// primary already stopped. The map mutex is released before any await, so
-    /// this never blocks the runtime.
+    /// with the tree, and the log says so first, naming `taker` and the build
+    /// it waits for: the wait can last that build's whole run (a primary
+    /// rebuild takes its container before it stops the primary, so it waits
+    /// with the primary still serving). The map mutex is released before any
+    /// await, so this never blocks the runtime.
     pub async fn take_spawn_container_lock(
         &self,
         container: &std::path::Path,
