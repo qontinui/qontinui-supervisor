@@ -2053,10 +2053,17 @@ pub struct SpawnTestRequest {
     /// that has its slot and is compiling can no longer be 504'd out from under
     /// itself, however small a value you pass.
     ///
-    /// **`0` means "a free slot right now, else a 504 at once".** A spawn that
-    /// finds a permit free reaches its build; one that would have to queue (a
-    /// busy pool, or a busy frontend lock) is answered 504 immediately, with
-    /// the message naming the phase it would have waited in. That is not
+    /// **`0` means "a free slot right now, else a 504 at once".** One that
+    /// would have to queue (a busy pool, or a busy frontend lock) is answered
+    /// 504 immediately, with the message naming the phase it would have waited
+    /// in. A spawn that finds a permit free reaches its build provided nothing
+    /// before the permit yields: the build is polled first and marks itself
+    /// `SlotHeld` the instant the permit is held. **Residual:** the pre-permit
+    /// disk and memory guards read a lock and emit logs while the marker still
+    /// says `AwaitingSlot`, so a contended yield there (or a memory-guard
+    /// deferral) can still 504 a zero budget. That is the guard's wait being
+    /// counted, which is the bound working, but it is not a free-slot
+    /// guarantee. That is not
     /// `X-Queue-Mode: no-wait`, which answers a busy pool with 503
     /// `build_pool_full` and its queue position.
     ///
@@ -2835,6 +2842,12 @@ const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(1
 /// because a frontend-lock wait can still follow. Only
 /// [`crate::build_monitor::BuildPhase::ends_the_queue`] (`Compiling`) stops it
 /// for good, so `queue_timeout_secs` can never 504 a build that is compiling.
+///
+/// The charge is per poll interval, so a phase change part-way through one is
+/// charged to whichever phase the interval began in: each transition out of a
+/// queue phase overcharges by up to one [`QUEUE_PHASE_POLL`] (100 ms), and
+/// each transition into one undercharges by as much. Negligible against any
+/// budget measured in seconds.
 ///
 /// A zero `timeout` fires on the first poll that reads a queue phase, which is
 /// what `queue_timeout_secs: 0` means: "a free slot now, else a 504". That is
@@ -3817,11 +3830,20 @@ impl Drop for SpawnInFlightGuard {
 /// tokio runtime is current, since `tokio::spawn` outside one panics. Either
 /// way it removes the entry only while it is still THIS reservation's
 /// `ManagedRunner` (`Arc::ptr_eq`), never a later entry under the same id.
+///
+/// **Once the start has been entered, `Drop` leaves the entry alone.** A panic
+/// or cancellation INSIDE `manager::start_managed_runner` can land after its
+/// child was spawned; removing the entry then would orphan a live process,
+/// and `finish_spawn_build`'s `panicked` answer tells the caller to stop the
+/// runner by this id, which needs the entry. A start that RETURNS `Err` is
+/// different: the explicit [`Self::release`] still removes it, as the inline
+/// cleanup did before.
 struct PlaceholderReservation {
     state: SharedState,
     id: String,
     managed: Arc<ManagedRunner>,
     armed: bool,
+    start_entered: bool,
 }
 
 impl PlaceholderReservation {
@@ -3832,7 +3854,15 @@ impl PlaceholderReservation {
             id: id.to_string(),
             managed: Arc::clone(managed),
             armed: true,
+            start_entered: false,
         }
+    }
+
+    /// Set immediately before `manager::start_managed_runner` is called: from
+    /// here a `Drop` (a panic or cancellation inside the start) may be
+    /// abandoning a spawned child, so it no longer removes the entry.
+    fn entering_start(&mut self) {
+        self.start_entered = true;
     }
 
     /// The runner started: from here its entry is the caller's, not ours.
@@ -3841,13 +3871,18 @@ impl PlaceholderReservation {
     }
 
     /// Give the reservation back now, unless disarmed. Idempotent.
+    ///
+    /// The removal happens BEFORE `armed` is cleared: a future cancelled while
+    /// waiting for the registry lock leaves the reservation armed, so its
+    /// `Drop` still releases it. `remove_if_reserved` is idempotent.
     async fn release(&mut self) {
         if !self.armed {
             return;
         }
-        self.armed = false;
         let mut runners = self.state.runners.write().await;
         remove_if_reserved(&mut runners, &self.id, &self.managed);
+        drop(runners);
+        self.armed = false;
     }
 }
 
@@ -3868,6 +3903,15 @@ fn remove_if_reserved(
 impl Drop for PlaceholderReservation {
     fn drop(&mut self) {
         if !self.armed {
+            return;
+        }
+        if self.start_entered {
+            warn!(
+                "spawn-test {} ended inside its start (a panic or cancellation); its registry \
+                 entry is kept because the runner's process may already be running — stop it \
+                 by this id",
+                self.id
+            );
             return;
         }
         if let Ok(mut runners) = self.state.runners.try_write() {
@@ -4364,8 +4408,11 @@ fn spawn_queue_timeout_message(
 /// time. Polled first, the build runs to its first real yield, and the marker
 /// it leaves there says truthfully whether it is still queued (the build
 /// stores [`crate::build_monitor::BuildPhase::SlotHeld`] the moment its
-/// permit is held). Both attempts of a spawn — the first and the poisoned-slot
-/// retry — come through here, since both go through `run_detailed`.
+/// permit is held). A yield BEFORE the permit — inside the disk or memory
+/// guard — still reads `AwaitingSlot` and is counted, so a zero budget can
+/// still fire there under contention. Both attempts of a spawn — the first and
+/// the poisoned-slot retry — come through here, since both go through
+/// `run_detailed`.
 async fn race_build_against_queue_budget<F>(
     state: &SharedState,
     build: F,
@@ -5190,6 +5237,9 @@ async fn execute_spawn_build_inner(
         }
     };
 
+    // From here a panic or cancellation may abandon a spawned child, so the
+    // reservation's `Drop` keeps the entry; an `Err` return still releases it.
+    reservation.entering_start();
     // Start the runner using the Arc captured at insertion time. This avoids
     // an id-based lookup, which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling

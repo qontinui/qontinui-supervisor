@@ -6145,7 +6145,11 @@ async fn a_prebuild_npm_lock_wait_is_a_504_naming_the_frontend_lock() {
 /// frontend lock is not 504'd the moment that wait begins: the lock wait gets
 /// the budget the work did not use. A wall-clock watcher charged the work to
 /// the wait.
-#[tokio::test]
+///
+/// On a paused clock, so the margins are exact rather than wall-clock bets on
+/// a loaded box: the watcher reads `tokio::time::Instant`, and every sleep
+/// here advances the clock deterministically.
+#[tokio::test(start_paused = true)]
 async fn queue_timeout_charges_only_time_spent_queued() {
     let budget = Duration::from_millis(300);
     let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
@@ -6211,5 +6215,62 @@ fn both_spawn_attempts_race_their_budget_biased_build_first() {
     assert!(
         biased < build_arm && build_arm < watcher_arm,
         "the race must be `biased;` with the build arm before the watcher arm"
+    );
+}
+
+/// A release cancelled while it waits for the registry lock must leave the
+/// reservation armed, so its `Drop` still gives the port back. Clearing
+/// `armed` before the await leaked the placeholder on exactly that path.
+#[tokio::test]
+async fn a_release_cancelled_on_the_lock_still_releases_on_drop() {
+    let state = make_state();
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let mut reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+
+    let lock = state.runners.write().await;
+    let cancelled = tokio::time::timeout(Duration::from_millis(50), reservation.release()).await;
+    assert!(
+        cancelled.is_err(),
+        "the release finished while the lock was held"
+    );
+    drop(lock);
+    drop(reservation);
+
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "a release cancelled on the registry lock leaked its placeholder"
+    );
+}
+
+/// A panic or cancellation INSIDE the start may abandon a spawned child, so
+/// once the start has been entered the reservation's `Drop` keeps the entry:
+/// the id is the caller's only handle for stopping that process.
+#[tokio::test]
+async fn a_reservation_dropped_inside_its_start_keeps_the_entry() {
+    let state = make_state();
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let mut reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+    reservation.entering_start();
+    drop(reservation);
+
+    assert!(
+        state.runners.read().await.contains_key(&id),
+        "a reservation dropped inside its start removed a runner whose process may be running"
+    );
+}
+
+/// A start that RETURNS `Err` started no runner it hands back, so the explicit
+/// release still removes the entry even though the start was entered.
+#[tokio::test]
+async fn a_start_that_returns_err_still_releases_its_placeholder() {
+    let state = make_state();
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let mut reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+    reservation.entering_start();
+    reservation.release().await;
+
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "a start that returned Err left its placeholder registered"
     );
 }
