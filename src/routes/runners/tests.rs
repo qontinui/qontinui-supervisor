@@ -793,10 +793,7 @@ async fn returns_dist_missing_even_when_src_tree_is_empty() {
 }
 
 /// The built tree's root itself is gone: `BuildTreeRemoved`, not
-/// `DistMissing`. On 2026-11-13 the spawn's own sweep had deleted its
-/// `.spawn-origin_main` container, and the verdict read as a missing dist/
-/// with an `npm run build` remedy that could not help, which got a healthy
-/// runner killed (plan
+/// `DistMissing`, whose `npm run build` remedy cannot bring a tree back (plan
 /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
 /// D3).
 #[tokio::test]
@@ -814,23 +811,46 @@ async fn returns_build_tree_removed_when_the_root_itself_is_absent() {
 }
 
 /// What a spawn door answers on each refusal: the token, the reason on the
-/// wire, and a remedy that fits the cause. A removed tree's remedy names the
-/// pruner and never sends the caller to rebuild the frontend.
+/// wire, and a remedy that fits the cause. A removed tree's remedy never sends
+/// the caller to rebuild the frontend, and offers a retry only where a retry
+/// brings the tree back: a managed container, whose message also names the
+/// sweeps that keep a container while its lock is held.
 #[test]
 fn a_frontend_refusal_names_the_remedy_for_its_own_cause() {
-    let root = std::path::Path::new("/ws/.spawn-origin_main/qontinui-runner");
+    use super::CheckedTree;
+    let managed_root = std::path::Path::new("/ws/.spawn-origin_main/qontinui-runner");
+    let caller_root = std::path::Path::new("/home/me/runner-checkout");
+    let live_root = std::path::Path::new("/ws/qontinui-runner");
+    let removed = |tree: CheckedTree<'_>| {
+        let body =
+            super::frontend_refusal_body(FrontendStaleReason::BuildTreeRemoved, None, Some(tree));
+        assert_eq!(body["error"], "frontend_build_tree_removed");
+        assert_eq!(body["frontend_stale_reason"], "build_tree_removed");
+        assert_eq!(body["frontend_stale"], true);
+        let message = body["message"].as_str().expect("a message").to_string();
+        assert!(
+            message.contains(&tree.root().display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("npm run build"), "{message}");
+        message
+    };
+    let managed = removed(CheckedTree::Managed(managed_root));
+    assert!(managed.contains("Retry the spawn"), "{managed}");
+    assert!(managed.contains("sweep"), "{managed}");
+    for unretryable in [
+        removed(CheckedTree::CallerOwned(caller_root)),
+        removed(CheckedTree::Live(live_root)),
+    ] {
+        assert!(unretryable.contains("retry"), "{unretryable}");
+        assert!(unretryable.contains("cannot help"), "{unretryable}");
+        assert!(!unretryable.contains("Retry the spawn"), "{unretryable}");
+    }
+    assert!(removed(CheckedTree::CallerOwned(caller_root)).contains("worktree_path"));
+    assert!(removed(CheckedTree::Live(live_root)).contains("--project-dir"));
 
-    let removed =
-        super::frontend_refusal_body(FrontendStaleReason::BuildTreeRemoved, None, Some(root));
-    assert_eq!(removed["error"], "frontend_build_tree_removed");
-    assert_eq!(removed["frontend_stale_reason"], "build_tree_removed");
-    assert_eq!(removed["frontend_stale"], true);
-    let message = removed["message"].as_str().expect("a message");
-    assert!(message.contains("pruner"), "{message}");
-    assert!(message.contains(&root.display().to_string()), "{message}");
-    assert!(!message.contains("npm run build"), "{message}");
-
-    let missing = super::frontend_refusal_body(FrontendStaleReason::DistMissing, None, Some(root));
+    let root = Some(CheckedTree::Managed(managed_root));
+    let missing = super::frontend_refusal_body(FrontendStaleReason::DistMissing, None, root);
     assert_eq!(missing["error"], "frontend_dist_missing");
     assert_eq!(missing["frontend_stale_reason"], "dist_missing");
     assert!(
@@ -840,7 +860,7 @@ fn a_frontend_refusal_names_the_remedy_for_its_own_cause() {
         "{missing}"
     );
 
-    let strict = super::frontend_refusal_body(FrontendStaleReason::SrcDrift, Some(2), Some(root));
+    let strict = super::frontend_refusal_body(FrontendStaleReason::SrcDrift, Some(2), root);
     assert_eq!(strict["error"], "frontend_stale");
     assert_eq!(strict["frontend_stale_reason"], "src_newer_than_dist");
     assert_eq!(strict["stale_slot_id"], 2);
@@ -990,13 +1010,16 @@ fn frontend_stale_reason_wire_format_is_stable() {
 /// pinned here.
 ///
 /// The lock used to be bound inside the rebuild block, so it was released
-/// before the verdict read the built tree: the spawn's own sweep deleted the
-/// container in between, and a healthy runner was started only to be killed
-/// as `frontend_dist_missing` (2026-11-13). The brace walk fails if the guard
-/// is declared in a scope that closes before the verdict.
+/// before the verdict read the built tree, and the spawn's own sweep deleted
+/// the container in between. The brace walk fails if the guard is declared in
+/// a scope that closes before the verdict, and the use count if anything
+/// releases it early (`= None`, `.take()`, a second `drop`). A build that fell
+/// back to a stale exe reads no tree (review round 1, S4), and the sweep runs
+/// once the container is released (S3).
 #[test]
 fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_starting() {
-    let body: String = fn_source("async fn execute_spawn_build_inner(")
+    let source = fn_source("async fn execute_spawn_build_inner(");
+    let body: String = source
         .lines()
         .filter(|line| !line.trim_start().starts_with("//"))
         .flat_map(str::split_whitespace)
@@ -1011,10 +1034,11 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
         "container_guard=Some(guard);",
         "crate::spawn_worktree::prepare_worktree(",
         "letmutbuild_result=run_detailed(build_dir_override.clone(),",
+        "letchecked_tree=ifmatches!(build_succeeded,Some(false)){None}",
         verdict,
-        "state.sweep_spawn_worktrees(None).await",
         released,
-        "frontend_refusal_body(reason,stale_slot_id,checked_root)",
+        "state.sweep_spawn_worktrees(None).await",
+        "frontend_refusal_body(reason,stale_slot_id,checked_tree)",
         "apply_paired_state_for_spawn(",
         "manager::start_managed_runner(",
     ] {
@@ -1029,10 +1053,20 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
         "one frontend verdict, read under the lock; a second one read after the start would \
          read a tree nothing protects"
     );
-    let from = body.find(declared).expect("the declaration") + declared.len();
-    let to = body.find(released).expect("the release");
+    // Structure, read with comments and literals stripped: no brace or name
+    // in a message or a comment counts.
+    let code: String = crate::source_scan::code_only(&source)
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        code.matches("container_guard").count(),
+        3,
+        "container_guard is declared, assigned once and dropped once, and used no other way"
+    );
+    let from = code.find(declared).expect("the declaration") + declared.len();
+    let to = code.find(released).expect("the release");
     let mut depth = 0i32;
-    for c in body[from..to].chars() {
+    for c in code[from..to].chars() {
         match c {
             '{' => depth += 1,
             '}' => depth -= 1,

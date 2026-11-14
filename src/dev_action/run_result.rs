@@ -592,10 +592,10 @@ mod tests {
     /// above. It reads spellings, so it does not check which argument the date is
     /// passed as.
     ///
-    /// The slow work differs by door: spawn-named's frontend verdict follows its wait,
-    /// while spawn-test reads its verdict before it starts the runner, under its
-    /// container lock, so what follows its wait is the provenance compare, a `git
-    /// fetch`.
+    /// The slow work it is checked against is the first that follows either door's
+    /// wait: resolving the exe the response reports (`exe_meta`). spawn-test reads its
+    /// frontend verdict before it starts the runner, so that is no longer after its
+    /// wait.
     #[test]
     fn a_spawn_doors_wait_dates_its_answer() {
         fn squeezed(text: &str) -> String {
@@ -612,14 +612,14 @@ mod tests {
                 "probe_runner_health(",
                 "side.answered_at.get_or_insert_with(chrono::Utc::now);",
                 2,
-                "build_older_than_lkg_json(",
+                "letexe_meta=",
             ),
             (
                 "async fn spawn_named_inner(",
                 "client.get(&health_url)",
                 "answered_at.get_or_insert_with(chrono::Utc::now);",
                 1,
-                "resolve_frontend_stale_for_spawn(",
+                "letexe_meta=",
             ),
         ] {
             let body = squeezed(crate::source_scan::fn_body(&src, signature).expect(signature));
