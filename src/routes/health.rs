@@ -1429,6 +1429,9 @@ mod tests {
     /// follows the cached footprint (UNKNOWN → 30, then derived).
     #[tokio::test]
     async fn health_build_pool_reports_size_jobs_and_disk_floor() {
+        // The served floor reads the disk-floor env override; a test driving a
+        // real build switches it off while holding this lock.
+        let _env = crate::test_env::BUILD_GUARD_ENV.lock().await;
         const GIB: u64 = 1024 * 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_placeholder_primary(dir.path()).await;

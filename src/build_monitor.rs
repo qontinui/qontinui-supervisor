@@ -707,28 +707,42 @@ where
 }
 
 /// The phase a `spawn-test` build future is in, tracked via a shared
-/// `Arc<AtomicU8>` so the route-level `tokio::time::timeout` wrapper can read
-/// the LIVE phase at the instant it fires and compose a phase-accurate timeout
-/// message. The single timeout wraps the WHOLE
-/// `run_cargo_build_with_dir_detailed` future, and the future is cancelled
-/// mid-flight on timeout (so no `BuildAttempt` is returned to the route) — the
-/// only way the route can tell which phase actually blocked is to observe this
-/// marker, which the build future advances monotonically as it progresses.
+/// `Arc<AtomicU8>` so the route's queue watcher can read the LIVE phase and
+/// compose a phase-accurate timeout message. The build future is cancelled
+/// mid-flight on a queue timeout (so no `BuildAttempt` is returned to the
+/// route) — the only way the route can tell which phase actually blocked is to
+/// observe this marker.
+///
+/// **The marker must tell the truth the moment the build stops queueing**,
+/// because the watcher fires on a queue phase however briefly it is read, and
+/// a zero `queue_timeout_secs` reads it once. So the build stores `SlotHeld`
+/// immediately after its permit is acquired, rather than leaving
+/// `AwaitingSlot` standing through the slot claim, the cleanup pass and the
+/// worktree frontend prebuild.
 ///
 /// Ordering (see `run_cargo_build_with_dir_detailed` / `run_build_inner`):
-/// `AwaitingSlot` (cargo permit acquire) → `AwaitingNpmLock` (frontend lock
-/// acquire) → `BuildingFrontend` (`pnpm run build`) → `Compiling` (cargo).
+/// `AwaitingSlot` (memory guard, cargo permit acquire) → `SlotHeld` → for a
+/// worktree build, the prebuild's own `AwaitingNpmLock` → `BuildingFrontend`
+/// (`pnpm install` / `pnpm run build`) → `AwaitingNpmLock` (the frontend lock
+/// again) → `BuildingFrontend` (`pnpm run build`) → `Compiling` (cargo). It is
+/// NOT monotonic: a worktree build re-enters `AwaitingNpmLock` after its
+/// prebuild, which is why the watcher only stops for good at `Compiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BuildPhase {
-    /// Waiting on `permits.acquire_owned()` — the genuine "build slot" wait.
+    /// Waiting on `permits.acquire_owned()` — the genuine "build slot" wait —
+    /// or, before it, deferred by the pre-permit memory guard.
     AwaitingSlot = 0,
     /// Slot held; waiting on `npm_lock.lock_owned()` (frontend serialization).
     AwaitingNpmLock = 1,
-    /// npm_lock held; running `pnpm run build`.
+    /// npm_lock held; running `pnpm install` / `pnpm run build`.
     BuildingFrontend = 2,
     /// Frontend done (or skipped); running `cargo build`.
     Compiling = 3,
+    /// Permit held; preparing the build (slot claim, cleanup pass, exe unlock,
+    /// the prebuild's freshness gate) before a frontend lock is asked for. Not
+    /// a queue wait, and not terminal: a frontend-lock wait follows.
+    SlotHeld = 4,
 }
 
 impl BuildPhase {
@@ -739,6 +753,7 @@ impl BuildPhase {
             1 => BuildPhase::AwaitingNpmLock,
             2 => BuildPhase::BuildingFrontend,
             3 => BuildPhase::Compiling,
+            4 => BuildPhase::SlotHeld,
             _ => BuildPhase::AwaitingSlot,
         }
     }
@@ -750,15 +765,22 @@ impl BuildPhase {
     /// Is this phase a QUEUE wait — the request blocked on a lock, doing no
     /// work of its own?
     ///
-    /// `queue_timeout_secs` bounds exactly these phases. Once the build starts
-    /// doing work (`BuildingFrontend` / `Compiling`) the clock stops: the
-    /// caller's slot is held, the compile is in flight, and a 504 there would
-    /// abandon a live build mid-compile — which is what the field's old
-    /// whole-future semantics did, despite being documented as a queue wait.
-    /// Killing a compiling build also throws away everything it had compiled,
-    /// so the bounded wait cost the caller far more than the wait it bounded.
+    /// `queue_timeout_secs` bounds exactly these phases. While the build is
+    /// doing work (`SlotHeld` / `BuildingFrontend` / `Compiling`) the clock
+    /// does not run: the caller's slot is held, and a 504 there would abandon
+    /// a live build — which is what the field's old whole-future semantics
+    /// did, despite being documented as a queue wait. Killing a compiling build
+    /// also throws away everything it had compiled, so the bounded wait cost
+    /// the caller far more than the wait it bounded.
     pub fn is_queue_wait(self) -> bool {
         matches!(self, BuildPhase::AwaitingSlot | BuildPhase::AwaitingNpmLock)
+    }
+
+    /// Is this phase final for the queue — no queue phase can follow it in the
+    /// same attempt? Only `Compiling`: the frontend lock is behind it for good.
+    /// Every other work phase can still be followed by a frontend-lock wait.
+    pub fn ends_the_queue(self) -> bool {
+        matches!(self, BuildPhase::Compiling)
     }
 
     /// Store this phase into the shared marker (Relaxed — the marker is a
@@ -791,6 +813,11 @@ impl BuildPhase {
             ),
             BuildPhase::Compiling => format!(
                 "Build queue timeout: waited {}s while compiling (cargo); the slot was \
+                 already held — not a slot wait",
+                secs
+            ),
+            BuildPhase::SlotHeld => format!(
+                "Build queue timeout: waited {}s while preparing the build; the slot was \
                  already held — not a slot wait",
                 secs
             ),
@@ -1108,6 +1135,12 @@ pub async fn run_cargo_build_with_dir_detailed(
         .queue_depth
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let permit_result = state.build_pool.permits.clone().acquire_owned().await;
+    // The queue wait is over the instant the permit is held. Said BEFORE any
+    // further await, so a queue watcher that reads the marker at this build's
+    // next yield sees `SlotHeld`, not a slot wait that has already ended.
+    if permit_result.is_ok() {
+        BuildPhase::SlotHeld.store(&phase);
+    }
     state
         .build_pool
         .queue_depth
@@ -1466,7 +1499,7 @@ async fn run_build_inner(
                 src_tauri
             ))
         })?;
-        prebuild_worktree_frontend(state, slot, &wt_root, force_frontend_build).await?;
+        prebuild_worktree_frontend(state, slot, &wt_root, force_frontend_build, phase).await?;
     }
     // The frontend is embedded in the binary via tauri_build, so we must run
     // `pnpm run build` first to produce a fresh dist/ before cargo build.
@@ -2721,17 +2754,24 @@ pub(crate) fn sidecar_build_verdict(
 /// stdout+stderr** embedded, and records the same blob on the slot so it
 /// reaches `SlotHistory::last_error_detail` / `last_error_log` and the build
 /// submission's `stderr_tail` (see [`record_frontend_failure`]).
+///
+/// `phase` is the build's queue marker: the prebuild's wait for the npm lock is
+/// a queue wait (`AwaitingNpmLock`), and what it runs under the lock is work
+/// (`BuildingFrontend`), so `queue_timeout_secs` bounds the first and never the
+/// second.
 async fn prebuild_worktree_frontend(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
     wt_root: &std::path::Path,
     force_frontend_build: bool,
+    phase: &std::sync::atomic::AtomicU8,
 ) -> Result<(), SupervisorError> {
     prebuild_worktree_frontend_with(
         state,
         slot,
         wt_root,
         force_frontend_build,
+        phase,
         |cwd, args| async move { run_pnpm_command(&cwd, args).await },
     )
     .await
@@ -2746,6 +2786,7 @@ async fn prebuild_worktree_frontend_with<F, Fut>(
     slot: &Arc<BuildSlot>,
     wt_root: &std::path::Path,
     force_frontend_build: bool,
+    phase: &std::sync::atomic::AtomicU8,
     pnpm: F,
 ) -> Result<(), SupervisorError>
 where
@@ -2815,7 +2856,10 @@ where
             ),
         )
         .await;
+    // The lock wait is a queue wait, and what runs under the lock is work.
+    BuildPhase::AwaitingNpmLock.store(phase);
     let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+    BuildPhase::BuildingFrontend.store(phase);
     // Re-check after the (possibly minutes-long) lock wait: a link re-created
     // in that window must not be installed through. Idempotent and cheap —
     // one `symlink_metadata` when `node_modules` is already a real dir. If a

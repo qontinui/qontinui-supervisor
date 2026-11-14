@@ -63,6 +63,8 @@ mod state;
 #[cfg(test)]
 mod test_clock;
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_ports;
 mod trace_propagation;
 mod velocity;

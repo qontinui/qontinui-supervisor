@@ -1842,6 +1842,9 @@ mod tests {
 
     #[test]
     fn test_memory_guard_resolvers_fall_back_to_defaults() {
+        // A test driving a real build switches these floors off while it holds
+        // this lock; reading them here without it would race that window.
+        let _env = crate::test_env::BUILD_GUARD_ENV.blocking_lock();
         // Only assert the no-override path when the env is genuinely unset —
         // asserting unconditionally would fail for an operator who has set a
         // per-machine override, and reading an absent var as "default" is the

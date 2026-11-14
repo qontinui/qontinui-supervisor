@@ -2046,14 +2046,24 @@ pub struct SpawnTestRequest {
     /// Only meaningful when `rebuild: true`. `None` means wait indefinitely
     /// (the default).
     ///
-    /// It bounds only the queue phases — waiting on a cargo build permit and,
-    /// after that, on the serialized frontend (pnpm) lock. **The clock stops
-    /// the moment the build starts doing work**: a build that has its slot and
-    /// is compiling can no longer be 504'd out from under itself, however
-    /// small a value you pass. Until 2026-08-03 this bounded the whole
-    /// build+spawn future despite its name and docs, so a caller asking "don't
-    /// make me queue for more than 60s" also got their compiling build
-    /// abandoned at 60s — losing everything it had compiled.
+    /// It bounds only the queue phases — waiting for the managed container,
+    /// on the pre-permit memory guard, on a cargo build permit and, after
+    /// that, on the serialized frontend (pnpm) lock. **The clock does not run
+    /// while the build is doing work**, and only queue time is summed: a build
+    /// that has its slot and is compiling can no longer be 504'd out from under
+    /// itself, however small a value you pass.
+    ///
+    /// **`0` means "a free slot right now, else a 504 at once".** A spawn that
+    /// finds a permit free reaches its build; one that would have to queue (a
+    /// busy pool, or a busy frontend lock) is answered 504 immediately, with
+    /// the message naming the phase it would have waited in. That is not
+    /// `X-Queue-Mode: no-wait`, which answers a busy pool with 503
+    /// `build_pool_full` and its queue position.
+    ///
+    /// Until 2026-08-03 this bounded the whole build+spawn future despite its
+    /// name and docs, so a caller asking "don't make me queue for more than
+    /// 60s" also got their compiling build abandoned at 60s — losing
+    /// everything it had compiled.
     ///
     /// Use `wait_timeout_secs` to bound the post-spawn health wait; there is
     /// deliberately no knob that kills a healthy in-flight compile.
@@ -2810,30 +2820,52 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
 /// accurate to well under a second.
 const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Resolve only if `timeout` elapses while the build is STILL in a queue phase
-/// (see [`crate::build_monitor::BuildPhase::is_queue_wait`]); returns the phase
-/// that was blocking so the caller can compose a phase-accurate message.
+/// Resolve once the build has spent `timeout` IN QUEUE PHASES (see
+/// [`crate::build_monitor::BuildPhase::is_queue_wait`]) and is still in one;
+/// returns the phase that was blocking so the caller can compose a
+/// phase-accurate message.
 ///
-/// Once the build leaves its queue phases — the cargo permit and, after it, the
-/// frontend lock are both held and real work has started — this future never
-/// resolves, so `queue_timeout_secs` can no longer 504 a build that is
-/// compiling. Phases advance monotonically within one attempt, so "left the
-/// queue" is a latch, not a sample that can flap back.
+/// **Only queue time is charged.** A worktree build waits for its cargo
+/// permit, works under it (`SlotHeld`, the frontend prebuild), and then waits
+/// again for the frontend lock — so the phases are not monotonic, and a
+/// wall-clock budget would charge the work between the two waits to the second
+/// one, 504ing a build whose actual queue time was far under the bound. Each
+/// poll interval is charged only when it began in a queue phase, and the
+/// watcher keeps polling through work phases rather than giving up on them,
+/// because a frontend-lock wait can still follow. Only
+/// [`crate::build_monitor::BuildPhase::ends_the_queue`] (`Compiling`) stops it
+/// for good, so `queue_timeout_secs` can never 504 a build that is compiling.
+///
+/// A zero `timeout` fires on the first poll that reads a queue phase, which is
+/// what `queue_timeout_secs: 0` means: "a free slot now, else a 504". That is
+/// truthful only because the build is polled first
+/// ([`race_build_against_queue_budget`]) and stores `SlotHeld` the moment its
+/// permit is held.
 async fn wait_out_queue_timeout(
     timeout: std::time::Duration,
     marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> crate::build_monitor::BuildPhase {
-    let start = std::time::Instant::now();
+    let mut queued_for = std::time::Duration::ZERO;
+    // When the previous poll read a queue phase: the interval since then is
+    // charged against the budget.
+    let mut queued_since: Option<tokio::time::Instant> = None;
     loop {
+        let now = tokio::time::Instant::now();
+        if let Some(since) = queued_since.take() {
+            queued_for += now.saturating_duration_since(since);
+        }
         let phase = crate::build_monitor::BuildPhase::from_u8(
             marker.load(std::sync::atomic::Ordering::Relaxed),
         );
-        if !phase.is_queue_wait() {
-            // Work has started — stop counting, forever.
+        if phase.ends_the_queue() {
+            // Compiling: no queue phase can follow — stop counting, forever.
             std::future::pending::<()>().await;
         }
-        if start.elapsed() >= timeout {
-            return phase;
+        if phase.is_queue_wait() {
+            if queued_for >= timeout {
+                return phase;
+            }
+            queued_since = Some(now);
         }
         tokio::time::sleep(QUEUE_PHASE_POLL).await;
     }
@@ -4314,6 +4346,62 @@ fn spawn_queue_timeout_message(
     )
 }
 
+/// Race a spawn-test build against its queue budget: the build's own result,
+/// or a 504 naming the phase that was still waiting when `budget` ran out.
+///
+/// `queue_timeout_secs` bounds the QUEUE, not the build. It used to wrap the
+/// whole future, so a caller passing a small bound to say "don't make me wait
+/// for a busy pool" got a 504 that ALSO abandoned an already-compiling slot —
+/// throwing away a live build (and everything it had compiled) for a wait that
+/// had already ended. The watcher ([`wait_out_queue_timeout`]) counts only the
+/// time the build's phase marker spends in a queue phase, so the field means
+/// what it is documented to mean.
+///
+/// **`biased;`, with the build first.** An unbiased `select!` picks its first
+/// branch at random, and with a zero budget the watcher resolves on its first
+/// poll whenever the marker still reads a queue phase — so a spawn that had a
+/// free slot got a spurious "waited 0s for a cargo build slot" about half the
+/// time. Polled first, the build runs to its first real yield, and the marker
+/// it leaves there says truthfully whether it is still queued (the build
+/// stores [`crate::build_monitor::BuildPhase::SlotHeld`] the moment its
+/// permit is held). Both attempts of a spawn — the first and the poisoned-slot
+/// retry — come through here, since both go through `run_detailed`.
+async fn race_build_against_queue_budget<F>(
+    state: &SharedState,
+    build: F,
+    phase_marker: Arc<std::sync::atomic::AtomicU8>,
+    budget: std::time::Duration,
+    queue_timeout_secs: u64,
+    container_wait: Option<&ContainerWait>,
+) -> Result<crate::build_monitor::BuildAttempt, (SupervisorError, crate::build_monitor::BuildAttempt)>
+where
+    F: std::future::Future<
+        Output = Result<
+            crate::build_monitor::BuildAttempt,
+            (SupervisorError, crate::build_monitor::BuildAttempt),
+        >,
+    >,
+{
+    let watcher = wait_out_queue_timeout(budget, phase_marker);
+    tokio::pin!(build);
+    tokio::select! {
+        biased;
+        r = &mut build => r,
+        phase = watcher => {
+            let available_permits = state.build_pool.permits.available_permits();
+            Err((
+                SupervisorError::Timeout(spawn_queue_timeout_message(
+                    phase,
+                    queue_timeout_secs,
+                    container_wait,
+                    available_permits,
+                )),
+                crate::build_monitor::BuildAttempt::default(),
+            ))
+        }
+    }
+}
+
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
 /// flow is preserved verbatim from the pre-Item-6 handler. It never removes the
 /// placeholder itself: it disarms `reservation` once the runner has started,
@@ -4658,9 +4746,10 @@ async fn execute_spawn_build_inner(
             let source_kind = source_kind.clone();
             async move {
                 // Shared phase marker the build future advances
-                // (AwaitingSlot → AwaitingNpmLock → BuildingFrontend →
-                // Compiling). On a queue timeout the future is cancelled
-                // mid-flight and returns no `BuildAttempt`, so reading this
+                // (AwaitingSlot → SlotHeld → AwaitingNpmLock →
+                // BuildingFrontend → Compiling, a worktree build visiting the
+                // frontend-lock wait twice). On a queue timeout the future is
+                // cancelled mid-flight and returns no `BuildAttempt`, so reading this
                 // marker is the ONLY way to compose a phase-accurate message —
                 // it reflects exactly what the cancelled future was doing.
                 let phase_marker = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
@@ -4675,38 +4764,19 @@ async fn execute_spawn_build_inner(
                     phase_marker.clone(),
                 );
                 match queue_budget {
+                    // `budget` is what is left of the caller's budget for this
+                    // attempt; the message names the caller's whole budget, and
+                    // how much of it a wait for the container took first.
                     Some(budget) => {
-                        // `queue_timeout_secs` bounds the QUEUE, not the build.
-                        // It used to wrap the whole future, so a caller passing
-                        // a small bound to say "don't make me wait for a busy
-                        // pool" got a 504 that ALSO abandoned an already-
-                        // compiling slot — throwing away a live build (and
-                        // everything it had compiled) for a wait that had
-                        // already ended. The watcher below stops counting the
-                        // moment the build leaves its queue phases, so the
-                        // field now means what it is documented to mean.
-                        // `budget` is what is left of it for this attempt; the
-                        // message names the caller's whole budget, and how much
-                        // of it a wait for the container took first.
-                        let secs = queue_timeout_secs.unwrap_or(budget.as_secs());
-                        let watcher = wait_out_queue_timeout(budget, phase_marker.clone());
-                        tokio::pin!(fut);
-                        tokio::select! {
-                            r = &mut fut => r,
-                            phase = watcher => {
-                                let available_permits =
-                                    state.build_pool.permits.available_permits();
-                                Err((
-                                    SupervisorError::Timeout(spawn_queue_timeout_message(
-                                        phase,
-                                        secs,
-                                        container_wait.as_ref(),
-                                        available_permits,
-                                    )),
-                                    crate::build_monitor::BuildAttempt::default(),
-                                ))
-                            }
-                        }
+                        race_build_against_queue_budget(
+                            state,
+                            fut,
+                            phase_marker,
+                            budget,
+                            queue_timeout_secs.unwrap_or(budget.as_secs()),
+                            container_wait.as_ref(),
+                        )
+                        .await
                     }
                     None => fut.await,
                 }

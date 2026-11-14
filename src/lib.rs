@@ -75,6 +75,9 @@ pub mod state;
 /// binaries under `tests/` share ONE definition of the env knob's name with
 /// the in-crate unit tests; a second spelling is how the two drift apart.
 pub mod test_clock;
+/// Test-only: serializes the tests that switch the build guards' env floors off.
+#[cfg(test)]
+mod test_env;
 /// Test-only: a loopback port that refuses connects and stays reserved.
 #[cfg(test)]
 mod test_ports;

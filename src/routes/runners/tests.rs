@@ -1297,7 +1297,7 @@ fn a_build_queue_timeout_splits_its_budget_with_the_container_wait() {
         .flat_map(str::split_whitespace)
         .collect();
     for wiring in [
-        "SupervisorError::Timeout(spawn_queue_timeout_message(phase,secs,container_wait.as_ref(),",
+        "race_build_against_queue_budget(state,fut,phase_marker,budget,queue_timeout_secs.unwrap_or(budget.as_secs()),container_wait.as_ref(),)",
         "letmutbuild_result=run_detailed(build_dir_override.clone(),build_queue_budget,container_wait,)",
         "run_detailed(build_dir_override.clone(),queue_budget,None)",
     ] {
@@ -1306,6 +1306,17 @@ fn a_build_queue_timeout_splits_its_budget_with_the_container_wait() {
             "execute_spawn_build_inner: no {wiring}"
         );
     }
+    let race: String = fn_source("async fn race_build_against_queue_budget<")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .flat_map(str::split_whitespace)
+        .collect();
+    let wiring =
+        "SupervisorError::Timeout(spawn_queue_timeout_message(phase,queue_timeout_secs,container_wait,";
+    assert!(
+        race.contains(wiring),
+        "race_build_against_queue_budget: no {wiring}"
+    );
 }
 
 /// W1 (review round 1 of plan
@@ -5781,6 +5792,109 @@ async fn a_no_wait_refusal_releases_its_placeholder() {
     );
 }
 
+/// How many spawns the zero-budget test runs. Each one is two coin flips on
+/// the unbiased race (the first attempt and its poisoned-slot retry), so a
+/// racy `select!` passes all of them with probability 4^-8.
+const ZERO_BUDGET_SPAWNS: usize = 8;
+
+/// `queue_timeout_secs: 0` with a free slot is "admit if a slot is free right
+/// now": the spawn reaches the build, and is answered by the build — never a
+/// 504 "waited 0s for a cargo build slot". Driven through the real
+/// `execute_spawn_build`, so the real `run_cargo_build_with_dir_detailed`
+/// races the real queue watcher in the real `select!`, for both the first
+/// attempt and the poisoned-slot retry. The live tree is an empty temp dir, so
+/// the build claims a slot and then fails in its frontend step.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_queue_budget_with_a_free_slot_reaches_the_build() {
+    let _floors = crate::test_env::build_guard_floors_off().await;
+    for spawn in 0..ZERO_BUDGET_SPAWNS {
+        let (state, _root) = state_over_an_empty_runner_tree();
+        let port = 9877;
+        let (id, managed) = reserve_spawn_test_placeholder(&state, port).await;
+        let run_guard = spawn_test_run_guard(&state, &managed).await;
+        let body: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({
+            "rebuild": true,
+            "from_working_tree": true,
+            "queue_timeout_secs": 0,
+        }))
+        .expect("a spawn-test body");
+
+        let reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+        let (status, body, _stderr) =
+            super::execute_spawn_build(state.clone(), body, reservation, port, false, run_guard)
+                .await;
+
+        assert_ne!(
+            status.as_u16(),
+            504,
+            "spawn {spawn}: a free slot under queue_timeout_secs: 0 was answered with a queue \
+             timeout: {body}"
+        );
+        assert!(
+            body["build_slot_id"].is_u64(),
+            "spawn {spawn}: the build never claimed a slot: {body}"
+        );
+    }
+}
+
+/// The real build of a worktree that does not exist, with a fresh phase
+/// marker: it passes the guards, takes a permit and a slot, and then fails in
+/// its frontend prebuild (`pnpm install` in a missing directory).
+fn real_build_of_a_missing_worktree<'a>(
+    state: &'a crate::state::SharedState,
+    root: &std::path::Path,
+) -> (
+    impl std::future::Future<
+            Output = Result<
+                crate::build_monitor::BuildAttempt,
+                (
+                    crate::error::SupervisorError,
+                    crate::build_monitor::BuildAttempt,
+                ),
+            >,
+        > + 'a,
+    Arc<AtomicU8>,
+) {
+    let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+    let build = crate::build_monitor::run_cargo_build_with_dir_detailed(
+        state,
+        None,
+        Some(root.join("no-such-worktree").join("src-tauri")),
+        false,
+        crate::build_monitor::BuildSourceKind::Override,
+        marker.clone(),
+    );
+    (build, marker)
+}
+
+/// The marker half of the zero-budget race: polled first (`biased;`), a build
+/// that holds its slot parks at its first real yield — here, the worktree
+/// frontend prebuild, before any `AwaitingNpmLock` store — and the watcher
+/// then reads the marker. If the marker still says `AwaitingSlot` the zero
+/// budget fires although the permit is held. The real build through the real
+/// race, not a model of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_budget_does_not_time_out_a_build_that_holds_its_slot() {
+    let _floors = crate::test_env::build_guard_floors_off().await;
+    for attempt in 0..ZERO_BUDGET_SPAWNS {
+        let (state, root) = state_over_an_empty_runner_tree();
+        let (build, marker) = real_build_of_a_missing_worktree(&state, root.path());
+        let result =
+            super::race_build_against_queue_budget(&state, build, marker, Duration::ZERO, 0, None)
+                .await;
+        match result {
+            Err((crate::error::SupervisorError::Timeout(msg), _)) => panic!(
+                "attempt {attempt}: a build holding its slot was 504'd on a zero budget: {msg}"
+            ),
+            Err((_, attempt_detail)) => assert!(
+                attempt_detail.slot_id.is_some(),
+                "attempt {attempt}: the build never claimed a slot"
+            ),
+            Ok(_) => panic!("attempt {attempt}: a build of a missing worktree succeeded"),
+        }
+    }
+}
+
 /// A refusal answered `Ok` — the frontend 503, decided before any runner
 /// starts — gives the reservation back too. The guard releases on every
 /// outcome that started no runner, not only on `Err`. The empty runner tree has
@@ -5939,5 +6053,163 @@ async fn a_reservation_never_removes_an_entry_it_does_not_own() {
     assert!(
         Arc::ptr_eq(kept, &replacement),
         "the registry no longer holds the replacement entry"
+    );
+}
+
+/// The other half of `queue_timeout_secs: 0`: with every permit taken, the
+/// spawn is answered 504 naming the slot wait, at once — "a free slot now,
+/// else a 504", never a wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_queue_budget_on_a_busy_pool_is_a_504_at_once() {
+    let _floors = crate::test_env::build_guard_floors_off().await;
+    let (state, _root) = state_over_an_empty_runner_tree();
+    let _every_permit = state
+        .build_pool
+        .permits
+        .clone()
+        .try_acquire_many_owned(state.build_pool.permits.available_permits() as u32)
+        .expect("take every build permit");
+    let (id, managed) = reserve_spawn_test_placeholder(&state, 9877).await;
+    let run_guard = spawn_test_run_guard(&state, &managed).await;
+    let body: super::SpawnTestRequest = serde_json::from_value(serde_json::json!({
+        "rebuild": true,
+        "from_working_tree": true,
+        "queue_timeout_secs": 0,
+    }))
+    .expect("a spawn-test body");
+    let reservation = super::PlaceholderReservation::new(&state, &id, &managed);
+
+    let answered = tokio::time::timeout(
+        crate::test_clock::poll_budget(Duration::from_secs(10)),
+        super::execute_spawn_build(state.clone(), body, reservation, 9877, false, run_guard),
+    )
+    .await;
+    let (status, body, _stderr) =
+        answered.expect("a zero budget on a busy pool queued instead of answering at once");
+
+    assert_eq!(status.as_u16(), 504, "body: {body}");
+    assert_eq!(
+        body["error"], "Timeout: Build queue timeout: waited 0s for a cargo build slot",
+        "body: {body}"
+    );
+    assert!(
+        !state.runners.read().await.contains_key(&id),
+        "the 504 left its placeholder registered"
+    );
+}
+
+/// The worktree frontend prebuild waits for the npm lock while holding its
+/// slot. That wait is still a queue wait, so a queue budget still 504s it —
+/// and the 504 names the frontend lock, not a cargo slot the build already
+/// holds. Before the prebuild stored its own phase, the marker read
+/// `AwaitingSlot` through the whole prebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_prebuild_npm_lock_wait_is_a_504_naming_the_frontend_lock() {
+    let _floors = crate::test_env::build_guard_floors_off().await;
+    let (state, root) = state_over_an_empty_runner_tree();
+    let _npm_lock = state.build_pool.npm_lock.clone().lock_owned().await;
+    let (build, marker) = real_build_of_a_missing_worktree(&state, root.path());
+
+    let result = tokio::time::timeout(
+        crate::test_clock::poll_budget(Duration::from_secs(30)),
+        super::race_build_against_queue_budget(
+            &state,
+            build,
+            marker,
+            Duration::from_millis(500),
+            1,
+            None,
+        ),
+    )
+    .await
+    .expect("a build blocked on the npm lock never timed out of its queue budget");
+
+    match result {
+        Err((crate::error::SupervisorError::Timeout(msg), _)) => {
+            assert!(
+                msg.contains("blocked on the frontend (pnpm) lock"),
+                "the prebuild's npm-lock wait was not attributed to the frontend lock: {msg}"
+            );
+            assert!(
+                !msg.contains("cargo build slot"),
+                "the 504 claims a slot wait although the slot was held: {msg}"
+            );
+        }
+        Err((other, _)) => panic!("expected a queue timeout, got: {other}"),
+        Ok(_) => panic!("a build of a missing worktree succeeded"),
+    }
+}
+
+/// Only queue time is charged. A build that works under its permit for longer
+/// than the whole budget (`SlotHeld`: the prebuild) and only then waits for the
+/// frontend lock is not 504'd the moment that wait begins: the lock wait gets
+/// the budget the work did not use. A wall-clock watcher charged the work to
+/// the wait.
+#[tokio::test]
+async fn queue_timeout_charges_only_time_spent_queued() {
+    let budget = Duration::from_millis(300);
+    let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
+    // The permit is free: the queue wait ends at once.
+    BuildPhase::SlotHeld.store(&marker);
+    let watcher = tokio::spawn(wait_out_queue_timeout(budget, marker.clone()));
+
+    // Work for twice the budget.
+    tokio::time::sleep(budget * 2).await;
+    assert!(!watcher.is_finished(), "the watcher fired during work");
+
+    // Now the frontend-lock wait begins; nothing of the budget is spent yet.
+    BuildPhase::AwaitingNpmLock.store(&marker);
+    tokio::time::sleep(budget / 3).await;
+    assert!(
+        !watcher.is_finished(),
+        "the watcher charged the work before the lock wait to the lock wait"
+    );
+
+    // Give-up budget on "the watcher fires at all", not a speed assertion.
+    let phase = tokio::time::timeout(
+        crate::test_clock::poll_budget(Duration::from_secs(30)),
+        watcher,
+    )
+    .await
+    .expect("a frontend-lock wait past its budget must still time out")
+    .expect("the watcher task");
+    assert_eq!(phase, BuildPhase::AwaitingNpmLock);
+}
+
+/// Both attempts of a spawn — the first and the poisoned-slot retry — reach
+/// the build through `run_detailed`, and `run_detailed` bounds a budgeted
+/// build only through `race_build_against_queue_budget`, whose `select!` is
+/// `biased;` with the build first. One edit covers both attempts; this pins
+/// that it stays one.
+#[test]
+fn both_spawn_attempts_race_their_budget_biased_build_first() {
+    let inner = fn_source("async fn execute_spawn_build_inner(");
+    let calls = inner.matches("run_detailed(").count();
+    assert_eq!(
+        calls, 2,
+        "expected the first attempt and the poisoned-slot retry to call `run_detailed`, \
+         found {calls} call(s)"
+    );
+    assert_eq!(
+        inner.matches("race_build_against_queue_budget(").count(),
+        1,
+        "`run_detailed` must bound a budgeted build through the one race function"
+    );
+    assert!(
+        !inner.contains("tokio::select!"),
+        "a second, unbiased `select!` crept back into the spawn-test build path"
+    );
+
+    let race = fn_source("async fn race_build_against_queue_budget<");
+    let select = race
+        .find("tokio::select!")
+        .expect("the race is a `select!`");
+    let after = &race[select..];
+    let biased = after.find("biased;").expect("the race is `biased;`");
+    let build_arm = after.find("r = &mut build").expect("the build arm");
+    let watcher_arm = after.find("phase = watcher").expect("the watcher arm");
+    assert!(
+        biased < build_arm && build_arm < watcher_arm,
+        "the race must be `biased;` with the build arm before the watcher arm"
     );
 }
