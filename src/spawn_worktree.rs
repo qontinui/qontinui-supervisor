@@ -1137,6 +1137,12 @@ impl SpawnContainerLocks {
         let held = lock.mutex.clone().lock_owned().await;
         SpawnContainerGuard::labelled(lock, held, taker)
     }
+
+    /// Who holds `container`'s lock now, read without touching the lock:
+    /// `None` when it is free, or in the instant before a new holder labels it.
+    pub fn holder(&self, container: &Path) -> Option<String> {
+        self.lock_for(container).holder()
+    }
 }
 
 /// The label the spawn-worktree sweep holds a container under while it
@@ -2464,9 +2470,14 @@ mod tests {
     fn a_held_container_names_its_holder_until_it_is_released() {
         let locks = SpawnContainerLocks::default();
         let container = Path::new("/ws/.spawn-origin_main");
+        assert_eq!(locks.holder(container), None);
         let held = locks
             .try_take(container, "spawn-test test-1")
             .expect("free");
+        assert_eq!(
+            locks.holder(container).as_deref(),
+            Some("spawn-test test-1")
+        );
         let refused = locks
             .try_take(container, "primary rebuild")
             .err()
@@ -2474,6 +2485,11 @@ mod tests {
         assert_eq!(refused.holder.as_deref(), Some("spawn-test test-1"));
         assert_eq!(refused.to_string(), "held by spawn-test test-1");
         drop(held);
+        assert_eq!(
+            locks.holder(container),
+            None,
+            "a released lock names nobody"
+        );
         let retaken = locks
             .try_take(container, "primary rebuild")
             .expect("free once its holder let go");

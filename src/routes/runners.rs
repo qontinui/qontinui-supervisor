@@ -4067,6 +4067,49 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
     }
 }
 
+/// Take a spawn-test's container lock under the caller's queue contract.
+///
+/// Waiting for the container is a queue wait like waiting for a build slot:
+/// under `X-Queue-Mode: no-wait` a container another build holds answers 503
+/// `spawn_container_busy` at once, naming that build, and a
+/// `queue_timeout_secs` budget bounds the wait, answering 504 naming the build
+/// still holding it. The caller takes the time it waited out of the budget its
+/// build then queues with. Without either, it waits as long as the holder
+/// builds, and the log says whom it waits for.
+async fn take_container_for_spawn(
+    state: &SharedState,
+    container: &std::path::Path,
+    taker: &str,
+    no_wait: bool,
+    queue_budget: Option<std::time::Duration>,
+) -> Result<crate::spawn_worktree::SpawnContainerGuard, SupervisorError> {
+    if no_wait {
+        return state
+            .spawn_container_locks
+            .try_take(container, taker)
+            .map_err(|held| SupervisorError::SpawnContainerBusy {
+                container: container.display().to_string(),
+                holder: held.holder,
+            });
+    }
+    let Some(budget) = queue_budget else {
+        return Ok(state.take_spawn_container_lock(container, taker).await);
+    };
+    match tokio::time::timeout(budget, state.take_spawn_container_lock(container, taker)).await {
+        Ok(guard) => Ok(guard),
+        Err(_) => {
+            let held = crate::spawn_worktree::ContainerHeld {
+                holder: state.spawn_container_locks.holder(container),
+            };
+            Err(SupervisorError::Timeout(format!(
+                "Build queue timeout: waited {}s for spawn container {:?}, {held}",
+                budget.as_secs(),
+                container
+            )))
+        }
+    }
+}
+
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
 /// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
 /// removal on the error paths below is unchanged.
@@ -4208,19 +4251,37 @@ async fn execute_spawn_build_inner(
         // tree — provenance is the whole point). Release the placeholder port
         // on failure so it doesn't leak.
         //
-        // The container's lock first (see `container_guard`). A container path
-        // that cannot be derived (malformed layout) takes no lock:
-        // `prepare_worktree` fails on the same derivation before it touches
-        // anything, and surfaces the real error.
+        // The container's lock first (see `container_guard`), under the
+        // caller's queue contract (`take_container_for_spawn`): its wait is a
+        // queue wait, so it answers `no_wait` and counts against
+        // `queue_timeout_secs`. A container path that cannot be derived
+        // (malformed layout) takes no lock: `prepare_worktree` fails on the
+        // same derivation before it touches anything, and surfaces the real
+        // error.
+        let queue_budget = body.queue_timeout_secs.map(std::time::Duration::from_secs);
+        let mut container_waited = std::time::Duration::ZERO;
         if let Some(git_ref) = build_source.managed_ref() {
             if let Ok(container) =
                 crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, git_ref)
             {
-                container_guard = Some(
-                    state
-                        .take_spawn_container_lock(&container, "spawn-test")
-                        .await,
-                );
+                let taker = match body.requester_id.as_deref() {
+                    Some(requester) => format!("spawn-test {id} (requester {requester})"),
+                    None => format!("spawn-test {id}"),
+                };
+                let waiting_since = std::time::Instant::now();
+                match take_container_for_spawn(state, &container, &taker, no_wait, queue_budget)
+                    .await
+                {
+                    Ok(guard) => {
+                        container_guard = Some(guard);
+                        container_waited = waiting_since.elapsed();
+                    }
+                    Err(e) => {
+                        let mut runners = state.runners.write().await;
+                        runners.remove(id);
+                        return Err(e);
+                    }
+                }
             }
         }
         let build_dir_override = match build_source.managed_ref() {
@@ -4388,7 +4449,8 @@ async fn execute_spawn_build_inner(
         // whatever branch the shared checkout happened to be parked on.
         let source_kind =
             build_source.build_source_kind(git_ref_info.as_ref().map(|(_, s)| s.as_str()));
-        let run_detailed = |override_dir: Option<std::path::PathBuf>| {
+        let run_detailed = |override_dir: Option<std::path::PathBuf>,
+                            queue_budget: Option<std::time::Duration>| {
             let requester = requester_id.clone();
             let source_kind = source_kind.clone();
             async move {
@@ -4409,8 +4471,8 @@ async fn execute_spawn_build_inner(
                     source_kind,
                     phase_marker.clone(),
                 );
-                match queue_timeout_secs {
-                    Some(secs) => {
+                match queue_budget {
+                    Some(budget) => {
                         // `queue_timeout_secs` bounds the QUEUE, not the build.
                         // It used to wrap the whole future, so a caller passing
                         // a small bound to say "don't make me wait for a busy
@@ -4420,8 +4482,10 @@ async fn execute_spawn_build_inner(
                         // already ended. The watcher below stops counting the
                         // moment the build leaves its queue phases, so the
                         // field now means what it is documented to mean.
-                        let timeout = std::time::Duration::from_secs(secs);
-                        let watcher = wait_out_queue_timeout(timeout, phase_marker.clone());
+                        // `budget` is what is left of it for this attempt; the
+                        // message names the caller's whole budget.
+                        let secs = queue_timeout_secs.unwrap_or(budget.as_secs());
+                        let watcher = wait_out_queue_timeout(budget, phase_marker.clone());
                         tokio::pin!(fut);
                         tokio::select! {
                             r = &mut fut => r,
@@ -4442,7 +4506,13 @@ async fn execute_spawn_build_inner(
             }
         };
 
-        let mut build_result = run_detailed(build_dir_override.clone()).await;
+        // The first attempt queues with what the container wait left of the
+        // budget; a poisoned-slot retry below queues afresh with all of it.
+        let mut build_result = run_detailed(
+            build_dir_override.clone(),
+            queue_budget.map(|budget| budget.saturating_sub(container_waited)),
+        )
+        .await;
 
         // Poisoned-slot self-heal (Issue 3 fix part 2). On a build FAILURE
         // whose stderr is NOT a genuine compiler diagnostic (no `error[E####]`,
@@ -4499,7 +4569,7 @@ async fn execute_spawn_build_inner(
                                 e
                             ),
                         }
-                        let retry = run_detailed(build_dir_override.clone()).await;
+                        let retry = run_detailed(build_dir_override.clone(), queue_budget).await;
                         match &retry {
                             Ok(_) => {
                                 tracing::info!(
