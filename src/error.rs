@@ -56,6 +56,22 @@ pub enum SupervisorError {
         estimated_wait_secs: Option<f64>,
     },
 
+    /// The `.spawn-<ref>` container a spawn-test builds in is held by another
+    /// build (a same-ref spawn-test, the primary's origin/main rebuild, or a
+    /// sweep removing it), and the caller opted out of waiting via
+    /// `X-Queue-Mode: no-wait`. A queue answer like [`Self::BuildPoolFull`]:
+    /// nothing was built or started; retry later.
+    #[error(
+        "Spawn container {container} is busy: held by {}",
+        .holder.as_deref().unwrap_or("another build")
+    )]
+    SpawnContainerBusy {
+        container: String,
+        /// The holder's label, `None` for the instant before a new holder
+        /// labels the lock it has just taken.
+        holder: Option<String>,
+    },
+
     #[error("Build failed: {0}")]
     BuildFailed(String),
 
@@ -230,6 +246,16 @@ impl SupervisorError {
             return (StatusCode::SERVICE_UNAVAILABLE, body);
         }
 
+        if let SupervisorError::SpawnContainerBusy { container, holder } = self {
+            let body = serde_json::json!({
+                "error": "spawn_container_busy",
+                "message": self.to_string(),
+                "container": container,
+                "holder": holder,
+            });
+            return (StatusCode::SERVICE_UNAVAILABLE, body);
+        }
+
         if let SupervisorError::InsufficientDisk {
             free_bytes,
             required_bytes,
@@ -329,6 +355,7 @@ impl SupervisorError {
             SupervisorError::SelfRestartRefused(_) => StatusCode::CONFLICT,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::SpawnContainerBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
@@ -395,5 +422,29 @@ mod tests {
         assert!(message.contains("port 9876"), "{message}");
         assert!(message.contains("PID 247696"), "{message}");
         assert!(body["recovery"].is_array());
+    }
+
+    /// `SpawnContainerBusy` is a 503 queue answer like `BuildPoolFull`, with a
+    /// typed body naming the container and the build that holds it.
+    #[test]
+    fn spawn_container_busy_maps_to_service_unavailable_naming_its_holder() {
+        let err = SupervisorError::SpawnContainerBusy {
+            container: "/ws/.spawn-origin_main".to_string(),
+            holder: Some("spawn-test test-1".to_string()),
+        };
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "spawn_container_busy");
+        assert_eq!(body["container"], "/ws/.spawn-origin_main");
+        assert_eq!(body["holder"], "spawn-test test-1");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("held by spawn-test test-1"), "{message}");
+
+        let unlabelled = SupervisorError::SpawnContainerBusy {
+            container: "/ws/.spawn-origin_main".to_string(),
+            holder: None,
+        };
+        assert!(unlabelled.to_string().ends_with("held by another build"));
+        assert!(unlabelled.to_status_body().1["holder"].is_null());
     }
 }

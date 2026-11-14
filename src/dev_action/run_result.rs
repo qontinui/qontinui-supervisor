@@ -103,7 +103,9 @@ pub fn unhealthy_after_start_reason(
 /// [`SupervisorError::UnverifiedExe`] (the exe a start resolved has no identity),
 /// [`SupervisorError::NoDisplay`] (a Linux start has no display),
 /// [`SupervisorError::PortHeldByLiveRunner`] (a live runner holds the port),
-/// [`SupervisorError::BuildPoolFull`] (the pool was full under `no-wait`) and
+/// [`SupervisorError::BuildPoolFull`] (the pool was full under `no-wait`),
+/// [`SupervisorError::SpawnContainerBusy`] (another build held the spawn
+/// container under `no-wait`) and
 /// [`SupervisorError::InsufficientDisk`] (the disk guard refused the build).
 /// Each refuses the step it guards before that step has started a process or a
 /// build, which is what `Refused` asserts: nothing ran. That holds for a start
@@ -135,6 +137,7 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
         | SupervisorError::NoDisplay(_)
         | SupervisorError::PortHeldByLiveRunner { .. }
         | SupervisorError::BuildPoolFull { .. }
+        | SupervisorError::SpawnContainerBusy { .. }
         | SupervisorError::InsufficientDisk { .. }) => ActionRunResult::Refused {
             reason: e.to_string(),
         },
@@ -394,6 +397,10 @@ mod tests {
                 detail: "unverified".to_string(),
             })),
             SupervisorError::PortHeldByLiveRunner { port: 9877, pid: 1 },
+            SupervisorError::SpawnContainerBusy {
+                container: "/ws/.spawn-origin_main".to_string(),
+                holder: Some("spawn-test test-1".to_string()),
+            },
         ]
     }
 

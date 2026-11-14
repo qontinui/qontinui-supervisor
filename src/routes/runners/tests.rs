@@ -1007,9 +1007,10 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
     let mut last = 0;
     for mark in [
         declared,
-        "container_guard=Some(state.take_spawn_container_lock(&container,\"spawn-test\").await",
+        "take_container_for_spawn(state,&container,&taker,no_wait,queue_budget)",
+        "container_guard=Some(guard);",
         "crate::spawn_worktree::prepare_worktree(",
-        "run_detailed(build_dir_override.clone()).await",
+        "letmutbuild_result=run_detailed(build_dir_override.clone(),",
         verdict,
         "crate::spawn_worktree::prune_spawn_worktrees(",
         released,
@@ -1043,6 +1044,69 @@ fn spawn_test_reads_its_frontend_verdict_under_its_container_lock_and_before_sta
              them is not read under the container lock"
         );
     }
+}
+
+/// S8 (review round 1 of plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`):
+/// a spawn-test's wait for its container is a queue wait. Under `no-wait` a held
+/// container answers `spawn_container_busy` naming its holder; a queue budget
+/// bounds the wait and its timeout names the holder too; a free container is
+/// taken at once either way.
+#[tokio::test]
+async fn a_spawn_tests_container_wait_honours_no_wait_and_its_queue_budget() {
+    let state = make_state();
+    let container = std::path::Path::new("/tmp/test/.spawn-origin_main");
+    let held = state
+        .spawn_container_locks
+        .try_take(container, "spawn-test test-1 (requester a)")
+        .expect("free");
+
+    let refused =
+        super::take_container_for_spawn(&state, container, "spawn-test test-2", true, None)
+            .await
+            .err()
+            .expect("a held container refuses a no-wait take");
+    match refused {
+        crate::error::SupervisorError::SpawnContainerBusy {
+            container: named,
+            holder,
+        } => {
+            assert_eq!(named, container.display().to_string());
+            assert_eq!(holder.as_deref(), Some("spawn-test test-1 (requester a)"));
+        }
+        other => panic!("expected spawn_container_busy, got {other:?}"),
+    }
+
+    let budget = Duration::from_millis(50);
+    let timed_out = super::take_container_for_spawn(
+        &state,
+        container,
+        "spawn-test test-2",
+        false,
+        Some(budget),
+    )
+    .await
+    .err()
+    .expect("a held container outlasts a short queue budget");
+    match timed_out {
+        crate::error::SupervisorError::Timeout(message) => {
+            assert!(message.contains("for spawn container"), "{message}");
+            assert!(
+                message.contains("held by spawn-test test-1 (requester a)"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a queue timeout, got {other:?}"),
+    }
+
+    drop(held);
+    let taken = super::take_container_for_spawn(&state, container, "spawn-test test-2", true, None)
+        .await
+        .expect("a free container is taken under no-wait");
+    drop(taken);
+    super::take_container_for_spawn(&state, container, "spawn-test test-2", false, Some(budget))
+        .await
+        .expect("a free container is taken within any budget");
 }
 
 /// Pin the default + explicit-true wire shapes for the
