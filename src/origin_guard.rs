@@ -1063,8 +1063,17 @@ mod unit_tests {
     /// - `format!("{}/…", loopback_base(<own port>))`;
     /// - a local bound to that base, then either a `"{local}/…"` string
     ///   literal or a positional `format!("{}/…", local)`. Only the rest of
-    ///   the block the binding sits in is read, so a same-named local bound
-    ///   to another base elsewhere in the file is not taken for this one.
+    ///   the block the binding sits in is read, up to a `let <local>` rebind
+    ///   at the binding's own depth, so a same-named local bound to another
+    ///   base elsewhere in the file is not taken for this one.
+    ///
+    /// Reach limits of the rebind cut: a shadow made by a pattern
+    /// (`if let Some(base) = …`, `match`, a destructuring `let (base, _)`)
+    /// or by a closure parameter (`|base| …`) is not seen, and the uses after
+    /// it are still read as this binding's. A `let <local>` inside a string
+    /// or comment is not a cut, but only because the block walk skips those;
+    /// a literal or comment shape the walk does not recognise (see
+    /// [`scope_end`]) would be matched.
     ///
     /// Reach, so a green run is not over-read: a self-call spelled any other
     /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
@@ -1072,7 +1081,8 @@ mod unit_tests {
     fn self_call_paths(production: &str) -> Vec<String> {
         const OWN_PORT: &str = r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)\s*,?\s*\)";
         const BASE: &str = r"(?:crate::)?(?:loopback::)?loopback_base\(\s*";
-        let binding = regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
+        let binding =
+            regex::Regex::new(&format!(r"let\s+(?:mut\s+)?(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
         let inline = regex::Regex::new(&format!(
             r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}"#
         ))
@@ -1083,14 +1093,18 @@ mod unit_tests {
             .collect();
         for local in binding.captures_iter(production) {
             let from = local.get(0).unwrap().end();
-            let mut scope = &production[from..enclosing_block_end(production, from)];
             let name = regex::escape(&local[1]);
-            // A later `let <name>` in the same block shadows this binding, so
-            // its scope ends there.
-            let rebind = regex::Regex::new(&format!(r"\blet\s+(?:mut\s+)?{name}\b")).unwrap();
-            if let Some(shadow) = rebind.find(scope) {
-                scope = &scope[..shadow.start()];
-            }
+            // A later `let <name>` at the binding's own brace depth shadows
+            // it, so its scope ends there. One inside an inner block shadows
+            // only that block and does not end it.
+            let rebind = regex::Regex::new(&format!(r"^let\s+(?:mut\s+)?{name}\b")).unwrap();
+            let bytes = production.as_bytes();
+            let stop_at = |i: usize| {
+                production[i..].starts_with("let")
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                    && rebind.is_match(&production[i..])
+            };
+            let scope = &production[from..scope_end(production, from, stop_at)];
             let named = regex::Regex::new(&format!(r#""\{{{name}\}}(/[^"]*)""#)).unwrap();
             let positional = regex::Regex::new(&format!(
                 r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{name}\s*[,)]"#
@@ -1126,21 +1140,28 @@ mod unit_tests {
         normalise_path(&segments.join("/"))
     }
 
-    /// The byte offset of the `}` that closes the block containing `from`
-    /// (the end of `text` when there is none). Braces inside string, raw
-    /// string and char literals and inside comments are not counted, so a
-    /// `"{base}/x"` format string does not move the count.
+    /// The byte offset where a scope that starts at `from` ends: the `}` that
+    /// closes the block containing `from`, or the first CODE position at the
+    /// same brace depth as `from` for which `stop_at(i)` holds, whichever
+    /// comes first (the end of `text` when neither does). Braces inside
+    /// string, raw string and char literals and inside comments are not
+    /// counted, and `stop_at` is never asked about a position inside one, so a
+    /// `"{base}/x"` format string does not move the count and a `let` in a
+    /// comment is not a stop.
     ///
     /// Reach limits: a nested block comment (`/* a /* b */ c */`) ends at its
     /// first `*/`, and a char literal holding a multi-byte character (`'é'`)
     /// is not recognised as one. Neither holds a brace in this crate today;
     /// either could shift the count if one did.
-    fn enclosing_block_end(text: &str, from: usize) -> usize {
+    fn scope_end(text: &str, from: usize, stop_at: impl Fn(usize) -> bool) -> usize {
         let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let bytes = text.as_bytes();
         let mut depth = 0usize;
         let mut i = from;
         while i < bytes.len() {
+            if depth == 0 && stop_at(i) {
+                return i;
+            }
             match bytes[i] {
                 b'/' if bytes.get(i + 1) == Some(&b'/') => {
                     i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
@@ -1345,8 +1366,10 @@ fn probe(state: &SharedState) {
     }
 
     /// A1: a binding's `"{local}/…"` uses are read only in the rest of its own
-    /// block. Here the own-port `base` comes FIRST, so a file-wide search
-    /// would also read the later runner function's `"{base}/runner-only"`.
+    /// block. Here the own-port `base` comes FIRST, and the later `runner`
+    /// takes a runner URL as a PARAMETER named `base` (no `let`, so no rebind
+    /// cut can hide it): a file-wide search, or a walk that over-counts an
+    /// opening brace, also reads `runner`'s `"{base}/runner-only"`.
     ///
     /// Between the binding and its use sit brace-bearing literals, a comment
     /// and a lifetime, each of which the block walk must skip. A closing brace
@@ -1354,7 +1377,9 @@ fn probe(state: &SharedState) {
     /// brace that is counted carries the scope into `runner` (read 2). The
     /// closing literals come FIRST, so a walk that skipped no string at all
     /// would still see an unmatched `}` rather than a `"}"` / `"{"` pair that
-    /// cancels out.
+    /// cancels out. Each raw literal holds a `"` before its `{`, so only real
+    /// raw-string handling (prefix included) skips it; a plain-string read
+    /// would end at that quote and count the brace.
     #[test]
     fn self_call_guard_reads_a_binding_only_in_its_own_block() {
         let routes = registered_route_paths();
@@ -1362,15 +1387,14 @@ fn probe(state: &SharedState) {
 fn own(state: &SharedState) {
     let base = crate::loopback::loopback_base(state.config.port);
     let close = ('}', "}");
-    let open = ('{', "{", r#"{"#, br#"{"#); // {
+    let open = ('{', "{", r#""{"#, br#""{"#, cr#"a"{"#); // {
     fn f<'a>(s: &'a str) -> &'a str {
         s
     }
     let _ = client.get(format!("{base}/health"));
 }
 
-fn runner(port: u16) {
-    let base = crate::loopback::runner_loopback_base(port);
+fn runner(base: &str) {
     let _ = client.get(format!("{base}/runner-only"));
 }
 "##;
@@ -1395,6 +1419,40 @@ fn f(state: &SharedState, port: u16) {
         let (dead, read) = unregistered_self_calls(&[("shadow.rs".to_string(), src)], &routes);
         assert_eq!(read, 1, "only the use before the rebind is a self-call");
         assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A rebind inside an INNER block shadows only that block, so the outer
+    /// binding's later use is still read, and here flagged.
+    #[test]
+    fn self_call_guard_ignores_a_rebind_in_an_inner_block() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, x: bool) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    if x {
+        let base = other();
+    }
+    let _ = client.post(format!("{base}/dead-route"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("inner.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "the outer use is still this binding's");
+        assert_eq!(dead, ["inner.rs: /dead-route"]);
+    }
+
+    /// `let mut` binds an own-port base as well as `let` does.
+    #[test]
+    fn self_call_guard_reads_a_let_mut_binding() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState) {
+    let mut me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.post(format!("{me}/dev-start/frontend"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("mut.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1);
+        assert_eq!(dead, ["mut.rs: /dev-start/frontend"]);
     }
 
     /// A2: the positional, rustfmt-split and suffix-interpolated spellings are
