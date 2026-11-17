@@ -688,17 +688,25 @@ fn bodiless_mod_name(code: &str) -> Option<String> {
     (!name.is_empty() && bodiless).then_some(name)
 }
 
-/// The files a `mod` declaration in `file` can resolve to.
-/// `path` with each `..` popping the component before it and each `.`
-/// dropped, without touching the filesystem. The walked source paths carry
+/// `path` with each `.` dropped and each `..` cancelling the normal component
+/// before it, without touching the filesystem. The walked source paths carry
 /// neither, so this is what lets a `#[path]` target compare equal to them.
+///
+/// A `..` with no normal component left to cancel is kept, not dropped: on a
+/// relative path it still climbs, so dropping it would resolve the target to
+/// a different file. Above a root or a Windows prefix it is a no-op, as the
+/// OS treats it.
 fn normalize_lexically(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
-            Component::ParentDir => {
-                out.pop();
-            }
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
             Component::CurDir => {}
             other => out.push(other),
         }
@@ -716,6 +724,7 @@ fn strip_bom(text: String) -> String {
     }
 }
 
+/// The files a `mod` declaration in `file` can resolve to.
 fn declaration_targets(file: &Path, decl: &ModDecl) -> Vec<PathBuf> {
     let dir = file.parent().unwrap_or(Path::new("."));
     // `#[path = "…"]` on a module declared in a file is relative to that
@@ -1235,6 +1244,23 @@ fn a_path_attribute_with_parent_components_resolves_normalised() {
     assert_eq!(set.len(), 1, "{set:?}");
 }
 
+/// A `..` that climbs past the start of a relative path is kept, so the target
+/// stays outside `src/` rather than collapsing onto a file the walk holds.
+#[test]
+fn an_unpoppable_parent_component_is_kept() {
+    let sources = vec![(
+        PathBuf::from("src/lib.rs"),
+        "#[cfg(test)]\n#[path = \"../../z.rs\"]\nmod z;\n".to_string(),
+    )];
+    let set = test_only_files(&sources);
+    assert!(
+        set.iter()
+            .all(|p| !p.starts_with("src") && p != Path::new("z.rs")),
+        "{set:?}"
+    );
+    assert!(set.contains(Path::new("../z.rs")), "{set:?}");
+}
+
 /// A leading byte-order mark is dropped before lexing, so a header after one
 /// marks the file test-only, as it does for `source_scan`.
 #[test]
@@ -1242,6 +1268,9 @@ fn a_bom_before_the_header_is_stripped() {
     let text = strip_bom("\u{feff}#![cfg(test)]\n\nfn t() {}\n".to_string());
     assert!(text.starts_with("#![cfg(test)]"), "{text:?}");
     assert!(is_test_only_file(&lex(&text).0));
+    // Unstripped, the BOM hides the header from the lexer: this is what the
+    // strip is for.
+    assert!(!is_test_only_file(&lex("\u{feff}#![cfg(test)]\n").0));
     // Without a BOM the text is unchanged, and a BOM mid-file is left alone.
     assert_eq!(strip_bom("a\u{feff}b".to_string()), "a\u{feff}b");
 }
