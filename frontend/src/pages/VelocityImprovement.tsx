@@ -73,9 +73,7 @@ function PhaseBadge({
         border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
       }}
     >
-      {phase === 'running_tests' ||
-      phase === 'fixing' ||
-      phase === 'waiting_frontend' ? (
+      {phase === 'running_tests' || phase === 'fixing' || phase === 'waiting_frontend' ? (
         <span className="spinner" style={{ width: 12, height: 12 }} />
       ) : null}
       {label}
