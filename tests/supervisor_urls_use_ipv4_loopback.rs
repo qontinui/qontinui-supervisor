@@ -146,7 +146,7 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The exemption token, qontinui-claude-config check #14's marker. It exempts
 /// only with a reason after its colon ([`exempts`]).
@@ -689,25 +689,42 @@ fn bodiless_mod_name(code: &str) -> Option<String> {
 }
 
 /// The files a `mod` declaration in `file` can resolve to.
+/// `path` with each `..` popping the component before it and each `.`
+/// dropped, without touching the filesystem. The walked source paths carry
+/// neither, so this is what lets a `#[path]` target compare equal to them.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// A source file's text as both classifiers read it: a leading byte-order
+/// mark is dropped, as `source_scan::is_test_only_file` drops it, so a
+/// `#![cfg(test)]` after one counts on both sides.
+fn strip_bom(text: String) -> String {
+    match text.strip_prefix('\u{feff}') {
+        Some(rest) => rest.to_string(),
+        None => text,
+    }
+}
+
 fn declaration_targets(file: &Path, decl: &ModDecl) -> Vec<PathBuf> {
     let dir = file.parent().unwrap_or(Path::new("."));
     // `#[path = "…"]` on a module declared in a file is relative to that
     // file's directory.
     if let Some(rel) = &decl.path {
-        // A `..` component would need normalising to compare with the walked
-        // paths. Joined raw, it would match no file, and the file it really
-        // names would be misread with confident advice. Fail loudly instead.
-        assert!(
-            !Path::new(rel)
-                .components()
-                .any(|c| c == std::path::Component::ParentDir),
-            "{}: `#[path = \"{rel}\"]` on `mod {};` contains `..`, which this test does not \
-             resolve. Teach `declaration_targets` to normalise it, or move the file so the \
-             attribute needs no `..`.",
-            file.display(),
-            decl.name
-        );
-        return vec![dir.join(rel)];
+        // Normalised, so a `..` or `.` in the attribute names the same path
+        // the walk produced, and gated and ungated declarations of one file
+        // compare equal.
+        return vec![normalize_lexically(&dir.join(rel))];
     }
     // A crate root (`lib.rs`, `main.rs`, a `src/bin/*.rs` binary) and a
     // `mod.rs` declare their children beside themselves. Any other file
@@ -867,13 +884,7 @@ fn no_supervisor_url_spells_localhost() {
         .map(|p| {
             let text = fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", p.display()));
-            // Strip a leading BOM before lexing, as `source_scan` does, so a
-            // header after one counts on both sides.
-            let text = match text.strip_prefix('\u{feff}') {
-                Some(rest) => rest.to_string(),
-                None => text,
-            };
-            (p, text)
+            (p, strip_bom(text))
         })
         .collect();
     let declared_test_only = test_only_files(&sources);
@@ -911,15 +922,16 @@ fn no_supervisor_url_spells_localhost() {
          min_files={MIN_FILES_SCANNED}"
     );
 
-    assert!(
-        files_scanned >= MIN_FILES_SCANNED,
-        "scanned only {files_scanned} production files under src/ (floor {MIN_FILES_SCANNED}): \
-         the directory moved or the walk broke, so a green run here would prove nothing"
-    );
-
-    // Both kinds of failure are collected and reported together, so fixing one
-    // does not reveal the other only on the next run.
+    // Every kind of failure is collected and reported together, so fixing one
+    // does not reveal another only on the next run.
     let mut report = Vec::new();
+    if files_scanned < MIN_FILES_SCANNED {
+        report.push(format!(
+            "scanned only {files_scanned} production files under src/ (floor \
+             {MIN_FILES_SCANNED}): the directory moved or the walk broke, so a green run here \
+             would prove nothing"
+        ));
+    }
     if !header_failures.is_empty() {
         report.push(format!(
             "{} test-only file(s) lack the `#![cfg(test)]` header, the one rule this test and \
@@ -1197,16 +1209,41 @@ fn test_only_files_come_from_cfg_test_declarations() {
     }
 }
 
-/// A `#[path]` that climbs with `..` is refused rather than joined raw, which
-/// would match no walked file and misclassify the one it names.
+/// A `#[path]` that climbs with `..` (or carries a `.`) resolves to the
+/// normalised path the walk produces. So a gated declaration and an ungated
+/// twin naming one file through different spellings cancel out, and a
+/// gated-only one is found under its normalised name.
 #[test]
-#[should_panic(expected = "contains `..`, which this test does not resolve")]
-fn a_path_attribute_with_a_parent_component_fails_loudly() {
-    let sources = vec![(
-        PathBuf::from("src/a/b.rs"),
-        "#[cfg(test)]\n#[path = \"../shared_tests.rs\"]\nmod shared;\n".to_string(),
-    )];
-    test_only_files(&sources);
+fn a_path_attribute_with_parent_components_resolves_normalised() {
+    let src = |p: &str, t: &str| (PathBuf::from(p), t.to_string());
+    let sources = vec![
+        // Gated in one file, ungated in another, both naming src/a/x.rs.
+        src(
+            "src/b/one.rs",
+            "#[cfg(test)]\n#[path = \"../a/x.rs\"]\nmod x;\n",
+        ),
+        src("src/c/two.rs", "#[path = \"./../a/x.rs\"]\nmod x;\n"),
+        // Gated only, naming src/a/y.rs.
+        src(
+            "src/b/three.rs",
+            "#[cfg(test)]\n#[path = \"../a/./y.rs\"]\nmod y;\n",
+        ),
+    ];
+    let set = test_only_files(&sources);
+    assert!(!set.contains(Path::new("src/a/x.rs")), "{set:?}");
+    assert!(set.contains(Path::new("src/a/y.rs")), "{set:?}");
+    assert_eq!(set.len(), 1, "{set:?}");
+}
+
+/// A leading byte-order mark is dropped before lexing, so a header after one
+/// marks the file test-only, as it does for `source_scan`.
+#[test]
+fn a_bom_before_the_header_is_stripped() {
+    let text = strip_bom("\u{feff}#![cfg(test)]\n\nfn t() {}\n".to_string());
+    assert!(text.starts_with("#![cfg(test)]"), "{text:?}");
+    assert!(is_test_only_file(&lex(&text).0));
+    // Without a BOM the text is unchanged, and a BOM mid-file is left alone.
+    assert_eq!(strip_bom("a\u{feff}b".to_string()), "a\u{feff}b");
 }
 
 /// A file reached only through gated declarations must carry the header: one
