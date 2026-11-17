@@ -38,8 +38,6 @@ pub struct VelocityImprovementConfig {
     pub model: Option<String>,
     #[serde(default = "default_fix_timeout")]
     pub fix_timeout_secs: u64,
-    #[serde(default)]
-    pub restart_backend: bool,
 }
 
 // ============================================================================
@@ -91,7 +89,6 @@ pub enum VelocityImprovementPhase {
     RunningTests,
     Analyzing,
     Fixing,
-    RestartingFrontend,
     WaitingFrontend,
     Complete,
     Stopped,
@@ -105,7 +102,6 @@ impl std::fmt::Display for VelocityImprovementPhase {
             Self::RunningTests => write!(f, "running_tests"),
             Self::Analyzing => write!(f, "analyzing"),
             Self::Fixing => write!(f, "fixing"),
-            Self::RestartingFrontend => write!(f, "restarting_frontend"),
             Self::WaitingFrontend => write!(f, "waiting_frontend"),
             Self::Complete => write!(f, "complete"),
             Self::Stopped => write!(f, "stopped"),
@@ -396,19 +392,7 @@ pub async fn run_velocity_improvement_loop(
         }
 
         // ------------------------------------------------------------------
-        // Phase 4: Restart frontend
-        // ------------------------------------------------------------------
-        set_phase(&state, VelocityImprovementPhase::RestartingFrontend).await;
-        log(&state, LogLevel::Info, "Restarting frontend...").await;
-
-        let restart_result = restart_frontend(&state, config.restart_backend).await;
-        if let Err(e) = restart_result {
-            warn!("Frontend restart failed: {}", e);
-            // Continue anyway — the frontend might still be running with old code
-        }
-
-        // ------------------------------------------------------------------
-        // Phase 5: Wait for frontend
+        // Phase 4: Wait for frontend
         // ------------------------------------------------------------------
         set_phase(&state, VelocityImprovementPhase::WaitingFrontend).await;
         log(
@@ -805,39 +789,8 @@ async fn spawn_fix_agent(
 }
 
 // ============================================================================
-// Frontend restart + health check
+// Frontend health check
 // ============================================================================
-
-async fn restart_frontend(state: &SharedState, restart_backend: bool) -> Result<(), String> {
-    let client = &state.http_client;
-    // This supervisor's own address: the port it bound (`--port`), on the
-    // IPv4 loopback its listener binds.
-    let supervisor = crate::loopback::loopback_base(state.config.port);
-
-    if restart_backend {
-        let _ = client
-            .post(format!("{supervisor}/dev-start/backend"))
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await;
-    }
-
-    let resp = client
-        .post(format!("{supervisor}/dev-start/frontend"))
-        .timeout(Duration::from_secs(180))
-        .send()
-        .await
-        .map_err(|e| format!("Frontend restart request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Frontend restart returned status {}",
-            resp.status()
-        ));
-    }
-
-    Ok(())
-}
 
 async fn wait_for_frontend(
     state: &SharedState,

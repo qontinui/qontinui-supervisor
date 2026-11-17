@@ -841,6 +841,7 @@ impl NormOrigin {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use std::collections::BTreeSet;
     use axum::http::HeaderValue;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -929,37 +930,37 @@ mod unit_tests {
         assert!(!ok("127.0.0.1.evil.example:9875"));
     }
 
-    /// Every route `build_router` registers (in `server.rs` and the routers it
-    /// merges) has a first segment in [`API_SEGMENTS`] or
-    /// [`SHARED_SPA_SEGMENTS`], so a new API prefix cannot silently become
-    /// reachable by a cross-site navigation. And no dashboard client route is
-    /// an API segment, so deep links keep working.
+    /// The router sources, as (module name as `crate::routes::<name>`,
+    /// source). One list, so the scan and the merge allowlist cannot drift.
+    const SCANNED_ROUTERS: &[(&str, &str)] = &[
+        ("server", include_str!("server.rs")),
+        ("velocity", include_str!("routes/velocity.rs")),
+        ("evaluation", include_str!("routes/evaluation.rs")),
+        ("velocity_tests", include_str!("routes/velocity_tests.rs")),
+        (
+            "velocity_improvement",
+            include_str!("routes/velocity_improvement.rs"),
+        ),
+        ("dev_endpoints", include_str!("routes/dev_endpoints.rs")),
+        ("dashboard", include_str!("routes/dashboard.rs")),
+    ];
+
+    /// Every literal route path `build_router` registers — `server.rs` and the
+    /// routers it merges, closed over `.merge(` — normalised by
+    /// [`normalise_path`].
     ///
-    /// The scan reads only the sources in [`SCANNED_ROUTERS`], so it also
-    /// checks — in every one of them, not just `server.rs` — that no route
-    /// reaches the router by a path it cannot read: a `.merge(` of anything
-    /// but another scanned module, a non-literal `.route(` path, or one of the
-    /// forbidden service/nest registrations.
-    #[test]
-    fn api_segments_cover_every_registered_route() {
-        /// The router sources, as (module name as `crate::routes::<name>`,
-        /// source). One list, so the scan and the merge allowlist cannot drift.
-        const SCANNED_ROUTERS: &[(&str, &str)] = &[
-            ("server", include_str!("server.rs")),
-            ("velocity", include_str!("routes/velocity.rs")),
-            ("evaluation", include_str!("routes/evaluation.rs")),
-            ("velocity_tests", include_str!("routes/velocity_tests.rs")),
-            (
-                "velocity_improvement",
-                include_str!("routes/velocity_improvement.rs"),
-            ),
-            ("dev_endpoints", include_str!("routes/dev_endpoints.rs")),
-            ("dashboard", include_str!("routes/dashboard.rs")),
-        ];
-        let sources: Vec<&str> = SCANNED_ROUTERS.iter().map(|(_, src)| *src).collect();
+    /// It also checks, in every scanned source and not just `server.rs`, that
+    /// no route reaches the router by a path this scan cannot read: a
+    /// `.merge(` of anything but another scanned module, a non-literal
+    /// `.route(` path, or one of the forbidden service/nest registrations. So
+    /// a caller can trust the set is the whole registered surface. Panics
+    /// (failing the calling test) when any of that does not hold, or when the
+    /// scan finds too few routes to be reading the real router.
+    fn registered_route_paths() -> BTreeSet<String> {
         let route = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
-        let mut seen = 0;
         let merge = regex::Regex::new(r"\.merge\(\s*crate::routes::(\w+)::").unwrap();
+        let mut paths = BTreeSet::new();
+        let mut seen = 0;
         for (name, src) in SCANNED_ROUTERS {
             // `.fallback(` is fine (dashboard.rs serves the SPA through one);
             // `.fallback_service(` is not, because a service fallback (a
@@ -1001,22 +1002,259 @@ mod unit_tests {
             );
             for cap in route.captures_iter(src) {
                 seen += 1;
-                let path = &cap[1];
-                if path == "/" {
-                    continue;
-                }
-                let first = path.trim_start_matches('/').split('/').next().unwrap();
-                assert!(
-                    API_SEGMENTS.contains(&first) || SHARED_SPA_SEGMENTS.contains(&first),
-                    "route {path}: add {first:?} to API_SEGMENTS (or SHARED_SPA_SEGMENTS if the dashboard has a client route under it)"
-                );
+                paths.insert(normalise_path(&cap[1]));
             }
         }
         assert!(seen > 100, "the scan found only {seen} routes");
         assert!(
-            sources[0].matches(".merge(").count() >= 6,
+            SCANNED_ROUTERS[0].1.matches(".merge(").count() >= 6,
             "server.rs no longer merges the stateless routers this scan expects"
         );
+        paths
+    }
+
+    /// `path` with every parameter segment (`{x}`, `:x`, or a URL segment
+    /// built from an interpolated `{x}`) written `{}`, and every wildcard
+    /// segment (`{*x}`, `*x`) written `*`.
+    fn normalise_path(path: &str) -> String {
+        path.split('/')
+            .map(|seg| {
+                if seg.starts_with("{*") || seg.starts_with('*') {
+                    "*"
+                } else if seg.starts_with(':') || (seg.contains('{') && seg.contains('}')) {
+                    "{}"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Whether the normalised self-call `call` would reach the normalised
+    /// registered route `route`: segment by segment, a route's `{}` takes any
+    /// one segment and its `*` takes the rest. A call's own `{}` (an
+    /// interpolated segment) is taken to match any one segment, since its
+    /// runtime value is unknown here.
+    fn route_matches(route: &str, call: &str) -> bool {
+        let route: Vec<&str> = route.split('/').collect();
+        let call: Vec<&str> = call.split('/').collect();
+        for (i, seg) in route.iter().enumerate() {
+            if *seg == "*" {
+                return call.len() > i;
+            }
+            match call.get(i) {
+                Some(c) if c == seg || *seg == "{}" || *c == "{}" => {}
+                _ => return false,
+            }
+        }
+        route.len() == call.len()
+    }
+
+    /// The path of every request this production source sends to the
+    /// supervisor's OWN API, normalised by [`normalise_path`].
+    ///
+    /// A self-call is recognised in two shapes, both built on
+    /// [`crate::loopback::loopback_base`] with this supervisor's own port
+    /// (`config.port`, `state.config.port`, `self.config.port`,
+    /// `supervisor_port`, `self.supervisor_port`) as its argument:
+    ///
+    /// - a local bound to that base, then a `"{local}/…"` string literal;
+    /// - `format!("{}/…", loopback_base(<own port>))`.
+    ///
+    /// Reach, so a green run is not over-read: a self-call spelled any other
+    /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
+    /// outside it. A query string or fragment is dropped from the path.
+    fn self_call_paths(production: &str) -> Vec<String> {
+        const OWN_PORT: &str = r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)";
+        const BASE: &str = r"(?:crate::)?(?:loopback::)?loopback_base\(\s*";
+        let binding =
+            regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}\s*\)")).unwrap();
+        let inline = regex::Regex::new(&format!(
+            r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}\s*\)"#
+        ))
+        .unwrap();
+        let mut raw: Vec<String> = inline
+            .captures_iter(production)
+            .map(|c| c[1].to_string())
+            .collect();
+        for local in binding.captures_iter(production) {
+            let used = regex::Regex::new(&format!(r#""\{{{}\}}(/[^"]*)""#, &local[1])).unwrap();
+            raw.extend(used.captures_iter(production).map(|c| c[1].to_string()));
+        }
+        raw.iter()
+            .map(|p| normalise_path(p.split(['?', '#']).next().unwrap_or_default()))
+            .collect()
+    }
+
+    /// Every `.rs` file under `src/`, as (path relative to the crate, text).
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let text = std::fs::read_to_string(&path).expect("source is readable");
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    out.push((rel, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// The self-calls in `sources` (as (name, production text)) whose path no
+    /// registered route answers, as `name: path` lines; and how many
+    /// self-calls were read in all.
+    fn unregistered_self_calls(
+        sources: &[(String, &str)],
+        routes: &BTreeSet<String>,
+    ) -> (Vec<String>, usize) {
+        let mut read = 0;
+        let mut dead = Vec::new();
+        for (name, production) in sources {
+            for call in self_call_paths(production) {
+                read += 1;
+                if !routes.iter().any(|r| route_matches(r, &call)) {
+                    dead.push(format!("{name}: {call}"));
+                }
+            }
+        }
+        (dead, read)
+    }
+
+    /// No production request the supervisor sends to its own API names a
+    /// route it does not register.
+    ///
+    /// Why: `velocity_improvement::restart_frontend` POSTed to
+    /// `/dev-start/frontend` for seven months after `c415c5f` deleted every
+    /// `/dev-start/*` route, and the dashboard showed "Restarting Frontend"
+    /// while nothing restarted (plan
+    /// `2026-11-17-supervisor-loopback-follow-ups-dead-dev-start-test-env-header-fragment-marker`).
+    /// Zero self-calls is the expected reading today; the fixture tests below
+    /// are what prove this can fail, and the count line keeps an empty read
+    /// visible. See [`self_call_paths`] for what the scan recognises.
+    #[test]
+    fn supervisor_self_calls_name_registered_routes() {
+        let routes = registered_route_paths();
+        let files = crate_sources();
+        let sources: Vec<(String, &str)> = files
+            .iter()
+            .map(|(name, text)| (name.clone(), crate::source_scan::production_span(text)))
+            .collect();
+        let (dead, read) = unregistered_self_calls(&sources, &routes);
+        println!("self-calls read: {read}, routes registered: {}", routes.len());
+        assert!(files.len() > 50, "read only {} sources under src/", files.len());
+        assert!(
+            dead.is_empty(),
+            "supervisor self-calls to routes it does not register:\n{}",
+            dead.join("\n")
+        );
+    }
+
+    /// The pre-deletion `restart_frontend` body, as it stood at `208b3f6`.
+    const OLD_RESTART_FRONTEND: &str = r#"
+async fn restart_frontend(state: &SharedState, restart_backend: bool) -> Result<(), String> {
+    let client = &state.http_client;
+    let supervisor = crate::loopback::loopback_base(state.config.port);
+
+    if restart_backend {
+        let _ = client
+            .post(format!("{supervisor}/dev-start/backend"))
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await;
+    }
+
+    let resp = client
+        .post(format!("{supervisor}/dev-start/frontend"))
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| format!("Frontend restart request failed: {}", e))?;
+    Ok(())
+}
+"#;
+
+    #[test]
+    fn self_call_guard_flags_the_old_dev_start_restart() {
+        let routes = registered_route_paths();
+        let (dead, read) = unregistered_self_calls(
+            &[("velocity_improvement.rs".to_string(), OLD_RESTART_FRONTEND)],
+            &routes,
+        );
+        assert_eq!(read, 2, "both /dev-start POSTs are self-calls");
+        for path in ["/dev-start/frontend", "/dev-start/backend"] {
+            assert!(
+                dead.contains(&format!("velocity_improvement.rs: {path}")),
+                "{path} not flagged: {dead:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_call_guard_passes_a_registered_route() {
+        let routes = registered_route_paths();
+        let bound = r#"
+fn probe(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{me}/health?verbose=1"));
+}
+"#;
+        let inline =
+            r#"let url = format!("{}/health", loopback::loopback_base(self.supervisor_port));"#;
+        let (dead, read) = unregistered_self_calls(
+            &[
+                ("bound.rs".to_string(), bound),
+                ("inline.rs".to_string(), inline),
+            ],
+            &routes,
+        );
+        assert_eq!(read, 2);
+        assert!(dead.is_empty(), "{dead:?}");
+        // A port that is not this supervisor's own is not a self-call.
+        let other_port =
+            r#"let url = format!("{}/dev-start/x", crate::loopback::loopback_base(port));"#;
+        let (_, other) =
+            unregistered_self_calls(&[("port.rs".to_string(), other_port)], &routes);
+        assert_eq!(other, 0);
+    }
+
+    #[test]
+    fn route_matching_reads_parameters_and_wildcards() {
+        assert!(route_matches("/eval/runs/{}", &normalise_path("/eval/runs/{id}")));
+        assert!(route_matches("/eval/runs/{}", "/eval/runs/abc"));
+        assert!(!route_matches("/eval/runs/{}", "/eval/runs"));
+        assert!(!route_matches("/eval/runs/{}", "/eval/runs/a/b"));
+        assert!(route_matches(&normalise_path("/assets/{*rest}"), "/assets/a/b"));
+        assert!(!route_matches("/health", "/healthz"));
+    }
+
+    /// Every route `build_router` registers (in `server.rs` and the routers it
+    /// merges) has a first segment in [`API_SEGMENTS`] or
+    /// [`SHARED_SPA_SEGMENTS`], so a new API prefix cannot silently become
+    /// reachable by a cross-site navigation. And no dashboard client route is
+    /// an API segment, so deep links keep working.
+    ///
+    /// The routes come from [`registered_route_paths`], which reads only the
+    /// sources in [`SCANNED_ROUTERS`] and so also checks that no route reaches
+    /// the router by a path it cannot read.
+    #[test]
+    fn api_segments_cover_every_registered_route() {
+        for path in registered_route_paths() {
+            if path == "/" {
+                continue;
+            }
+            let first = path.trim_start_matches('/').split('/').next().unwrap();
+            assert!(
+                API_SEGMENTS.contains(&first) || SHARED_SPA_SEGMENTS.contains(&first),
+                "route {path}: add {first:?} to API_SEGMENTS (or SHARED_SPA_SEGMENTS if the dashboard has a client route under it)"
+            );
+        }
 
         let app = include_str!("../frontend/src/App.tsx");
         let client = regex::Regex::new(r#"<Route\s+path="/([^/"]*)"#).unwrap();
