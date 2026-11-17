@@ -841,8 +841,8 @@ impl NormOrigin {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use std::collections::BTreeSet;
     use axum::http::HeaderValue;
+    use std::collections::BTreeSet;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1070,11 +1070,9 @@ mod unit_tests {
     /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
     /// outside it. See [`normalise_call_path`] for how a path is read.
     fn self_call_paths(production: &str) -> Vec<String> {
-        const OWN_PORT: &str =
-            r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)\s*,?\s*\)";
+        const OWN_PORT: &str = r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)\s*,?\s*\)";
         const BASE: &str = r"(?:crate::)?(?:loopback::)?loopback_base\(\s*";
-        let binding =
-            regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
+        let binding = regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
         let inline = regex::Regex::new(&format!(
             r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}"#
         ))
@@ -1085,8 +1083,14 @@ mod unit_tests {
             .collect();
         for local in binding.captures_iter(production) {
             let from = local.get(0).unwrap().end();
-            let scope = &production[from..enclosing_block_end(production, from)];
+            let mut scope = &production[from..enclosing_block_end(production, from)];
             let name = regex::escape(&local[1]);
+            // A later `let <name>` in the same block shadows this binding, so
+            // its scope ends there.
+            let rebind = regex::Regex::new(&format!(r"\blet\s+(?:mut\s+)?{name}\b")).unwrap();
+            if let Some(shadow) = rebind.find(scope) {
+                scope = &scope[..shadow.start()];
+            }
             let named = regex::Regex::new(&format!(r#""\{{{name}\}}(/[^"]*)""#)).unwrap();
             let positional = regex::Regex::new(&format!(
                 r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{name}\s*[,)]"#
@@ -1100,11 +1104,16 @@ mod unit_tests {
 
     /// A self-call's path as [`route_matches`] reads it. A query string or
     /// fragment is dropped. A `{…}` interpolation that FOLLOWS other
-    /// characters in a segment (`/x{query}`, `/runs{suffix}`) is a suffix of
-    /// that segment, not a segment of its own, so it is dropped too: read as
-    /// a parameter it would become `{}`, which matches any segment and would
-    /// let `/dev-start{q}` pass as `/health`. A segment that is wholly an
-    /// interpolation (`/{id}`) stays a parameter.
+    /// characters in a segment (`/x{query}`, `/runs{suffix}`) is dropped and
+    /// the path is read up to it: read as a parameter it would become `{}`,
+    /// which matches any segment and would let `/dev-start{q}` pass as
+    /// `/health`. A segment that is wholly an interpolation (`/{id}`) stays a
+    /// parameter.
+    ///
+    /// Reach limit: the value of a dropped interpolation is unknown here. It
+    /// is usually a query string or suffix, but it may carry further segments
+    /// (`{me}/runs{rest}` with `rest = "/a/b"`), and then the path checked is
+    /// only a prefix of the one sent.
     fn normalise_call_path(path: &str) -> String {
         let path = path.split(['?', '#']).next().unwrap_or_default();
         let segments: Vec<&str> = path
@@ -1121,7 +1130,13 @@ mod unit_tests {
     /// (the end of `text` when there is none). Braces inside string, raw
     /// string and char literals and inside comments are not counted, so a
     /// `"{base}/x"` format string does not move the count.
+    ///
+    /// Reach limits: a nested block comment (`/* a /* b */ c */`) ends at its
+    /// first `*/`, and a char literal holding a multi-byte character (`'é'`)
+    /// is not recognised as one. Neither holds a brace in this crate today;
+    /// either could shift the count if one did.
     fn enclosing_block_end(text: &str, from: usize) -> usize {
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
         let bytes = text.as_bytes();
         let mut depth = 0usize;
         let mut i = from;
@@ -1132,11 +1147,19 @@ mod unit_tests {
                     continue;
                 }
                 b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                    i = text[i + 2..].find("*/").map_or(bytes.len(), |n| i + 2 + n + 2);
+                    i = text[i + 2..]
+                        .find("*/")
+                        .map_or(bytes.len(), |n| i + 2 + n + 2);
                     continue;
                 }
+                // `r"…"`, `r#"…"#`, and the byte / C-string forms `br…`,
+                // `cr…`: the `r` starts a token, or follows a `b` / `c` that
+                // does.
                 b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#'))
-                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) =>
+                    && (i == 0
+                        || !is_ident(bytes[i - 1])
+                        || (matches!(bytes[i - 1], b'b' | b'c')
+                            && (i == 1 || !is_ident(bytes[i - 2])))) =>
                 {
                     let hashes = bytes[i + 1..].iter().take_while(|b| **b == b'#').count();
                     let open = i + 1 + hashes;
@@ -1238,8 +1261,15 @@ mod unit_tests {
             .map(|(name, text)| (name.clone(), crate::source_scan::production_span(text)))
             .collect();
         let (dead, read) = unregistered_self_calls(&sources, &routes);
-        println!("self-calls read: {read}, routes registered: {}", routes.len());
-        assert!(files.len() > 50, "read only {} sources under src/", files.len());
+        println!(
+            "self-calls read: {read}, routes registered: {}",
+            routes.len()
+        );
+        assert!(
+            files.len() > 50,
+            "read only {} sources under src/",
+            files.len()
+        );
         assert!(
             dead.is_empty(),
             "supervisor self-calls to routes it does not register:\n{}",
@@ -1310,32 +1340,60 @@ fn probe(state: &SharedState) {
         // A port that is not this supervisor's own is not a self-call.
         let other_port =
             r#"let url = format!("{}/dev-start/x", crate::loopback::loopback_base(port));"#;
-        let (_, other) =
-            unregistered_self_calls(&[("port.rs".to_string(), other_port)], &routes);
+        let (_, other) = unregistered_self_calls(&[("port.rs".to_string(), other_port)], &routes);
         assert_eq!(other, 0);
     }
 
     /// A1: a binding's `"{local}/…"` uses are read only in the rest of its own
     /// block. Here the own-port `base` comes FIRST, so a file-wide search
     /// would also read the later runner function's `"{base}/runner-only"`.
+    ///
+    /// Between the binding and its use sit brace-bearing literals, a comment
+    /// and a lifetime, each of which the block walk must skip. A closing brace
+    /// that is counted ends the scope before the use (read 0); an opening
+    /// brace that is counted carries the scope into `runner` (read 2). The
+    /// closing literals come FIRST, so a walk that skipped no string at all
+    /// would still see an unmatched `}` rather than a `"}"` / `"{"` pair that
+    /// cancels out.
     #[test]
     fn self_call_guard_reads_a_binding_only_in_its_own_block() {
         let routes = registered_route_paths();
-        let src = r#"
+        let src = r##"
 fn own(state: &SharedState) {
     let base = crate::loopback::loopback_base(state.config.port);
+    let close = ('}', "}");
+    let open = ('{', "{", r#"{"#, br#"{"#); // {
+    fn f<'a>(s: &'a str) -> &'a str {
+        s
+    }
     let _ = client.get(format!("{base}/health"));
-    let brace = '}';
-    let quoted = "}";
 }
 
 fn runner(port: u16) {
     let base = crate::loopback::runner_loopback_base(port);
     let _ = client.get(format!("{base}/runner-only"));
 }
-"#;
+"##;
         let (dead, read) = unregistered_self_calls(&[("two_fns.rs".to_string(), src)], &routes);
         assert_eq!(read, 1, "only the own-port fn's /health is a self-call");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A later `let <name>` in the same block shadows the own-port binding, so
+    /// a use after it is not read as a self-call.
+    #[test]
+    fn self_call_guard_stops_at_a_shadowing_rebind() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, port: u16) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{base}/health"));
+    let base = crate::loopback::runner_loopback_base(port);
+    let _ = client.get(format!("{base}/runner-only"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("shadow.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "only the use before the rebind is a self-call");
         assert!(dead.is_empty(), "{dead:?}");
     }
 
@@ -1369,6 +1427,18 @@ fn f(state: &SharedState) {
 }
 "#;
         assert_eq!(read_one(split), ["f.rs: /dev-start/frontend"]);
+        // The inline form, rustfmt-split.
+        let split_inline = r#"
+fn f(state: &SharedState) {
+    let _ = client.post(format!(
+        "{}/dev-start/frontend",
+        crate::loopback::loopback_base(
+            state.config.port,
+        )
+    ));
+}
+"#;
+        assert_eq!(read_one(split_inline), ["f.rs: /dev-start/frontend"]);
         // An interpolated suffix is not a wildcard segment.
         let suffix = r#"
 fn f(state: &SharedState) {
@@ -1382,11 +1452,17 @@ fn f(state: &SharedState) {
 
     #[test]
     fn route_matching_reads_parameters_and_wildcards() {
-        assert!(route_matches("/eval/runs/{}", &normalise_path("/eval/runs/{id}")));
+        assert!(route_matches(
+            "/eval/runs/{}",
+            &normalise_path("/eval/runs/{id}")
+        ));
         assert!(route_matches("/eval/runs/{}", "/eval/runs/abc"));
         assert!(!route_matches("/eval/runs/{}", "/eval/runs"));
         assert!(!route_matches("/eval/runs/{}", "/eval/runs/a/b"));
-        assert!(route_matches(&normalise_path("/assets/{*rest}"), "/assets/a/b"));
+        assert!(route_matches(
+            &normalise_path("/assets/{*rest}"),
+            "/assets/a/b"
+        ));
         assert!(!route_matches("/health", "/healthz"));
     }
 
