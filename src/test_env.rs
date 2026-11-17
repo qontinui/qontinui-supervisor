@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test-only: serializes the tests that set or read the pre-permit build
 //! guards' env floors.
 //!

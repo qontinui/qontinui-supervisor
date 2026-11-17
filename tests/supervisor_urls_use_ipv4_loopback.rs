@@ -52,8 +52,9 @@
 //!   field names, so they start an item only when a name follows (`union U`)
 //!   or a `!` does (`macro_rules! m`). A gated `union: 1,` is a field.
 //! - A whole file is skipped when it opens with `#![cfg(test)]`, or when EVERY
-//!   `mod name;` declaration that resolves to it is gated that way. The rule is
-//!   "every" because this crate has two roots. `main.rs` gates
+//!   `mod name;` declaration that resolves to it is gated that way, and the
+//!   second case FAILS the test unless the file also carries the header. The
+//!   rule is "every" because this crate has two roots. `main.rs` gates
 //!   `mod test_clock;` while `lib.rs` declares `pub mod test_clock;`, so that
 //!   file is compiled into production and stays in scope.
 //!
@@ -71,15 +72,18 @@
 //!   comments and test modules follow, so a gated helper above the cut reads
 //!   as production and everything below it as test. This test bounds each gated item, field, variant or arm on its own
 //!   and scans everything outside them, below a test module included.
-//! - **Test-only files.** `source_scan::is_test_only_file` keys on the file's
-//!   own `#![cfg(test)]` header, and so does this test. This test also skips a
-//!   file whose every `mod name;` declaration is gated, as the plan's Phase 2
-//!   step 4 prescribes and qontinui-runner's guard does. On 2026-11-15
-//!   `source_scan.rs`, `test_ports.rs` and `dev_action/test_support.rs` gained
-//!   the header they lacked, so the two rules agree on them. The second rule
-//!   decides only a test-only file with no header: this test skips it, and
-//!   `source_scan` reads it as production. qontinui-claude-config's
-//!   `scripts/file-size-census.py` lists such files as `missing-header`.
+//! - **Test-only files.** The file's own `#![cfg(test)]` header is the one
+//!   rule both classifiers decide on: `source_scan::is_test_only_file` keys on
+//!   it, and so does this test. This test also derives the files whose every
+//!   `mod name;` declaration is gated, as qontinui-runner's guard does, but
+//!   only to hold them to that rule: such a file without the header is a
+//!   failure here ([`headerless_test_only_files`]), naming the file and the fix,
+//!   because `source_scan` would read it as production while this test skipped
+//!   it. It is still skipped for the localhost scan. `src/test_env.rs` was the
+//!   last such file and gained its header on 2026-11-17; `source_scan.rs`,
+//!   `test_ports.rs` and `dev_action/test_support.rs` gained theirs on
+//!   2026-11-15. qontinui-claude-config's `scripts/file-size-census.py` lists
+//!   such files as `missing-header`.
 //! - **A byte-order mark.** `source_scan` strips a leading one. This test does
 //!   not, so a `#![cfg(test)]` after a BOM marks nothing and the file stays in
 //!   scope, the conservative direction for this guard.
@@ -723,6 +727,24 @@ fn test_only_files(sources: &[(PathBuf, String)]) -> HashSet<PathBuf> {
     gated.difference(&ungated).cloned().collect()
 }
 
+/// Each of `declared` (the files [`test_only_files`] derived) that is in
+/// `sources` and does NOT open with `#![cfg(test)]`, in `sources` order.
+///
+/// Such a file is test-only only by its declarations, so this test would skip
+/// it while `source_scan::is_test_only_file`, which reads the header alone,
+/// would read it as production. Returning it lets the caller fail on it, so
+/// the header stays the one rule both classifiers decide on.
+fn headerless_test_only_files(
+    sources: &[(PathBuf, String)],
+    declared: &HashSet<PathBuf>,
+) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .filter(|(path, text)| declared.contains(path) && !is_test_only_file(&lex(text).0))
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// One flagged line.
 struct Hit {
     rel: String,
@@ -833,8 +855,10 @@ fn no_supervisor_url_spells_localhost() {
         })
         .collect();
     let declared_test_only = test_only_files(&sources);
+    let headerless = headerless_test_only_files(&sources, &declared_test_only);
 
     let mut hits = Vec::new();
+    let mut header_failures = Vec::new();
     let (mut files_scanned, mut lines_scanned, mut skipped_test) = (0usize, 0usize, 0usize);
     for (path, text) in &sources {
         let rel = path
@@ -842,6 +866,13 @@ fn no_supervisor_url_spells_localhost() {
             .map(|r| r.to_string_lossy().replace('\\', "/"))
             .unwrap_or_else(|_| path.display().to_string());
         if declared_test_only.contains(path) {
+            if headerless.contains(path) {
+                header_failures.push(format!(
+                    "  {rel}: reached only through `#[cfg(test)] mod` declarations, but has no \
+                     `#![cfg(test)]` header, so `source_scan` reads it as production. Fix: add \
+                     `#![cfg(test)]` as its first item."
+                ));
+            }
             skipped_test += 1;
             continue;
         }
@@ -862,6 +893,14 @@ fn no_supervisor_url_spells_localhost() {
         files_scanned >= MIN_FILES_SCANNED,
         "scanned only {files_scanned} production files under src/ (floor {MIN_FILES_SCANNED}): \
          the directory moved or the walk broke, so a green run here would prove nothing"
+    );
+
+    assert!(
+        header_failures.is_empty(),
+        "{} test-only file(s) lack the `#![cfg(test)]` header, the one rule this test and \
+         `src/source_scan.rs` both decide on:\n{}",
+        header_failures.len(),
+        header_failures.join("\n")
     );
 
     if !hits.is_empty() {
@@ -1130,4 +1169,40 @@ fn test_only_files_come_from_cfg_test_declarations() {
     ] {
         assert!(!set.contains(Path::new(p)), "{p} is production: {set:?}");
     }
+}
+
+/// A file reached only through gated declarations must carry the header: one
+/// without it is returned, so the guard fails on it, and its header-bearing
+/// twin is not.
+#[test]
+fn a_gated_only_file_without_the_header_is_returned() {
+    let src = |p: &str, t: &str| (PathBuf::from(p), t.to_string());
+    let sources = vec![
+        src(
+            "src/lib.rs",
+            "#[cfg(test)]\nmod headerless;\n#[cfg(test)]\nmod headed;\npub mod prod;\n",
+        ),
+        src(
+            "src/headerless.rs",
+            "//! Test-only, but says so only in prose.\n\nuse crate::prod::X;\n",
+        ),
+        src(
+            "src/headed.rs",
+            "#![cfg(test)]\n\n//! Test-only.\n\nuse crate::prod::X;\n",
+        ),
+        src("src/prod.rs", "pub struct X;\n"),
+    ];
+    let declared = test_only_files(&sources);
+    assert!(
+        declared.contains(Path::new("src/headerless.rs")),
+        "{declared:?}"
+    );
+    assert!(
+        declared.contains(Path::new("src/headed.rs")),
+        "{declared:?}"
+    );
+    assert_eq!(
+        headerless_test_only_files(&sources, &declared),
+        vec![PathBuf::from("src/headerless.rs")]
+    );
 }

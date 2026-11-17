@@ -485,6 +485,13 @@ mod tests {
         assert!(is_test_only_file("/* a */ /* b */ #![cfg(test)]\n"));
     }
 
+    /// `test_env.rs` is declared only behind `#[cfg(test)]`, so its header
+    /// is what keeps every in-crate source scan from reading it as production.
+    #[test]
+    fn test_env_has_no_production_span() {
+        assert_eq!(production_span(include_str!("test_env.rs")), "");
+    }
+
     #[test]
     fn a_production_file_is_not_test_only() {
         // An ordinary file, and one with an in-file test module: that is the
