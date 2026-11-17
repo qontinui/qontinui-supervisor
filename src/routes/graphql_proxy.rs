@@ -41,7 +41,10 @@ pub async fn graphql_proxy(State(state): State<SharedState>, req: Request) -> Re
     }
     drop(cached);
 
-    let target_url = format!("http://127.0.0.1:{}/graphql", state.runner_api_port);
+    let target_url = format!(
+        "{}/graphql",
+        crate::loopback::runner_loopback_base(state.runner_api_port)
+    );
     debug!("GraphQL proxy: POST /graphql -> {}", target_url);
 
     let client = &state.http_client;

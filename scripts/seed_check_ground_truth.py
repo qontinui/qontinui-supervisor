@@ -9,7 +9,7 @@ import os
 import urllib.request
 from pathlib import Path
 
-BASE = "http://localhost:9875"
+BASE = "http://127.0.0.1:9875"
 
 
 def api_post(path, data):

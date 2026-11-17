@@ -6396,7 +6396,7 @@ async fn request_drain(state: &SharedState, port: u16, runner_name: &str) {
     // a normal turn-flush + stash, but it never blocks the restart: on timeout
     // we proceed straight to the close-request + kill below.
     const DRAIN_REQUEST_TIMEOUT_SECS: u64 = 30;
-    let url = format!("http://127.0.0.1:{}/drain", port);
+    let url = format!("{}/drain", crate::loopback::runner_loopback_base(port));
     let result = state
         .http_client
         .post(&url)
@@ -6549,7 +6549,7 @@ async fn request_graceful_stop(
 ) {
     let result = post_close_request(
         &state.http_client,
-        &format!("http://127.0.0.1:{}", port),
+        &crate::loopback::runner_loopback_base(port),
         intent,
     )
     .await;
@@ -8345,7 +8345,7 @@ async fn rebuild_and_restart_latched(
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
         let port = managed.config.port;
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", crate::loopback::runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()

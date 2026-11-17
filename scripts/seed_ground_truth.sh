@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Insert 15 curated test prompts with ground truth workflows
-BASE="http://localhost:9875"
+BASE="http://127.0.0.1:9875"
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%S+00:00")
 COUNT=0
 FAIL=0

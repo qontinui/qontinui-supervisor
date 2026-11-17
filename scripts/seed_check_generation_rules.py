@@ -10,7 +10,7 @@ Usage: python3 scripts/seed_check_generation_rules.py
 import json
 import urllib.request
 
-BASE = "http://localhost:9876"
+BASE = "http://127.0.0.1:9876"
 
 
 def api_get(path):

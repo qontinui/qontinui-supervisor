@@ -642,10 +642,11 @@ pub struct SupervisorState {
     pub cached_runner_health: RwLock<Vec<CachedRunnerHealth>>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
-    /// Port the legacy `/ui-bridge/*`, `/runner-api/*` and `/graphql` proxies
-    /// forward to.
+    /// Port of the primary runner: the legacy `/ui-bridge/*`, `/runner-api/*`
+    /// and `/graphql` proxies forward to it, and the temp-runner spawn asks it
+    /// for a placement (`process::env_forwarders`).
     /// Always [`crate::config::RUNNER_API_PORT`] in production; a field only so
-    /// a test can point those proxies at a stub runner on an ephemeral port.
+    /// a test can point those callers at a stub runner on an ephemeral port.
     pub runner_api_port: u16,
     /// Runtime-configurable auto-login credentials for temp test runners.
     /// Set via `POST /test-login` and read by `forward_test_auto_login_env`.
@@ -1940,6 +1941,7 @@ impl SupervisorState {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
         let expo_port = config.expo_port;
+        let supervisor_port = config.port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
         // Capacity 8 with `broadcast` semantics: lagging receivers see Lagged,
@@ -2035,7 +2037,7 @@ impl SupervisorState {
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
-            command_relay: CommandRelay::new(),
+            command_relay: CommandRelay::new(supervisor_port),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,

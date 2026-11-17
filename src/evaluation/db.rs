@@ -5,6 +5,18 @@ use std::sync::Mutex;
 
 use super::{EvalResult, EvalRunSummary, TestPrompt};
 
+/// Default prompts reworded after they were first seeded: `(id, the exact text
+/// it was seeded with before)`. `seed_defaults` inserts only into an empty
+/// table, so without this an existing DB would keep the old text under the id a
+/// fresh DB seeds with the new text, and that prompt's scores would not compare
+/// across installs. A row is rewritten only while it still holds the old text
+/// exactly: a prompt someone edited is theirs.
+const REWORDED_DEFAULT_PROMPTS: &[(&str, &str)] = &[(
+    "check-http-status",
+    // runner-localhost-ok: the retired text matched below to replace it; nothing dials it
+    "Verify that the frontend at localhost:3001, backend at localhost:8000, and runner at localhost:9876 all return HTTP 200 on their health endpoints",
+)];
+
 pub struct EvalDb {
     conn: Mutex<Connection>,
     #[allow(dead_code)]
@@ -170,15 +182,30 @@ impl EvalDb {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("eval DB mutex poisoned: {e}"))?;
+        let now = Utc::now().to_rfc3339();
+        // (id, prompt, category, complexity)
+        let seeds: &[(&str, &str, &str, &str)] = &Self::default_test_prompts();
+
+        // A reworded default reaches an existing DB too, which the insert
+        // below never touches. Only a row still holding the old text changes.
+        for (id, old) in REWORDED_DEFAULT_PROMPTS {
+            let Some((_, new, _, _)) = seeds.iter().find(|(seed_id, ..)| seed_id == id) else {
+                continue;
+            };
+            let reworded = conn.execute(
+                "UPDATE test_prompts SET prompt = ?1, updated_at = ?2 WHERE id = ?3 AND prompt = ?4",
+                params![new, now, id, old],
+            )?;
+            if reworded > 0 {
+                tracing::info!(prompt_id = %id, "Migrated eval DB: reworded default test prompt");
+            }
+        }
+
         let count: i64 =
             conn.query_row("SELECT COUNT(*) FROM test_prompts", [], |row| row.get(0))?;
         if count > 0 {
             return Ok(());
         }
-
-        let now = Utc::now().to_rfc3339();
-        // (id, prompt, category, complexity)
-        let seeds: &[(&str, &str, &str, &str)] = &Self::default_test_prompts();
 
         let mut stmt = conn.prepare(
             "INSERT INTO test_prompts (id, prompt, category, complexity, enabled, created_at, updated_at)
@@ -221,7 +248,7 @@ impl EvalDb {
             ("check-format-python", "Check Python code formatting with black in the backend directory without making changes, report any files that would be reformatted", "code_quality", "simple"),
             ("check-security-scan", "Run a security scan on the backend Python code to detect common vulnerabilities like SQL injection or hardcoded secrets", "security", "medium"),
             ("check-ts-analyze", "Run static analysis on the TypeScript frontend code to detect unused variables, unreachable code, and potential null pointer issues", "code_quality", "medium"),
-            ("check-http-status", "Verify that the frontend at localhost:3001, backend at localhost:8000, and runner at localhost:9876 all return HTTP 200 on their health endpoints", "monitoring", "medium"),
+            ("check-http-status", "Verify that the frontend at localhost:3001, backend at localhost:8000, and runner at 127.0.0.1:9876 all return HTTP 200 on their health endpoints", "monitoring", "medium"),
             ("check-ai-review", "Run an AI code review on the most recently changed files in the backend to identify code quality issues and suggest improvements", "code_quality", "complex"),
             ("check-ci-pipeline", "Run the full CI/CD check pipeline including lint, format, typecheck, and tests for the backend project", "devops", "complex"),
 
@@ -704,5 +731,78 @@ impl EvalDb {
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EvalDb, REWORDED_DEFAULT_PROMPTS};
+    use rusqlite::params;
+
+    /// The text a fresh DB is seeded with under `id`.
+    fn seeded(id: &str) -> &'static str {
+        EvalDb::default_test_prompts()
+            .into_iter()
+            .find(|(seed_id, ..)| *seed_id == id)
+            .map(|(_, prompt, ..)| prompt)
+            .unwrap_or_else(|| panic!("{id} is reworded but is not a seeded default"))
+    }
+
+    fn prompt_of(db: &EvalDb, id: &str) -> String {
+        db.conn()
+            .query_row(
+                "SELECT prompt FROM test_prompts WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|e| panic!("read the prompt of {id}: {e}"))
+    }
+
+    fn set_prompt(db: &EvalDb, id: &str, prompt: &str) {
+        let changed = db
+            .conn()
+            .execute(
+                "UPDATE test_prompts SET prompt = ?1 WHERE id = ?2",
+                params![prompt, id],
+            )
+            .unwrap_or_else(|e| panic!("set the prompt of {id}: {e}"));
+        assert_eq!(changed, 1, "{id} has no row to set");
+    }
+
+    /// An existing DB still holding a reworded default's old text gets the new
+    /// text when it is next opened, and a prompt someone edited is left alone.
+    #[test]
+    fn a_reworded_default_reaches_an_existing_db_but_not_an_edited_prompt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // A fresh DB is seeded with the new text. Putting the old text back
+        // makes it a DB seeded before the rewording.
+        let db = EvalDb::new(dir.path()).expect("open a fresh eval DB");
+        for (id, old) in REWORDED_DEFAULT_PROMPTS {
+            assert_eq!(prompt_of(&db, id), seeded(id), "{id}: a fresh DB");
+            assert_ne!(*old, seeded(id), "{id}: the old text is the new text");
+            set_prompt(&db, id, old);
+        }
+        drop(db);
+
+        let db = EvalDb::new(dir.path()).expect("reopen the eval DB");
+        for (id, _) in REWORDED_DEFAULT_PROMPTS {
+            assert_eq!(
+                prompt_of(&db, id),
+                seeded(id),
+                "{id}: the old text was not rewritten"
+            );
+            set_prompt(&db, id, "a prompt someone edited");
+        }
+        drop(db);
+
+        let db = EvalDb::new(dir.path()).expect("reopen the eval DB");
+        for (id, _) in REWORDED_DEFAULT_PROMPTS {
+            assert_eq!(
+                prompt_of(&db, id),
+                "a prompt someone edited",
+                "{id}: an edited prompt was overwritten"
+            );
+        }
     }
 }

@@ -340,9 +340,8 @@ impl DeviceSources {
         Self {
             machine: load_machine_file,
             read_seeded: true,
-            mint_base: Some(format!(
-                "http://127.0.0.1:{}",
-                crate::config::RUNNER_API_PORT
+            mint_base: Some(crate::loopback::runner_loopback_base(
+                crate::config::RUNNER_API_PORT,
             )),
         }
     }

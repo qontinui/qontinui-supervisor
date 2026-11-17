@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Shared classification for the crate's SOURCE-SCANNING tests: the guards
 //! that read `src/**/*.rs` as text and police only its production code.
 //!

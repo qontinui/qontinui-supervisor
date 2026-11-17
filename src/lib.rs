@@ -31,6 +31,10 @@ pub mod fs_atomic;
 pub mod git_provenance;
 pub mod health_cache;
 pub mod log_capture;
+/// The one loopback address the supervisor binds and dials, and the URL
+/// builders for itself and for runners
+/// (plan `2026-11-11-supervisor-and-temp-runner-probes-still-dial-localhost`).
+pub mod loopback;
 pub mod origin_guard;
 pub mod otel;
 pub mod pii_scrub;

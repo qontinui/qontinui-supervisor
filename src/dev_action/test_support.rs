@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test-only: a stand-in for coord's two dev-action routes, so a test can plant
 //! the expectations a mint reads and see what the client sent. A config reaches
 //! it through [`crate::config::AmbientCoord::At`].

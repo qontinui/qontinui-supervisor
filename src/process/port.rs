@@ -81,7 +81,7 @@ pub fn is_port_listening(port: u16) -> bool {
 
 /// Check if an HTTP health endpoint is responding at the given port and path.
 pub async fn check_http_health(port: u16, path: &str) -> bool {
-    let url = format!("http://127.0.0.1:{}{}", port, path);
+    let url = format!("{}{}", crate::loopback::loopback_base(port), path);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build();

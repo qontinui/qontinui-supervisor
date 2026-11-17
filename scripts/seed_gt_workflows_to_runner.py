@@ -12,7 +12,7 @@ import os
 import urllib.request
 from pathlib import Path
 
-RUNNER = "http://localhost:9876"
+RUNNER = "http://127.0.0.1:9876"
 
 # Derived from $QONTINUI_ROOT, else from this script's own location
 # (<workspace-root>/qontinui-supervisor/scripts/) — never a literal user
@@ -326,24 +326,24 @@ add_gt(
     tags=["ground_truth", "ui_bridge", "command", "web", "reference"],
     setup=[
         make_command("setup-sdk-connect", "Connect UI Bridge SDK", "setup",
-                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/connect '
+                     'curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/connect '
                      '-H "Content-Type: application/json" '
                      '-d "{\\"url\\": \\"http://localhost:3001\\"}"',
                      fail_on_error=True),
         make_command("setup-navigate", "Navigate to workflows page", "setup",
-                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate '
+                     'curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/page/navigate '
                      '-H "Content-Type: application/json" '
                      '-d "{\\"url\\": \\"http://localhost:3001/build/workflows\\"}"'),
     ],
     checks=[
         make_command("verify-navigate", "Navigate to target page", "verification",
-                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/page/navigate '
+                     'curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/page/navigate '
                      '-H "Content-Type: application/json" '
                      '-d "{\\"url\\": \\"http://localhost:3001/build/workflows\\"}"',
                      fail_on_error=True,
                      retry={"count": 3, "delay_ms": 3000}),
         make_command("verify-snapshot", "Verify page elements loaded", "verification",
-                     'curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep "elements"',
+                     'curl -sf http://127.0.0.1:9876/ui-bridge/sdk/snapshot | grep "elements"',
                      fail_on_error=True,
                      retry={"count": 3, "delay_ms": 3000}),
         make_check("verify-eslint", "TypeScript lint (ESLint)", "lint", "eslint",
@@ -391,7 +391,7 @@ add_gt(
     tags=["ground_truth", "command", "ui_bridge", "prompt", "multi-phase", "reference"],
     setup=[
         make_command("setup-sdk-connect", "Connect UI Bridge SDK", "setup",
-                     'curl -sf -X POST http://localhost:9876/ui-bridge/sdk/connect '
+                     'curl -sf -X POST http://127.0.0.1:9876/ui-bridge/sdk/connect '
                      '-H "Content-Type: application/json" '
                      '-d "{\\"url\\": \\"http://localhost:3001\\"}"',
                      fail_on_error=True),
@@ -408,7 +408,7 @@ add_gt(
         make_check("verify-prettier", "Prettier format check", "format", "prettier",
                     "npx prettier --check .", f"{WS}\\qontinui-web\\frontend"),
         make_command("verify-ui-elements", "Verify UI renders correctly", "verification",
-                     'curl -sf http://localhost:9876/ui-bridge/sdk/snapshot | grep "elements"',
+                     'curl -sf http://127.0.0.1:9876/ui-bridge/sdk/snapshot | grep "elements"',
                      fail_on_error=True,
                      retry={"count": 3, "delay_ms": 3000}),
         make_prompt("verify-ai-review", "AI review of implementation", "verification",
@@ -470,10 +470,10 @@ add_gt(
                      "curl -sf http://localhost:3001",
                      fail_on_error=True),
         make_command("verify-runner", "Check runner API health", "verification",
-                     "curl -sf http://localhost:9876/health",
+                     "curl -sf http://127.0.0.1:9876/health",
                      fail_on_error=True),
         make_command("verify-supervisor", "Check supervisor health", "verification",
-                     "curl -sf http://localhost:9875/health",
+                     "curl -sf http://127.0.0.1:9875/health",
                      fail_on_error=True),
     ],
     agentic=[make_agentic(

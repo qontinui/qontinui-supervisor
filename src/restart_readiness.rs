@@ -320,7 +320,7 @@ fn excerpt(s: &str) -> String {
 ///
 /// IPv4 loopback only — see the module docs for the measurement.
 pub async fn probe(port: u16) -> Readiness {
-    probe_at(&format!("http://127.0.0.1:{}", port)).await
+    probe_at(&crate::loopback::runner_loopback_base(port)).await
 }
 
 /// [`probe`] against an explicit base URL. Split out so the tests can drive a
@@ -766,7 +766,9 @@ fn refusal_message(
                 .drain
                 .as_ref()
                 .and_then(|d| d.call.clone())
-                .unwrap_or_else(|| format!("POST http://127.0.0.1:{}/drain", port));
+                .unwrap_or_else(|| {
+                    format!("POST {}/drain", crate::loopback::runner_loopback_base(port))
+                });
             msg.push_str(&format!(
                 " {ai} AI/task-run session(s) are also live; those a drain DOES cover — `{call}` \
                  would capture{} their work to refs/wip/<agent_session_id>. Note a drain is \
@@ -980,7 +982,11 @@ pub fn decide(
     intent: CloseIntent,
     readiness: &Readiness,
 ) -> GateDecision {
-    let url = format!("http://127.0.0.1:{}{}", port, READINESS_PATH);
+    let url = format!(
+        "{}{}",
+        crate::loopback::runner_loopback_base(port),
+        READINESS_PATH
+    );
 
     let refusal = match readiness {
         // Under a handoff a zero census is not enough: the runner's door is
