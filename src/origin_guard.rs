@@ -1054,24 +1054,29 @@ mod unit_tests {
     /// The path of every request this production source sends to the
     /// supervisor's OWN API, normalised by [`normalise_path`].
     ///
-    /// A self-call is recognised in two shapes, both built on
+    /// A self-call is recognised in these shapes, all built on
     /// [`crate::loopback::loopback_base`] with this supervisor's own port
     /// (`config.port`, `state.config.port`, `self.config.port`,
-    /// `supervisor_port`, `self.supervisor_port`) as its argument:
+    /// `supervisor_port`, `self.supervisor_port`) as its argument, a
+    /// rustfmt-split `loopback_base(\n    port,\n)` included:
     ///
-    /// - a local bound to that base, then a `"{local}/…"` string literal;
-    /// - `format!("{}/…", loopback_base(<own port>))`.
+    /// - `format!("{}/…", loopback_base(<own port>))`;
+    /// - a local bound to that base, then either a `"{local}/…"` string
+    ///   literal or a positional `format!("{}/…", local)`. Only the rest of
+    ///   the block the binding sits in is read, so a same-named local bound
+    ///   to another base elsewhere in the file is not taken for this one.
     ///
     /// Reach, so a green run is not over-read: a self-call spelled any other
     /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
-    /// outside it. A query string or fragment is dropped from the path.
+    /// outside it. See [`normalise_call_path`] for how a path is read.
     fn self_call_paths(production: &str) -> Vec<String> {
-        const OWN_PORT: &str = r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)";
+        const OWN_PORT: &str =
+            r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)\s*,?\s*\)";
         const BASE: &str = r"(?:crate::)?(?:loopback::)?loopback_base\(\s*";
         let binding =
-            regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}\s*\)")).unwrap();
+            regex::Regex::new(&format!(r"let\s+(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
         let inline = regex::Regex::new(&format!(
-            r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}\s*\)"#
+            r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}"#
         ))
         .unwrap();
         let mut raw: Vec<String> = inline
@@ -1079,12 +1084,93 @@ mod unit_tests {
             .map(|c| c[1].to_string())
             .collect();
         for local in binding.captures_iter(production) {
-            let used = regex::Regex::new(&format!(r#""\{{{}\}}(/[^"]*)""#, &local[1])).unwrap();
-            raw.extend(used.captures_iter(production).map(|c| c[1].to_string()));
+            let from = local.get(0).unwrap().end();
+            let scope = &production[from..enclosing_block_end(production, from)];
+            let name = regex::escape(&local[1]);
+            let named = regex::Regex::new(&format!(r#""\{{{name}\}}(/[^"]*)""#)).unwrap();
+            let positional = regex::Regex::new(&format!(
+                r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{name}\s*[,)]"#
+            ))
+            .unwrap();
+            raw.extend(named.captures_iter(scope).map(|c| c[1].to_string()));
+            raw.extend(positional.captures_iter(scope).map(|c| c[1].to_string()));
         }
-        raw.iter()
-            .map(|p| normalise_path(p.split(['?', '#']).next().unwrap_or_default()))
-            .collect()
+        raw.iter().map(|p| normalise_call_path(p)).collect()
+    }
+
+    /// A self-call's path as [`route_matches`] reads it. A query string or
+    /// fragment is dropped. A `{…}` interpolation that FOLLOWS other
+    /// characters in a segment (`/x{query}`, `/runs{suffix}`) is a suffix of
+    /// that segment, not a segment of its own, so it is dropped too: read as
+    /// a parameter it would become `{}`, which matches any segment and would
+    /// let `/dev-start{q}` pass as `/health`. A segment that is wholly an
+    /// interpolation (`/{id}`) stays a parameter.
+    fn normalise_call_path(path: &str) -> String {
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        let segments: Vec<&str> = path
+            .split('/')
+            .map(|seg| match seg.find('{') {
+                Some(at) if at > 0 => &seg[..at],
+                _ => seg,
+            })
+            .collect();
+        normalise_path(&segments.join("/"))
+    }
+
+    /// The byte offset of the `}` that closes the block containing `from`
+    /// (the end of `text` when there is none). Braces inside string, raw
+    /// string and char literals and inside comments are not counted, so a
+    /// `"{base}/x"` format string does not move the count.
+    fn enclosing_block_end(text: &str, from: usize) -> usize {
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut i = from;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                    continue;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i = text[i + 2..].find("*/").map_or(bytes.len(), |n| i + 2 + n + 2);
+                    continue;
+                }
+                b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#'))
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_')) =>
+                {
+                    let hashes = bytes[i + 1..].iter().take_while(|b| **b == b'#').count();
+                    let open = i + 1 + hashes;
+                    if bytes.get(open) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        i = text[open + 1..]
+                            .find(&close)
+                            .map_or(bytes.len(), |n| open + 1 + n + close.len());
+                        continue;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'\'' if bytes.get(i + 1) == Some(&b'\\') => {
+                    // `'\''`, `'\n'`, `'\u{7f}'`: the closing quote is at or
+                    // after the char following the backslash.
+                    i = text
+                        .get(i + 3..)
+                        .and_then(|t| t.find('\''))
+                        .map_or(bytes.len(), |n| i + 3 + n);
+                }
+                b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+                b'{' => depth += 1,
+                b'}' if depth == 0 => return i,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
     }
 
     /// Every `.rs` file under `src/`, as (path relative to the crate, text).
@@ -1098,7 +1184,9 @@ mod unit_tests {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                    let text = std::fs::read_to_string(&path).expect("source is readable");
+                    let text = std::fs::read_to_string(&path)
+                        .expect("source is readable")
+                        .replace("\r\n", "\n");
                     let rel = path.strip_prefix(root).unwrap().display().to_string();
                     out.push((rel, text));
                 }
@@ -1135,9 +1223,12 @@ mod unit_tests {
     /// `/dev-start/*` route, and the dashboard showed "Restarting Frontend"
     /// while nothing restarted (plan
     /// `2026-11-17-supervisor-loopback-follow-ups-dead-dev-start-test-env-header-fragment-marker`).
-    /// Zero self-calls is the expected reading today; the fixture tests below
-    /// are what prove this can fail, and the count line keeps an empty read
-    /// visible. See [`self_call_paths`] for what the scan recognises.
+    /// Zero self-calls is the expected reading today, so the fixture tests
+    /// below are what prove this can fail. The `self-calls read: N, routes
+    /// registered: M` line is printed on every run, but cargo captures it on
+    /// a passing test: it is visible under `--nocapture` and in a failing
+    /// run's output, not on an ordinary green run. See [`self_call_paths`]
+    /// for what the scan recognises.
     #[test]
     fn supervisor_self_calls_name_registered_routes() {
         let routes = registered_route_paths();
@@ -1222,6 +1313,71 @@ fn probe(state: &SharedState) {
         let (_, other) =
             unregistered_self_calls(&[("port.rs".to_string(), other_port)], &routes);
         assert_eq!(other, 0);
+    }
+
+    /// A1: a binding's `"{local}/…"` uses are read only in the rest of its own
+    /// block. Here the own-port `base` comes FIRST, so a file-wide search
+    /// would also read the later runner function's `"{base}/runner-only"`.
+    #[test]
+    fn self_call_guard_reads_a_binding_only_in_its_own_block() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn own(state: &SharedState) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{base}/health"));
+    let brace = '}';
+    let quoted = "}";
+}
+
+fn runner(port: u16) {
+    let base = crate::loopback::runner_loopback_base(port);
+    let _ = client.get(format!("{base}/runner-only"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("two_fns.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "only the own-port fn's /health is a self-call");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A2: the positional, rustfmt-split and suffix-interpolated spellings are
+    /// all read, and an interpolated suffix does not become a parameter that
+    /// matches any route.
+    #[test]
+    fn self_call_guard_reads_every_recognised_spelling() {
+        let routes = registered_route_paths();
+        let read_one = |src: &str| {
+            let (dead, read) = unregistered_self_calls(&[("f.rs".to_string(), src)], &routes);
+            assert_eq!(read, 1, "expected one self-call in {src}");
+            dead
+        };
+        // Positional `format!("{}/…", local)`.
+        let positional = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.post(format!("{}/dev-start/frontend", me));
+}
+"#;
+        assert_eq!(read_one(positional), ["f.rs: /dev-start/frontend"]);
+        assert!(read_one(&positional.replace("/dev-start/frontend", "/health")).is_empty());
+        // A rustfmt-split argument list, trailing comma included.
+        let split = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(
+        state.config.port,
+    );
+    let _ = client.post(format!("{me}/dev-start/frontend"));
+}
+"#;
+        assert_eq!(read_one(split), ["f.rs: /dev-start/frontend"]);
+        // An interpolated suffix is not a wildcard segment.
+        let suffix = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{me}/dev-start{query}"));
+}
+"#;
+        assert_eq!(read_one(suffix), ["f.rs: /dev-start"]);
+        assert!(read_one(&suffix.replace("/dev-start{query}", "/health{query}")).is_empty());
     }
 
     #[test]
