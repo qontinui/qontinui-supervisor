@@ -64,8 +64,9 @@
 //! in `src/source_scan.rs`. This test cannot call it. Both crate roots declare
 //! that module `#[cfg(test)] mod source_scan;` and its items are `pub(crate)`,
 //! while a file under `tests/` links the library built without `cfg(test)`, so
-//! the module does not exist for it. The rules here are this test's own, and
-//! they differ in three ways:
+//! the module does not exist for it. The rules here are this test's own. They
+//! still differ on the first point below, and are held to agree on the other
+//! two:
 //!
 //! - **Test code inside a file.** `source_scan::production_span` cuts at an
 //!   inline test module, or at a bodiless `#[cfg(test)] mod x;` that only
@@ -81,14 +82,16 @@
 //!   because `source_scan` would read it as production while this test skipped
 //!   it. It is still skipped for the localhost scan. `src/test_env.rs` was the
 //!   last such file and gained its header on 2026-11-17; `source_scan.rs`,
-//!   `test_ports.rs` and `dev_action/test_support.rs` gained theirs on
-//!   2026-11-15. qontinui-claude-config's `scripts/file-size-census.py` lists
-//!   such files as `missing-header`.
-//! - **A byte-order mark.** `source_scan` strips a leading one. This test does
-//!   not, so a `#![cfg(test)]` after a BOM marks nothing and the file stays in
-//!   scope, the conservative direction for this guard.
+//!   `test_ports.rs` and `dev_action/test_support.rs` gained theirs in
+//!   `208b3f6` (2026-11-17). qontinui-claude-config's
+//!   `scripts/file-size-census.py` lists such files as `missing-header`.
+//! - **A byte-order mark.** Both strip a leading one before deciding:
+//!   `source_scan::is_test_only_file` does, and this test strips it as it
+//!   reads each file, before lexing. So a `#![cfg(test)]` after a BOM marks
+//!   the file test-only on both sides.
 //!
-//! So the two can disagree about which lines are production. Moving this guard
+//! So the two can still disagree about which lines inside a file are
+//! production. Moving this guard
 //! in-crate, as a `#[cfg(test)]` module under `src/`, would let both share one
 //! classifier.
 //!
@@ -691,6 +694,19 @@ fn declaration_targets(file: &Path, decl: &ModDecl) -> Vec<PathBuf> {
     // `#[path = "…"]` on a module declared in a file is relative to that
     // file's directory.
     if let Some(rel) = &decl.path {
+        // A `..` component would need normalising to compare with the walked
+        // paths. Joined raw, it would match no file, and the file it really
+        // names would be misread with confident advice. Fail loudly instead.
+        assert!(
+            !Path::new(rel)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir),
+            "{}: `#[path = \"{rel}\"]` on `mod {};` contains `..`, which this test does not \
+             resolve. Teach `declaration_targets` to normalise it, or move the file so the \
+             attribute needs no `..`.",
+            file.display(),
+            decl.name
+        );
         return vec![dir.join(rel)];
     }
     // A crate root (`lib.rs`, `main.rs`, a `src/bin/*.rs` binary) and a
@@ -851,6 +867,12 @@ fn no_supervisor_url_spells_localhost() {
         .map(|p| {
             let text = fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("could not read {}: {e}", p.display()));
+            // Strip a leading BOM before lexing, as `source_scan` does, so a
+            // header after one counts on both sides.
+            let text = match text.strip_prefix('\u{feff}') {
+                Some(rest) => rest.to_string(),
+                None => text,
+            };
             (p, text)
         })
         .collect();
@@ -895,20 +917,23 @@ fn no_supervisor_url_spells_localhost() {
          the directory moved or the walk broke, so a green run here would prove nothing"
     );
 
-    assert!(
-        header_failures.is_empty(),
-        "{} test-only file(s) lack the `#![cfg(test)]` header, the one rule this test and \
-         `src/source_scan.rs` both decide on:\n{}",
-        header_failures.len(),
-        header_failures.join("\n")
-    );
-
+    // Both kinds of failure are collected and reported together, so fixing one
+    // does not reveal the other only on the next run.
+    let mut report = Vec::new();
+    if !header_failures.is_empty() {
+        report.push(format!(
+            "{} test-only file(s) lack the `#![cfg(test)]` header, the one rule this test and \
+             `src/source_scan.rs` both decide on:\n{}",
+            header_failures.len(),
+            header_failures.join("\n")
+        ));
+    }
     if !hits.is_empty() {
         let list: Vec<String> = hits
             .iter()
             .map(|h| format!("  {}:{}  {}", h.rel, h.line, h.text))
             .collect();
-        panic!(
+        report.push(format!(
             "{} line(s) address the supervisor or a runner as `localhost`. Both bind 127.0.0.1 \
              only, and on Windows `localhost` tries ::1 first (+~0.3 s per new reqwest \
              connection, +~2 s for Python/PowerShell), in the supervisor and in every agent \
@@ -921,8 +946,9 @@ fn no_supervisor_url_spells_localhost() {
              marker, with no reason after its colon, exempts nothing.\n{}",
             hits.len(),
             list.join("\n")
-        );
+        ));
     }
+    assert!(report.is_empty(), "{}", report.join("\n\n"));
 }
 
 /// Whether `scan_text` flags anything in `src`.
@@ -1169,6 +1195,18 @@ fn test_only_files_come_from_cfg_test_declarations() {
     ] {
         assert!(!set.contains(Path::new(p)), "{p} is production: {set:?}");
     }
+}
+
+/// A `#[path]` that climbs with `..` is refused rather than joined raw, which
+/// would match no walked file and misclassify the one it names.
+#[test]
+#[should_panic(expected = "contains `..`, which this test does not resolve")]
+fn a_path_attribute_with_a_parent_component_fails_loudly() {
+    let sources = vec![(
+        PathBuf::from("src/a/b.rs"),
+        "#[cfg(test)]\n#[path = \"../shared_tests.rs\"]\nmod shared;\n".to_string(),
+    )];
+    test_only_files(&sources);
 }
 
 /// A file reached only through gated declarations must carry the header: one
