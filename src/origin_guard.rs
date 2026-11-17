@@ -1070,10 +1070,14 @@ mod unit_tests {
     /// Reach limits of the rebind cut: a shadow made by a pattern
     /// (`if let Some(base) = …`, `match`, a destructuring `let (base, _)`)
     /// or by a closure parameter (`|base| …`) is not seen, and the uses after
-    /// it are still read as this binding's. A `let <local>` inside a string
-    /// or comment is not a cut, but only because the block walk skips those;
-    /// a literal or comment shape the walk does not recognise (see
-    /// [`scope_end`]) would be matched.
+    /// it are still read as this binding's. A `let` right after `if`,
+    /// `while` or `&&` is a condition binding that shadows only its own
+    /// block, so it is not a cut either. A `let <local>` inside a string or
+    /// comment is not a cut, but only because the block walk skips those; a
+    /// literal or comment shape the walk does not recognise (see
+    /// [`scope_end`]) would be matched. A multi-byte character outside a
+    /// recognised literal is stepped over byte by byte and never read as a
+    /// cut.
     ///
     /// Reach, so a green run is not over-read: a self-call spelled any other
     /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
@@ -1099,10 +1103,15 @@ mod unit_tests {
             // only that block and does not end it.
             let rebind = regex::Regex::new(&format!(r"^let\s+(?:mut\s+)?{name}\b")).unwrap();
             let bytes = production.as_bytes();
+            // The walk steps byte by byte, so `i` can sit inside a multi-byte
+            // character: compare bytes, and slice only through `get`.
             let stop_at = |i: usize| {
-                production[i..].starts_with("let")
+                bytes[i..].starts_with(b"let")
+                    // Defensive: `<ident ending in let> <name>` is not valid
+                    // Rust, so this check decides no real source today.
                     && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
-                    && rebind.is_match(&production[i..])
+                    && !follows_a_condition(bytes, i)
+                    && production.get(i..).is_some_and(|rest| rebind.is_match(rest))
             };
             let scope = &production[from..scope_end(production, from, stop_at)];
             let named = regex::Regex::new(&format!(r#""\{{{name}\}}(/[^"]*)""#)).unwrap();
@@ -1114,6 +1123,29 @@ mod unit_tests {
             raw.extend(positional.captures_iter(scope).map(|c| c[1].to_string()));
         }
         raw.iter().map(|p| normalise_call_path(p)).collect()
+    }
+
+    /// Whether the `let` at `i` is a condition binding (`if let`,
+    /// `while let`, `&& let`): the previous token, past whitespace, is `if`,
+    /// `while` or `&&`.
+    fn follows_a_condition(bytes: &[u8], i: usize) -> bool {
+        let before = &bytes[..i];
+        let end = before.len()
+            - before
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+        let before = &before[..end];
+        if before.ends_with(b"&&") {
+            return true;
+        }
+        let word_len = before
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        matches!(&before[end - word_len..], b"if" | b"while")
     }
 
     /// A self-call's path as [`route_matches`] reads it. A query string or
@@ -1412,12 +1444,50 @@ fn runner(base: &str) {
 fn f(state: &SharedState, port: u16) {
     let base = crate::loopback::loopback_base(state.config.port);
     let _ = client.get(format!("{base}/health"));
-    let base = crate::loopback::runner_loopback_base(port);
+    let mut base = crate::loopback::runner_loopback_base(port);
     let _ = client.get(format!("{base}/runner-only"));
 }
 "#;
         let (dead, read) = unregistered_self_calls(&[("shadow.rs".to_string(), src)], &routes);
         assert_eq!(read, 1, "only the use before the rebind is a self-call");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A `let` after `if`, `while` or `&&` binds only inside its own block,
+    /// so the outer binding's later use is still read, and here flagged.
+    #[test]
+    fn self_call_guard_ignores_a_condition_binding() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, x: bool) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    if let base = other() {
+        drop(base);
+    }
+    while let base = other() {}
+    while x && let base = other() {}
+    let _ = client.post(format!("{base}/dead-route"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("cond.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "the outer use is still this binding's");
+        assert_eq!(dead, ["cond.rs: /dead-route"]);
+    }
+
+    /// A multi-byte char literal before the use: the walk steps through its
+    /// bytes, and the rebind check must not slice inside the character.
+    #[test]
+    fn self_call_guard_survives_a_multi_byte_char() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let c = '…';
+    let _ = client.get(format!("{base}/health"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("utf8.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1);
         assert!(dead.is_empty(), "{dead:?}");
     }
 
