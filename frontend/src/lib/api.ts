@@ -522,21 +522,6 @@ export interface HealthResponse {
   originGuard?: OriginGuardWire;
 }
 
-export interface DevStartResponse {
-  status: string;
-  flag: string;
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-}
-
-export interface LogFileResponse {
-  file: string;
-  type: string;
-  content: string;
-  lines: number;
-}
-
 /// 202 body returned by the detached rebuild paths
 /// (`/runner/restart {rebuild:true}`, `/runners/{id}/restart {rebuild:true}`,
 /// `/runners/{id}/rebuild-and-restart`, `/runner/rebuild-when-idle`,
@@ -699,65 +684,7 @@ export interface MessageResponse {
   message: string;
 }
 
-// Workflow Loop types
-export interface WorkflowLoopStatus {
-  running: boolean;
-  config: WorkflowLoopConfig | null;
-  current_iteration: number;
-  phase: string;
-  started_at: string | null;
-  error: string | null;
-  iteration_count: number;
-  restart_signaled: boolean;
-  build_task_run_id?: string | null;
-  execute_task_run_id?: string | null;
-}
-
-export interface Checkpoint {
-  step_index: number;
-  step_name: string;
-  status: string;
-  phase: string;
-  duration_ms: number | null;
-  error: string | null;
-  stage_index: number;
-}
-
-export interface WorkflowLoopConfig {
-  workflow_id?: string;
-  max_iterations: number;
-  exit_strategy?: { type: string; reflection_workflow_id?: string | null };
-  between_iterations: { type: string; rebuild?: boolean };
-  phases?: PipelinePhases;
-}
-
-export interface PipelinePhases {
-  build?: { description: string; context?: string };
-  execute_workflow_id?: string;
-  reflect: { reflection_workflow_id: string | null };
-  implement_fixes?: {
-    additional_context?: string;
-    timeout_secs?: number;
-  };
-}
-
-export interface IterationResult {
-  iteration: number;
-  started_at: string;
-  completed_at: string | null;
-  task_run_id: string | null;
-  exit_check: { should_exit: boolean; reason: string } | null;
-  generated_workflow_id?: string;
-  reflection_task_run_id?: string;
-  fix_count?: number;
-  fixes_implemented?: boolean;
-  rebuild_triggered?: boolean;
-}
-
-export interface WorkflowLoopHistory {
-  iterations: IterationResult[];
-}
-
+// Runner-direct workflow type
 export interface UnifiedWorkflow {
   id: string;
   name: string;
@@ -1079,18 +1006,7 @@ export const api = {
   vtTrend: (limit?: number) =>
     fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
 
-  // Workflow Loop
-  wlStatus: () => fetchJson<WorkflowLoopStatus>('/workflow-loop/status'),
-  wlHistory: () => fetchJson<WorkflowLoopHistory>('/workflow-loop/history'),
-  wlStart: (config: Record<string, unknown>) =>
-    fetchJson<unknown>('/workflow-loop/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    }),
-  wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
-  wlCheckpoints: (taskRunId: string) =>
-    fetchJson<{ checkpoints: Checkpoint[] }>(`/workflow-loop/checkpoints/${taskRunId}`),
+  // Workflow-loop's server routes were removed (c415c5f); this one call goes to the runner.
   wlWorkflows: () =>
     fetch('http://127.0.0.1:9876/unified-workflows')
       .then((r) => r.json())
@@ -1132,12 +1048,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }),
-  devStartStatus: () =>
-    fetchJson<{
-      services: { name: string; port: number; available: boolean }[];
-    }>('/dev-start/status'),
-  devStartAction: (action: string) =>
-    fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: 'POST' }),
   runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
   listRunners: () =>
     fetchJson<
@@ -1230,10 +1140,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(opts),
     }),
-
-  // Logs
-  logFile: (type: string, tailLines?: number) =>
-    fetchJson<LogFileResponse>(`/logs/file/${type}${tailLines ? `?tail_lines=${tailLines}` : ''}`),
 
   // Runner Monitor (proxied to runner at port 9876)
   runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),
