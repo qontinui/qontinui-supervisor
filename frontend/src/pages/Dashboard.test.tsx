@@ -41,21 +41,7 @@ vi.mock('../lib/api', () => {
   return {
     api: {
       health: vi.fn().mockResolvedValue(healthResponse),
-      devStartStatus: vi.fn().mockResolvedValue({
-        services: [
-          { name: 'backend', port: 8000, available: true },
-          { name: 'frontend', port: 3001, available: true },
-        ],
-      }),
       expoStatus: vi.fn().mockResolvedValue({ running: false, configured: true }),
-      devStartAction: vi.fn().mockResolvedValue({
-        status: 'ok',
-        flag: 'backend',
-        stdout: 'Started',
-        stderr: '',
-        exit_code: 0,
-      }),
-      logFile: vi.fn().mockResolvedValue({ content: '', lines: 0 }),
       expoStart: vi.fn().mockResolvedValue({}),
       expoStop: vi.fn().mockResolvedValue({}),
       listRunners: vi.fn().mockResolvedValue([]),
@@ -74,7 +60,6 @@ vi.mock('../lib/api', () => {
       }),
     },
     HealthResponse: {},
-    DevStartResponse: {},
   };
 });
 
@@ -428,7 +413,7 @@ describe('Dashboard — build staleness', () => {
       .filter(([, fn]) => vi.isMockFunction(fn) && fn.mock.calls.length > 0)
       .map(([name]) => name)
       .sort();
-    expect(opened).toEqual(['builds', 'devStartStatus', 'expoStatus', 'health', 'listRunners']);
+    expect(opened).toEqual(['builds', 'expoStatus', 'health', 'listRunners']);
   });
 
   it('shows the build-behind badge on the primary row and amends the Rebuild tooltip', async () => {
@@ -477,7 +462,7 @@ describe('Dashboard — a live spawn with no port', () => {
   });
 
   /// The runner's own table row, so the panel's other Start/Stop buttons
-  /// (dev-start services, Expo) cannot answer for it.
+  /// (Expo) cannot answer for it.
   async function prebindRow(): Promise<HTMLElement> {
     const cells = await screen.findAllByText('named-prebind');
     const row = cells.map((c) => c.closest('tr')).find((r) => r !== null);
