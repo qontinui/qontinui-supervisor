@@ -1330,6 +1330,116 @@ mod unit_tests {
         );
     }
 
+    /// Dashboard client sources the census reads: the React client's API module
+    /// and the legacy static page.
+    const CLIENT_SOURCES: &[(&str, &str)] = &[
+        (
+            "frontend/src/lib/api.ts",
+            include_str!("../frontend/src/lib/api.ts"),
+        ),
+        (
+            "static/dashboard.html",
+            include_str!("../static/dashboard.html"),
+        ),
+    ];
+
+    /// Client paths the supervisor serves by a mechanism the route scan cannot
+    /// see (static assets, upgrades). Each entry carries its reason. Empty today.
+    const CLIENT_PATH_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// The path of every supervisor request a dashboard client source makes with
+    /// a string-literal path: the first argument of `fetchJson` / `fetchJSON` /
+    /// `postAction`, or of `fetch(` (optionally `BASE + '…'`). A template's
+    /// `${…}` segment is normalised like a route parameter; a query string, or
+    /// a `${…}` appended mid-segment, is cut off. Paths that do not start with
+    /// `new EventSource(BASE + '…')` is read too; `new WebSocket(url)` is not. Paths that do not start with
+    /// `/` (the runner's absolute URLs, `fetch(`${BASE}${path}`)`) are not
+    /// supervisor paths and are skipped. HTTP method is not checked.
+    fn client_paths(src: &str) -> Vec<String> {
+        let call = regex::Regex::new(
+            r#"(?:\bfetchJson|\bfetchJSON|\bpostAction)(?:<[^(]*?>)?\(\s*['"`](/[^'"`]*)|\b(?:fetch|new EventSource)\(\s*(?:BASE\s*\+\s*)?['"`](/[^'"`]*)"#,
+        )
+        .unwrap();
+        call.captures_iter(src)
+            .map(|c| {
+                let raw = c.get(1).or_else(|| c.get(2)).unwrap().as_str();
+                let mut cut = raw.len();
+                if let Some(i) = raw.find('?') {
+                    cut = cut.min(i);
+                }
+                if let Some(i) = raw.find("${") {
+                    if !raw[..i].ends_with('/') {
+                        cut = cut.min(i);
+                    }
+                }
+                normalise_path(&raw[..cut])
+            })
+            .collect()
+    }
+
+    /// Of `sources` (`(name, text)`), every client path that names no route in
+    /// `routes` and is not allowlisted, as `name: path` — and how many were read.
+    fn unregistered_client_paths(
+        sources: &[(&str, &str)],
+        routes: &BTreeSet<String>,
+    ) -> (Vec<String>, usize) {
+        let mut dead = Vec::new();
+        let mut read = 0;
+        for (name, text) in sources {
+            for path in client_paths(text) {
+                read += 1;
+                let allowed = CLIENT_PATH_ALLOWLIST
+                    .iter()
+                    .any(|(p, _)| route_matches(&normalise_path(p), &path));
+                if !allowed && !routes.iter().any(|r| route_matches(r, &path)) {
+                    dead.push(format!("{name}: {path}"));
+                }
+            }
+        }
+        (dead, read)
+    }
+
+    /// Every path the dashboard clients request is a route the supervisor
+    /// registers. `/dev-start/*` and `/workflow-loop/*` were removed on
+    /// 2026-04-06 (`c415c5f`) while the dashboard kept calling them, and the
+    /// client tests mocked `fetch`, so nothing reddened (plan
+    /// `2026-11-17-supervisor-dashboard-delete-dead-dev-start-panel-and-census-client-paths`).
+    /// The census can miss a path built another way, so it also fails on a
+    /// vacuous read.
+    #[test]
+    fn dashboard_client_paths_name_registered_routes() {
+        let routes = registered_route_paths();
+        let (dead, read) = unregistered_client_paths(CLIENT_SOURCES, &routes);
+        println!(
+            "client paths read: {read}, routes registered: {}",
+            routes.len()
+        );
+        assert!(read > 40, "read only {read} client paths");
+        assert!(
+            dead.is_empty(),
+            "dashboard calls routes the supervisor does not register:\n{}",
+            dead.join("\n")
+        );
+    }
+
+    #[test]
+    fn client_census_flags_a_dead_dev_start_call() {
+        let routes = registered_route_paths();
+        let src = "export const api = { devStartStatus: () =>\n  fetchJson<{ services: { name: string }[] }>('/dev-start/status'),\n  go: (a: string) => fetchJson<X>(`/dev-start/${a}`, { method: 'POST' }),\n  ok: () => fetchJson<Y>('/health'),\n};";
+        let (dead, read) = unregistered_client_paths(&[("fixture", src)], &routes);
+        assert_eq!(read, 3);
+        assert_eq!(
+            dead,
+            vec![
+                "fixture: /dev-start/status".to_string(),
+                "fixture: /dev-start/{}".to_string()
+            ]
+        );
+        let html = "fetch(BASE + '/workflow-loop/stop', { method: 'POST' }); postAction('/dev-start/all');";
+        let (dead, _) = unregistered_client_paths(&[("fixture.html", html)], &routes);
+        assert_eq!(dead.len(), 2, "{dead:?}");
+    }
+
     /// The pre-deletion `restart_frontend` body, as it stood at `208b3f6`.
     const OLD_RESTART_FRONTEND: &str = r#"
 async fn restart_frontend(state: &SharedState, restart_backend: bool) -> Result<(), String> {

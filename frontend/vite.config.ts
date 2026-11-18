@@ -167,16 +167,6 @@ export default defineConfig({
       '/lineage/stats': toSupervisor(),
       '/lineage/sessions': toSupervisor(),
       '/lineage/commits': toSupervisor(),
-      // No supervisor route answers either prefix today, while the dashboard
-      // calls both (`api.devStartStatus` runs on every Dashboard load;
-      // `api.wlStatus`). Kept so the wiring is here if the routes return, and
-      // recorded as its own defect rather than silently deleted: proxied or
-      // not the outcome is the same, and it is NOT a 404 — the SPA fallback
-      // answers `GET /dev-start/status` with 200 + index.html, and the
-      // `get`-only fallback answers `api.devStartAction`'s POST with 405.
-      // Coord finding 91da7570-5d89-4f1e-aafe-2d7104f701d3.
-      '/dev-start': toSupervisor(),
-      '/workflow-loop': toSupervisor(),
     },
   },
 });
