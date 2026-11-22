@@ -1529,9 +1529,10 @@ mod tests {
     /// The live defect this module was changed to fix: coord COALESCEs each
     /// budget column, so an omitted key leaves it alone but a
     /// `max_concurrent_agents: 0` here is a write, and it flapped the
-    /// device's real cap to zero on every publish. Coord owns that column (its own derivation from the runner's publish; an
-    /// explicit `0` is still stored verbatim), and the ONLY way for the
-    /// supervisor to stay out of it on the wire is to omit the key.
+    /// device's real cap to zero on every publish. Coord owns that column
+    /// (its own derivation from the runner's publish; an explicit `0` is
+    /// still stored verbatim), and the ONLY way for the supervisor to stay
+    /// out of it on the wire is to omit the key.
     #[test]
     fn budget_payload_omits_the_agent_cap_the_supervisor_does_not_own() {
         let v = serialized();
