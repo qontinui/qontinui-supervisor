@@ -65,8 +65,10 @@
 //! coord's `upsert_budget` does (`crates/coord/src/fleet.rs`) — see the note
 //! on `BudgetPayload`. What coord stores is decided by its
 //! `stored_max_concurrent_agents`: its own derivation when the publish
-//! carries `memory_gb`, `cpu_cores` and `ci_reserved_gib`; an explicit `0`
-//! verbatim; otherwise nothing, so the column keeps its last stored value.
+//! carries a non-zero `max_concurrent_agents` together with non-zero
+//! `memory_gb`/`cpu_cores` and a `ci_reserved_gib`; an explicit `0`
+//! verbatim; otherwise (an omitted key included) nothing, so the column
+//! keeps its last stored value.
 //! In no case is it a number the supervisor could contribute, so it omits
 //! the key.
 
@@ -1526,10 +1528,11 @@ mod tests {
         .expect("payload serializes")
     }
 
-    /// The live defect this module was changed to fix: coord COALESCEs each
-    /// budget column, so an omitted key leaves it alone but a
-    /// `max_concurrent_agents: 0` here is a write, and it flapped the
-    /// device's real cap to zero on every publish. Coord owns that column
+    /// The live defect this module was changed to fix: under coord's earlier
+    /// straight `SET`, a `max_concurrent_agents: 0` here flapped the
+    /// device's real cap to zero on every publish. Coord now COALESCEs each
+    /// budget column, so an omitted key leaves it alone, but any value sent
+    /// is still a write. Coord owns that column
     /// (its own derivation from the runner's publish; an explicit `0` is
     /// still stored verbatim), and the ONLY way for the supervisor to stay
     /// out of it on the wire is to omit the key.
