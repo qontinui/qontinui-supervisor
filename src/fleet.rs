@@ -191,8 +191,8 @@ pub fn load_machine_file() -> Option<MachineFile> {
 /// What coord stores there is decided by its `stored_max_concurrent_agents`
 /// (the module docs give the exact rule): a non-zero value a runner sends is
 /// replaced by coord's derivation or dropped, and an explicit `0` is stored
-/// verbatim — which is why
-/// the supervisor must omit the key rather than send a placeholder.
+/// verbatim — which is why the supervisor must omit the key rather than
+/// send a placeholder.
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
     role: &'static str,
