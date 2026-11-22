@@ -188,9 +188,10 @@ pub fn load_machine_file() -> Option<MachineFile> {
 /// **Coord owns the column.** Coord's `BudgetPublishRequest` declares
 /// `max_concurrent_agents` `Option` and `upsert_budget` writes it
 /// `SET col = COALESCE($n, col)`, so an omitted key leaves the column alone.
-/// What coord stores there is its own derivation from the runner's
-/// `memory_gb`/`cpu_cores` (with its `ci_reserved_gib`); a non-zero value a
-/// runner sends is advisory, and an explicit `0` is stored verbatim — which is why
+/// What coord stores there is decided by its `stored_max_concurrent_agents`
+/// (the module docs give the exact rule): a non-zero value a runner sends is
+/// replaced by coord's derivation or dropped, and an explicit `0` is stored
+/// verbatim — which is why
 /// the supervisor must omit the key rather than send a placeholder.
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
@@ -1531,8 +1532,9 @@ mod tests {
     /// The live defect this module was changed to fix: under coord's earlier
     /// straight `SET`, a `max_concurrent_agents: 0` here flapped the
     /// device's real cap to zero on every publish. Coord now COALESCEs each
-    /// budget column, so an omitted key leaves it alone, but any value sent
-    /// is still a write. Coord owns that column
+    /// budget column, so an omitted key leaves it alone, but an explicit `0` is
+    /// still a write (stored verbatim); a non-zero value is replaced or
+    /// dropped by coord's derivation. Coord owns that column
     /// (its own derivation from the runner's publish; an explicit `0` is
     /// still stored verbatim), and the ONLY way for the supervisor to stay
     /// out of it on the wire is to omit the key.
