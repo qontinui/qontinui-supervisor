@@ -42,7 +42,7 @@
 //! | `role` | supervisor | it is the only writer of `'build'`, which coord's `build_dispatcher::select_build_machine` requires (`WHERE role = 'build'`) — omitting it would silently disable remote build dispatch |
 //! | `disk_reserved_gb` | either (hardware, not process, state) | both publishers send the same figure; omitting it on both sides would only NULL a real column |
 //! | `hostname` | either (coord already `COALESCE`s it) | read from `machine.json`, identical on both sides |
-//! | `max_concurrent_agents` | **runner** | omitted here |
+//! | `max_concurrent_agents` | **coord** (derived from the runner's `memory_gb`/`cpu_cores`, with its `ci_reserved_gib`; any runner-sent value is advisory) | omitted here |
 //!
 //! **The CI-runner columns are NOT on this route.** This module used to send
 //! `ci_runner_labels` / `ci_runner_status` in the budget payload. Coord's
@@ -60,9 +60,13 @@
 //! same box and reporting the same number are not in conflict, and dropping
 //! such a field from both sides loses real data for no benefit.
 //!
-//! This omission contract requires coord to declare `max_concurrent_agents`
-//! `Option` and write it `SET col = COALESCE($n, col)` — see the ordering
-//! note on `BudgetPayload`.
+//! This omission contract relies on coord declaring `max_concurrent_agents`
+//! `Option` and writing it `SET col = COALESCE($n, col)`, which coord's
+//! `upsert_budget` does (`stored_max_concurrent_agents` in coord's
+//! `crates/coord/src/fleet.rs`) — see the note on `BudgetPayload`. The
+//! stored value is coord's own derivation from the runner's publish, not the
+//! number any publisher sent, so the supervisor has nothing to contribute to
+//! that column; an explicit `0` would still be stored verbatim.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -177,10 +181,13 @@ pub fn load_machine_file() -> Option<MachineFile> {
 /// then unrepresentable-if-wrong rather than one edit away from sending a
 /// zero again.
 ///
-/// **Ordering dependency.** Coord must declare `max_concurrent_agents`
-/// `Option` and write it `SET col = COALESCE($n, col)` before this payload
-/// is deployed — until then `BudgetPublishRequest` declares it mandatory
-/// and a publish that omits it is rejected outright.
+/// **Coord owns the column.** Coord's `BudgetPublishRequest` declares
+/// `max_concurrent_agents` `Option` and `upsert_budget` writes it
+/// `SET col = COALESCE($n, col)`, so an omitted key leaves the column alone.
+/// What coord stores there is its own derivation from the runner's
+/// `memory_gb`/`cpu_cores` (with its `ci_reserved_gib`); any value a runner
+/// sends is advisory, and an explicit `0` is stored verbatim — which is why
+/// the supervisor must omit the key rather than send a placeholder.
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
     role: &'static str,
@@ -1019,7 +1026,7 @@ pub(crate) async fn publish_budget(
     // does not own — see the module docs. Omission is the only way to say
     // "leave this column alone": coord writes each budget column with a
     // straight `SET`, so a placeholder value is a write, not an abstention.
-    // Sending `max_concurrent_agents: 0` used to FLAP the runner's real cap
+    // Sending `max_concurrent_agents: 0` used to FLAP the device's real cap
     // to zero on every supervisor publish until the runner's 10-minute
     // republisher re-asserted it. That flap is exactly the 2026-07-28
     // outage's mechanism — a writer emitting a default over another writer's
@@ -1518,16 +1525,17 @@ mod tests {
 
     /// The live defect this module was changed to fix: coord writes every
     /// budget column with a straight `SET`, so a `max_concurrent_agents: 0`
-    /// here flapped the runner's real cap to zero on every publish. The
-    /// supervisor does not own that column, and the ONLY way to say so on
-    /// the wire is to omit the key.
+    /// here flapped the device's real cap to zero on every publish. Coord
+    /// owns that column (its own derivation from the runner's publish; an
+    /// explicit `0` is still stored verbatim), and the ONLY way for the
+    /// supervisor to stay out of it on the wire is to omit the key.
     #[test]
     fn budget_payload_omits_the_agent_cap_the_supervisor_does_not_own() {
         let v = serialized();
         let obj = v.as_object().expect("payload is a JSON object");
         assert!(
             !obj.contains_key("max_concurrent_agents"),
-            "max_concurrent_agents is the RUNNER's column — sending any value overwrites it: {v}"
+            "max_concurrent_agents is COORD's column (derived from the runner's memory_gb/cpu_cores) — sending a value from the supervisor can overwrite it: {v}"
         );
     }
 
