@@ -7681,6 +7681,11 @@ pub struct AdmittedRestart {
     /// primary rebuild asks again when it had to wait for its spawn container
     /// (`take_origin_main_container`).
     force: bool,
+    /// For a primary rebuild, the runner's stops as they stood when the
+    /// restart was admitted, read BEFORE its readiness probe: a stop asked
+    /// after this, that no restart made, abandons the rebuild
+    /// ([`StopsSince`]). `None` for every other restart.
+    yields_to: Option<StopsSince>,
     started: std::time::Instant,
 }
 
@@ -7748,6 +7753,17 @@ pub async fn admit_restart(
         }
     };
 
+    // A primary rebuild's baseline for the stops it yields to, read before the
+    // readiness probe below (up to 15 s): a stop asked during that probe is
+    // newer than this rebuild. Read here rather than in the HTTP handler, so
+    // a stop asked during the door's sub-second dev-action mint, before this
+    // point, is not seen: such a stop and the rebuild are concurrent.
+    let yields_to = if rebuild && managed.config.kind().is_primary() {
+        Some(StopsSince::of(&*managed.runner.read().await))
+    } else {
+        None
+    };
+
     // Readiness gate. Evaluated here, at the restart boundary, rather than being
     // left to the nested `stop_runner_by_id` call below — a restart that is
     // going to be refused must be refused BEFORE `restart_requested` is
@@ -7779,6 +7795,7 @@ pub async fn admit_restart(
         rebuild,
         source,
         force,
+        yields_to,
         started: restart_start,
     })
 }
@@ -7802,6 +7819,7 @@ pub async fn run_admitted_restart(
         rebuild,
         source,
         force,
+        yields_to,
         started: restart_start,
     } = admitted;
     let runner_id = runner_id.as_str();
@@ -7866,6 +7884,7 @@ pub async fn run_admitted_restart(
         build_tree,
         intent,
         force,
+        yields_to,
         initiated_by,
         &mut acted,
         &stop_removed_entry,
@@ -8156,6 +8175,7 @@ async fn restart_after_gate(
     build_tree: BuildTree,
     intent: CloseIntent,
     force: bool,
+    yields_to: Option<StopsSince>,
     initiated_by: Option<uuid::Uuid>,
     acted: &mut bool,
     stop_removed_entry: &std::sync::atomic::AtomicBool,
@@ -8169,16 +8189,12 @@ async fn restart_after_gate(
     // `take_origin_main_container` asks the gate again, before anything stops.
     //
     // Every primary rebuild, from either tree, yields to a stop no restart
-    // made that is asked after it began ([`StopsSince`]): read now, before the
-    // container wait, and checked again before the stop, inside it, and after
+    // made that is asked after it was admitted: `yields_to`, read by
+    // `admit_restart` before its readiness probe ([`StopsSince`]), and checked
+    // again after any container wait, before the stop, inside it, and after
     // the build. The build can last most of an hour, and a stop asked in it is
     // newer than the rebuild whether or not the rebuild had to wait.
     let is_primary = managed.config.kind().is_primary();
-    let yields_to = if rebuild && is_primary {
-        Some(StopsSince::of(&*managed.runner.read().await))
-    } else {
-        None
-    };
     let container_guard = match yields_to {
         Some(since) if build_tree.compiles_origin_main(is_primary) => {
             Some(take_origin_main_container(state, managed, since, force, intent).await?)

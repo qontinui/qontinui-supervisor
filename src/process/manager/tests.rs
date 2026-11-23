@@ -6335,9 +6335,9 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         sig,
         &squeezed(body_of(sig)),
         &[
-            // Every primary rebuild reads its baseline, from either tree,
-            // before it asks for the container: waited or not, it yields.
-            "letyields_to=ifrebuild&&is_primary{Some(StopsSince::of(&*managed.runner.read().await))}else{None};",
+            // The baseline comes from admission (`admit_restart`, pinned and
+            // driven below), for every primary rebuild from either tree:
+            // waited or not, it yields.
             "letcontainer_guard=matchyields_to{",
             "take_origin_main_container(state,managed,since,force,intent).await?",
             "ifletSome(since)=yields_to{",
@@ -6697,6 +6697,73 @@ async fn a_restarts_stop_yields_under_its_lock_to_a_stop_asked_while_it_waited()
     let runner = managed.runner.read().await;
     assert!(!runner.stop_requested, "nothing latched");
     assert_eq!(runner.restart_stop_at, None, "nothing marked");
+}
+
+/// A primary rebuild's baseline is read at admission, BEFORE its readiness
+/// probe, whatever tree it builds and whether or not it will wait for its
+/// container: a stop asked during that probe is newer than the rebuild
+/// (finding 0d218fea, round 3). Any other restart carries none.
+#[tokio::test]
+async fn a_primary_rebuild_takes_its_stop_baseline_at_admission_before_its_probe() {
+    let (state, _root) = restart_test_state();
+    let managed = register_armed_primary(&state, 29_891, Default::default()).await;
+    let id = managed.config.id.clone();
+
+    let no_rebuild = admit_restart(
+        &state,
+        &id,
+        false,
+        RestartSource::Manual,
+        true,
+        CloseIntent::Kill,
+    )
+    .await
+    .expect("an unprotected, stopped primary is admitted");
+    assert_eq!(no_rebuild.yields_to, None, "a restart that builds nothing");
+
+    let admitted = admit_restart(
+        &state,
+        &id,
+        true,
+        RestartSource::Manual,
+        true,
+        CloseIntent::Kill,
+    )
+    .await
+    .expect("an unprotected, stopped primary is admitted");
+    let since = admitted
+        .yields_to
+        .expect("a primary rebuild carries a baseline");
+    assert!(since.abandons(&*managed.runner.read().await).is_ok());
+    managed.runner.write().await.stop_asks += 1;
+    assert!(matches!(
+        since.abandons(&*managed.runner.read().await),
+        Err(SupervisorError::RebuildAbandoned(_))
+    ));
+
+    // Read before the readiness probe, at source level: the probe is the
+    // window this placement exists for.
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let body: String = crate::source_scan::code_only(
+        crate::source_scan::fn_body(&src, "pub async fn admit_restart(").expect("admit_restart"),
+    )
+    .split_whitespace()
+    .collect();
+    let read = body
+        .find("letyields_to=ifrebuild&&managed.config.kind().is_primary(){Some(StopsSince::of(")
+        .expect("admit_restart reads the baseline for every primary rebuild");
+    let probe = body
+        .find("crate::restart_readiness::enforce(")
+        .expect("admit_restart's readiness probe");
+    assert!(read < probe, "the baseline must be read before the probe");
 }
 
 /// A waited rebuild abandoned after its build has stopped the runner and built:
