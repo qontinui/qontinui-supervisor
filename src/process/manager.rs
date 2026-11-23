@@ -7756,8 +7756,12 @@ pub async fn admit_restart(
     // A primary rebuild's baseline for the stops it yields to, read before the
     // readiness probe below (up to 15 s): a stop asked during that probe is
     // newer than this rebuild. Read here rather than in the HTTP handler, so
-    // a stop asked during the door's sub-second dev-action mint, before this
-    // point, is not seen: such a stop and the rebuild are concurrent.
+    // a stop asked AND latched during the door's dev-action mint, before this
+    // point, is not seen: up to about 2.75 s while coord is slow (the
+    // expectations fetch's 750 ms bearer budget plus its 2 s timeout,
+    // `dev_action::expectations`), and such a stop is concurrent with the
+    // rebuild request. One that latches after this read moves the time and
+    // is seen.
     let yields_to = if rebuild && managed.config.kind().is_primary() {
         Some(StopsSince::of(&*managed.runner.read().await))
     } else {
