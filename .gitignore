@@ -45,7 +45,7 @@ __pycache__/
 #
 # Three of the roster's entries are already covered above — `agent-worktrees/`
 # (line 12), `.mcp.json` (line 17), and `.claude/worktrees/` by the broader
-# `.claude/` (line 37). These are the two the earlier promotions left behind:
+# `.claude/` (line 37). These are the ones the earlier promotions left behind:
 #
 #   .agent-worktrees/  the dot-prefixed container. `agent-worktrees/` above does
 #                      NOT match it — a gitignore pattern matches a path

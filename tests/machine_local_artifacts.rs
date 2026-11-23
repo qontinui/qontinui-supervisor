@@ -4,7 +4,8 @@
 //!
 //! The runner drops machine-local artifacts into every repo it manages
 //! (`.mcp.json`, the two `agent-worktrees` container spellings,
-//! `.coord-mcp-status`, and `.claude/worktrees/`). None of them is source, and
+//! `.coord-mcp-status` with its `.coord-mcp-status.tmp-*` atomic-replace temp
+//! file, and `.claude/worktrees/`). None of them is source, and
 //! every one of them makes `git status --porcelain` non-empty while it is
 //! untracked-and-unignored.
 //!
@@ -454,6 +455,9 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // The breadcrumb's atomic-replace temp file (`coord_mcp::replace_breadcrumb`),
+    // which a crash between its write and its rename would leave behind.
+    ".coord-mcp-status.tmp-*",
     ".claude/worktrees/",
 ];
 "#;
@@ -464,6 +468,7 @@ const MANAGED_REPO_EXCLUDES: &[&str] = &[
             "agent-worktrees/".to_string(),
             ".agent-worktrees/".to_string(),
             ".coord-mcp-status".to_string(),
+            ".coord-mcp-status.tmp-*".to_string(),
             ".claude/worktrees/".to_string(),
         ]),
         "the parser must read the declaration's actual shape, type sigil included"
