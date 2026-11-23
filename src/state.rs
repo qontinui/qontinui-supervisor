@@ -888,16 +888,16 @@ pub struct RunnerState {
     pub stop_requested_at: Option<DateTime<Utc>>,
     /// The [`Self::stop_requested_at`] a restart's own stop set
     /// ([`Self::latch_restart_stop_request`]), cleared with it by the next
-    /// start. `None` when the restart's stop found an earlier stop latched. A primary rebuild that waited for its spawn container reads it to
-    /// tell a stop another restart made, which that restart answers itself,
-    /// from one asked for while it waited.
+    /// start. `None` when the restart's stop found an earlier stop latched. A
+    /// primary rebuild reads it to tell a stop another restart made, which that
+    /// restart answers itself, from one asked for since the rebuild began.
     pub restart_stop_at: Option<DateTime<Utc>>,
     /// How many stops anything but a restart has asked of this runner since
     /// the supervisor started tracking it: counted when the stop is asked,
     /// before its readiness probe and its wait for the lifecycle lock, and
-    /// never decreased (a refused stop still counts). A primary rebuild that
-    /// waited for its spawn container compares it with the count it read
-    /// before the wait, because [`Self::stop_requested_at`] dates a stop only
+    /// never decreased (a refused stop still counts). A primary rebuild
+    /// compares it with the count it read when it began, because
+    /// [`Self::stop_requested_at`] dates a stop only
     /// once it latches, seconds after it was asked.
     pub stop_asks: u64,
     pub pid: Option<u32>,

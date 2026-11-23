@@ -6335,8 +6335,11 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         sig,
         &squeezed(body_of(sig)),
         &[
-            "let(container_guard,yields_to)=",
-            "take_origin_main_container(state,managed,force,intent).await?;",
+            // Every primary rebuild reads its baseline, from either tree,
+            // before it asks for the container: waited or not, it yields.
+            "letyields_to=ifrebuild&&is_primary{Some(StopsSince::of(&*managed.runner.read().await))}else{None};",
+            "letcontainer_guard=matchyields_to{",
+            "take_origin_main_container(state,managed,since,force,intent).await?",
             "ifletSome(since)=yields_to{",
             "since.abandons(&*managed.runner.read().await);",
             "returnErr(rebuild_abandoned(state,e).await);",
@@ -6359,7 +6362,7 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         3,
         "{sig}: container_guard is bound, lent to the build and dropped, and used no other way"
     );
-    let bound = "let(container_guard,yields_to)=";
+    let bound = "letcontainer_guard=";
     let from = code.find(bound).expect("the binding") + bound.len();
     let to = code.find("drop(container_guard);").expect("the drop");
     let mut depth = 0i32;
@@ -6380,13 +6383,13 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         sig,
         &squeezed(body_of(sig)),
         &[
-            "letsince=StopsSince::of(&*managed.runner.read().await);",
+            "since:StopsSince,",
             ".try_take(&container,PRIMARY_REBUILD_TAKER)",
             ".take_spawn_container_lock(&container,PRIMARY_REBUILD_TAKER)",
             "letabandoned=since.abandons(&*managed.runner.read().await);",
             "returnErr(rebuild_abandoned(state,e).await);",
             "crate::restart_readiness::enforce(state,managed,crate::restart_readiness::GateAction::Restart,force,intent,)",
-            "Ok((guard,Some(since)))",
+            "Ok(guard)",
         ],
     );
 

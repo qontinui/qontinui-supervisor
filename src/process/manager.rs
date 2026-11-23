@@ -6713,19 +6713,19 @@ enum StopCause {
     /// reads it unmarked, whatever becomes of the restart, and never reads an
     /// earlier stop as the restart's.
     ///
-    /// `yields_to` is set by a primary rebuild that waited for its spawn
-    /// container: in that same write, before anything is latched, the stop is
-    /// refused ([`SupervisorError::RebuildAbandoned`]) when a stop no restart
-    /// made was requested since the wait began ([`StopsSince::abandons`]).
+    /// `yields_to` is set by a primary rebuild: in that same write, before
+    /// anything is latched, the stop is refused
+    /// ([`SupervisorError::RebuildAbandoned`]) when a stop no restart made was
+    /// requested since the rebuild began ([`StopsSince::abandons`]).
     Restart { yields_to: Option<StopsSince> },
 }
 
-/// What a primary rebuild read of the runner's stops before it waited for its
-/// spawn container: a stop requested after it, that no restart made, abandons
-/// the rebuild. Carried from the wait to the restart's own stop and to its
-/// start, so the check runs again after the second readiness probe, inside
-/// the stop under the lock that orders it against every other stop, and after
-/// the build.
+/// What a primary rebuild read of the runner's stops when it began, before any
+/// wait for its spawn container: a stop requested after it, that no restart
+/// made, abandons the rebuild. Carried to the restart's own stop and to its
+/// start, so the check runs again after any wait and second readiness probe,
+/// inside the stop under the lock that orders it against every other stop,
+/// and after the build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StopsSince {
     /// [`crate::state::RunnerState::stop_requested_at`] before the wait.
@@ -6776,7 +6776,7 @@ async fn stop_runner_as(
 
     // A stop is asked now, seconds before it latches: counted here, before its
     // readiness probe and its wait for the lifecycle lock, so a primary
-    // rebuild that waited for its spawn container sees it in that window too.
+    // rebuild sees it in that window too.
     // A restart's own stop checks those stops instead, before its probe (so a
     // stop it then abandons logs no override) and again under the lock.
     match cause {
@@ -8028,31 +8028,24 @@ const PRIMARY_REBUILD_TAKER: &str = "the primary's origin/main rebuild";
 /// container is taken, before anything stops, and a refusal releases it.
 ///
 /// A stop requested while the rebuild waited abandons it before that second
-/// ask ([`after_container_wait`]): the rebuild would otherwise start a runner
-/// that was asked to stop after the rebuild was. The second ask can take
-/// seconds, so a rebuild that waited also gets back what it read before the
-/// wait ([`StopsSince`]), and `restart_after_gate` asks again before its own
-/// stop, inside it, and before its start.
+/// ask ([`StopsSince::abandons`]): the rebuild would otherwise start a runner
+/// that was asked to stop after the rebuild was. `since` is what the rebuild
+/// read when it began; `restart_after_gate` asks again before its own stop,
+/// inside it, and before its start, waited or not.
 async fn take_origin_main_container(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
+    since: StopsSince,
     force: bool,
     intent: CloseIntent,
-) -> Result<
-    (
-        crate::spawn_worktree::SpawnContainerGuard,
-        Option<StopsSince>,
-    ),
-    SupervisorError,
-> {
+) -> Result<crate::spawn_worktree::SpawnContainerGuard, SupervisorError> {
     let container =
         crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, "origin/main")?;
-    let since = StopsSince::of(&*managed.runner.read().await);
     if let Ok(guard) = state
         .spawn_container_locks
         .try_take(&container, PRIMARY_REBUILD_TAKER)
     {
-        return Ok((guard, None));
+        return Ok(guard);
     }
     let guard = state
         .take_spawn_container_lock(&container, PRIMARY_REBUILD_TAKER)
@@ -8069,7 +8062,7 @@ async fn take_origin_main_container(
         intent,
     )
     .await?;
-    Ok((guard, Some(since)))
+    Ok(guard)
 }
 
 /// Log a primary rebuild's abandonment at `Warn`, and hand the error back.
@@ -8081,18 +8074,18 @@ async fn rebuild_abandoned(state: &SharedState, e: SupervisorError) -> Superviso
     e
 }
 
-/// The refusal a primary rebuild that waited for its spawn container answers
-/// with when a stop no restart made was asked after the wait began.
+/// The refusal a primary rebuild answers with when a stop no restart made was
+/// asked after the rebuild began.
 fn rebuild_abandoned_error() -> SupervisorError {
     SupervisorError::RebuildAbandoned(
         "primary rebuild abandoned: a stop that no restart made was requested after \
-         this rebuild began waiting for its spawn container"
+         this rebuild began"
             .to_string(),
     )
 }
 
-/// Whether a primary rebuild that waited for its spawn container may go on to
-/// the gate, given the runner's stop-request time before and after the wait,
+/// Whether a primary rebuild may go on, given the runner's stop-request time
+/// when it began (before any wait for its spawn container) and now,
 /// and the one a restart marked as its own stop
 /// ([`RunnerState::restart_stop_at`]). A stop latched during the wait is newer
 /// than the rebuild request, so it wins: the rebuild is abandoned as a refusal
@@ -8118,9 +8111,13 @@ fn rebuild_abandoned_error() -> SupervisorError {
 /// an earlier stop is still latched, or one asked during the build, is seen
 /// there by its ask.
 ///
-/// It errs toward the stop: one asked just BEFORE the rebuild read its
-/// [`StopsSince`], and still in its readiness probe then, latches during the
-/// wait, moves the time, and abandons the rebuild although it was asked first.
+/// It errs toward the stop, deliberately: one asked just BEFORE the rebuild
+/// read its [`StopsSince`], and still in its readiness probe then, latches
+/// later, moves the time, and abandons the rebuild although it was asked
+/// first. Ignoring a moved time whenever the ask count is unchanged would fix
+/// that, but would also ignore a stop latched by a path that does not count
+/// asks, and a wrongly abandoned rebuild starts nothing and is retried, while a
+/// wrongly continued one starts a runner someone stopped.
 ///
 /// [`RunnerState::restart_stop_at`]: crate::state::RunnerState::restart_stop_at
 /// [`RunnerState::latch_stop_request`]: crate::state::RunnerState::latch_stop_request
@@ -8170,13 +8167,23 @@ async fn restart_after_gate(
     // primary still serving, not stopped. After such a wait the readiness
     // verdict this restart was admitted on is stale, so
     // `take_origin_main_container` asks the gate again, before anything stops.
-    let (container_guard, yields_to) = if rebuild
-        && build_tree.compiles_origin_main(managed.config.kind().is_primary())
-    {
-        let (guard, yields_to) = take_origin_main_container(state, managed, force, intent).await?;
-        (Some(guard), yields_to)
+    //
+    // Every primary rebuild, from either tree, yields to a stop no restart
+    // made that is asked after it began ([`StopsSince`]): read now, before the
+    // container wait, and checked again before the stop, inside it, and after
+    // the build. The build can last most of an hour, and a stop asked in it is
+    // newer than the rebuild whether or not the rebuild had to wait.
+    let is_primary = managed.config.kind().is_primary();
+    let yields_to = if rebuild && is_primary {
+        Some(StopsSince::of(&*managed.runner.read().await))
     } else {
-        (None, None)
+        None
+    };
+    let container_guard = match yields_to {
+        Some(since) if build_tree.compiles_origin_main(is_primary) => {
+            Some(take_origin_main_container(state, managed, since, force, intent).await?)
+        }
+        _ => None,
     };
     // The second readiness ask can take seconds: a stop requested during it
     // abandons the rebuild too, whether or not a stop is still needed below.
