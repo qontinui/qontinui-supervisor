@@ -1089,6 +1089,7 @@ mod tests {
     // ---- proc-root seam -------------------------------------------------
 
     const UNIT: &str = "qontinui-runner-x-20261104T230000000Z.scope";
+    #[cfg(unix)]
     const SUPERVISOR_CGROUP: &str =
         "/user.slice/user-1000.slice/user@1000.service/app.slice/qontinui-supervisor-x.service";
 

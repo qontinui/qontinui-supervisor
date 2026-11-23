@@ -2076,7 +2076,7 @@ fn temp_restart_keeps_the_instance_state() {
             .to_string()
     };
 
-    let stop = body_of("pub async fn stop_runner_by_id(");
+    let stop = body_of("async fn stop_runner_as(");
     assert!(
         stop.contains("let restarting = managed.runner.read().await.restart_requested;")
             && stop
@@ -3857,7 +3857,7 @@ fn every_stop_request_latches_its_time() {
     .replace("\r\n", "\n");
     let src = crate::source_scan::production_span(&src).to_string();
     for sig in [
-        "pub async fn stop_runner_by_id(",
+        "async fn stop_runner_as(",
         "pub async fn reap_stale_test_runners(",
     ] {
         let body: String = crate::source_scan::fn_body(&src, sig)
@@ -3945,7 +3945,7 @@ fn a_spawn_is_recorded_after_its_re_points_and_no_stop_or_exit_removes_its_entry
         "the spawn must be recorded before the exit monitor that stamps it is spawned"
     );
 
-    let stop = body_of("pub async fn stop_runner_by_id(");
+    let stop = body_of("async fn stop_runner_as(");
     assert!(
         !stop.contains("recent_spawns.write()"),
         "stop_runner_by_id must leave the spawn ring alone"
@@ -4475,7 +4475,7 @@ fn the_lifecycle_lock_spans_the_start_and_the_stop() {
         "only start_managed_runner's task runs the body"
     );
 
-    let stop = body_of("pub async fn stop_runner_by_id(");
+    let stop = body_of("async fn stop_runner_as(");
     assert_eq!(stop.matches(LOCK).count(), 1, "the stop takes it once");
     in_order(
         "stop_runner_by_id",
@@ -6327,7 +6327,7 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         &[
             "letcontainer_guard=",
             "Some(take_origin_main_container(state,managed,force,intent).await?)",
-            "stop_runner_by_id(state,runner_id,true,intent).await?;",
+            "stop_runner_as(state,runner_id,true,intent,StopCause::Restart).await?;",
             "primary_rebuild_from_origin_main(state,container).await?",
             "drop(container_guard);",
             "start_managed_runner(",
@@ -6362,9 +6362,13 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
         sig,
         &squeezed(body_of(sig)),
         &[
+            "letstop_before=managed.runner.read().await.stop_requested_at;",
             ".try_take(&container,PRIMARY_REBUILD_TAKER)",
             ".take_spawn_container_lock(&container,PRIMARY_REBUILD_TAKER)",
-            "crate::restart_readiness::enforce(",
+            "(runner.stop_requested_at,runner.restart_stop_at)",
+            "after_container_wait(stop_before,stop_after,restart_stop)",
+            "returnErr(e);",
+            "crate::restart_readiness::enforce(state,managed,crate::restart_readiness::GateAction::Restart,force,intent,)",
             "Ok(guard)",
         ],
     );
@@ -6387,6 +6391,81 @@ fn the_primary_rebuild_takes_its_spawn_container_before_the_stop_and_holds_it_th
             "crate::build_monitor::run_cargo_build_with_dir(",
         ],
     );
+}
+
+/// A primary rebuild that waited for its spawn container yields to a stop
+/// requested during the wait that no restart made, and only to one: a stop
+/// latched before the wait keeps its time and is the stopped runner the
+/// rebuild exists to bring back, and a restart's own stop is that restart's.
+#[test]
+fn a_stop_requested_while_a_primary_rebuild_waited_abandons_it() {
+    let t = |s: i64| chrono::DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap();
+    assert!(after_container_wait(None, None, None).is_ok());
+    assert!(after_container_wait(Some(t(1)), Some(t(1)), None).is_ok());
+    // A start during the wait cleared an earlier stop: nothing newer stands.
+    assert!(after_container_wait(Some(t(1)), None, None).is_ok());
+    assert!(matches!(
+        after_container_wait(None, Some(t(2)), None),
+        Err(SupervisorError::RebuildAbandoned(_))
+    ));
+    // Cleared by a start and stopped again during the wait.
+    assert!(after_container_wait(Some(t(1)), Some(t(2)), None).is_err());
+    // The primary rebuild ahead of it stopped the runner and released the
+    // container before its start, or failed its build.
+    assert!(after_container_wait(None, Some(t(2)), Some(t(2))).is_ok());
+    // A restart's mark from an earlier stop does not cover a newer one.
+    assert!(after_container_wait(Some(t(1)), Some(t(2)), Some(t(1))).is_err());
+}
+
+/// A restart's stop is marked in the same write that latches it, so no exit of
+/// the restart (a stop error, a cancellation) leaves it latched and unmarked
+/// for a primary rebuild queued on the spawn container to read.
+#[test]
+fn a_restarts_stop_is_marked_in_the_write_that_latches_it() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("process")
+            .join("manager.rs"),
+    )
+    .expect("read manager.rs")
+    .replace("\r\n", "\n");
+    let src = crate::source_scan::production_span(&src).to_string();
+    let body: String = crate::source_scan::code_only(
+        crate::source_scan::fn_body(&src, "async fn stop_runner_as(")
+            .expect("stop_runner_as exists"),
+    )
+    .split_whitespace()
+    .collect();
+    assert!(
+        body.contains(
+            "letmutrunner=managed.runner.write().await;\
+             runner.latch_stop_request(chrono::Utc::now());\
+             ifcause==StopCause::Restart{runner.mark_stop_as_restarts();}}"
+        ),
+        "stop_runner_as must mark a restart's stop inside the write that latches it"
+    );
+    let code: String = crate::source_scan::code_only(&src)
+        .split_whitespace()
+        .collect();
+    assert_eq!(
+        code.matches("StopCause::Restart").count(),
+        2,
+        "StopCause::Restart is named only by stop_runner_as's mark and restart_after_gate's stop"
+    );
+}
+
+/// A start clears a restart's mark with the stop it marked, and the mark names
+/// the stop latched when it was made.
+#[test]
+fn a_restarts_stop_mark_follows_the_latch() {
+    let t = |s: i64| chrono::DateTime::from_timestamp(1_800_000_000 + s, 0).unwrap();
+    let mut runner = crate::state::RunnerState::new();
+    runner.latch_stop_request(t(1));
+    runner.mark_stop_as_restarts();
+    assert_eq!(runner.restart_stop_at, Some(t(1)));
+    runner.clear_stop_request();
+    assert_eq!(runner.restart_stop_at, None);
 }
 
 /// `rebuild_and_restart_by_id` cannot run in a unit test, since it builds. Its start
@@ -6441,7 +6520,7 @@ fn both_restarts_read_what_their_stop_removed_before_their_rebuild() {
     in_order(
         "async fn restart_after_gate(",
         &[
-            "stop_runner_by_id(state,runner_id,true,intent).await?;",
+            "stop_runner_as(state,runner_id,true,intent,StopCause::Restart).await?;",
             "removed_by_its_stop=stopped.removed_entry;",
             "primary_rebuild_from_origin_main(",
             "StartAs::Restart{removed_by_its_stop,}",
@@ -7772,8 +7851,8 @@ fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
     .expect("read manager.rs")
     .replace("\r\n", "\n");
     let src = crate::source_scan::production_span(&src).to_string();
-    let stop = crate::source_scan::fn_body(&src, "pub async fn stop_runner_by_id(")
-        .expect("stop_runner_by_id exists")
+    let stop = crate::source_scan::fn_body(&src, "async fn stop_runner_as(")
+        .expect("stop_runner_as exists")
         .to_string();
     assert!(stop.contains("let graceful_timeout = intent.graceful_stop_timeout();"));
     assert!(stop.contains("request_graceful_stop(state, port, &runner_name, intent).await;"));
@@ -7786,7 +7865,8 @@ fn stop_runner_by_id_sizes_its_wait_and_close_request_by_the_intent() {
     let after_gate = crate::source_scan::fn_body(&src, "async fn restart_after_gate(")
         .expect("restart_after_gate exists")
         .to_string();
-    assert!(after_gate.contains("stop_runner_by_id(state, runner_id, true, intent).await?;"));
+    assert!(after_gate
+        .contains("stop_runner_as(state, runner_id, true, intent, StopCause::Restart).await?;"));
 }
 
 /// Under a handoff the graceful wait ends on the PID being gone, never on the
@@ -7910,8 +7990,8 @@ fn stop_escalation_only_runs_kills_from_the_table() {
     .expect("read manager.rs")
     .replace("\r\n", "\n");
     let src = crate::source_scan::production_span(&src).to_string();
-    let stop = crate::source_scan::fn_body(&src, "pub async fn stop_runner_by_id(")
-        .expect("stop_runner_by_id exists")
+    let stop = crate::source_scan::fn_body(&src, "async fn stop_runner_as(")
+        .expect("stop_runner_as exists")
         .to_string();
     assert!(stop.contains("let kills = reap_kills(outcome, intent);"));
     assert!(stop.contains("run_reap_kill("));

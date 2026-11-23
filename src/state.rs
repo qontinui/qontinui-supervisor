@@ -886,6 +886,12 @@ pub struct RunnerState {
     /// monitor copies it onto the exited spawn's ring entry when it is dated
     /// at or before the exit ([`SpawnMarker::stop_requested_at`]).
     pub stop_requested_at: Option<DateTime<Utc>>,
+    /// The [`Self::stop_requested_at`] a restart read back right after its own
+    /// stop ([`Self::mark_stop_as_restarts`]), cleared with it by the next
+    /// start. A primary rebuild that waited for its spawn container reads it to
+    /// tell a stop another restart made, which that restart answers itself,
+    /// from one asked for while it waited.
+    pub restart_stop_at: Option<DateTime<Utc>>,
     pub pid: Option<u32>,
     /// When the API was last observed responding.
     ///
@@ -2301,6 +2307,7 @@ impl RunnerState {
             restart_latches: 0,
             stop_requested: false,
             stop_requested_at: None,
+            restart_stop_at: None,
             pid: None,
             last_seen_responding_at: None,
         }
@@ -2327,6 +2334,13 @@ impl RunnerState {
     pub fn clear_stop_request(&mut self) {
         self.stop_requested = false;
         self.stop_requested_at = None;
+        self.restart_stop_at = None;
+    }
+
+    /// Record the stop request now latched as a restart's own. Called by a
+    /// restart right after its stop returns; see [`Self::restart_stop_at`].
+    pub fn mark_stop_as_restarts(&mut self) {
+        self.restart_stop_at = self.stop_requested_at;
     }
 }
 

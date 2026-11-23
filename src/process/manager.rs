@@ -6697,6 +6697,30 @@ pub async fn stop_runner_by_id(
     force: bool,
     intent: CloseIntent,
 ) -> Result<StopOutcome, SupervisorError> {
+    stop_runner_as(state, runner_id, force, intent, StopCause::Request).await
+}
+
+/// Who asks for a stop, as [`stop_runner_as`] records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopCause {
+    /// Anything but a restart: an operator, a route, a sweep.
+    Request,
+    /// A restart's own stop, which the restart answers with its start. It is
+    /// marked ([`crate::state::RunnerState::mark_stop_as_restarts`]) in the
+    /// same write that latches it, so a primary rebuild queued on the spawn
+    /// container never reads it unmarked, whatever becomes of the restart.
+    Restart,
+}
+
+/// [`stop_runner_by_id`], told who asks. Only `restart_after_gate` passes
+/// [`StopCause::Restart`].
+async fn stop_runner_as(
+    state: &SharedState,
+    runner_id: &str,
+    force: bool,
+    intent: CloseIntent,
+    cause: StopCause,
+) -> Result<StopOutcome, SupervisorError> {
     let managed = state
         .get_runner(runner_id)
         .await
@@ -6735,6 +6759,9 @@ pub async fn stop_runner_by_id(
     {
         let mut runner = managed.runner.write().await;
         runner.latch_stop_request(chrono::Utc::now());
+        if cause == StopCause::Restart {
+            runner.mark_stop_as_restarts();
+        }
     }
 
     state
@@ -7931,6 +7958,10 @@ const PRIMARY_REBUILD_TAKER: &str = "the primary's origin/main rebuild";
 /// spawn-test's whole build, after which that verdict is stale: sessions may
 /// have started on the primary meanwhile. So the gate is asked again once the
 /// container is taken, before anything stops, and a refusal releases it.
+///
+/// A stop requested while the rebuild waited abandons it before that second
+/// ask ([`after_container_wait`]): the rebuild would otherwise start a runner
+/// that was asked to stop after the rebuild was.
 async fn take_origin_main_container(
     state: &SharedState,
     managed: &Arc<ManagedRunner>,
@@ -7939,6 +7970,7 @@ async fn take_origin_main_container(
 ) -> Result<crate::spawn_worktree::SpawnContainerGuard, SupervisorError> {
     let container =
         crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, "origin/main")?;
+    let stop_before = managed.runner.read().await.stop_requested_at;
     if let Ok(guard) = state
         .spawn_container_locks
         .try_take(&container, PRIMARY_REBUILD_TAKER)
@@ -7948,6 +7980,17 @@ async fn take_origin_main_container(
     let guard = state
         .take_spawn_container_lock(&container, PRIMARY_REBUILD_TAKER)
         .await;
+    let (stop_after, restart_stop) = {
+        let runner = managed.runner.read().await;
+        (runner.stop_requested_at, runner.restart_stop_at)
+    };
+    if let Err(e) = after_container_wait(stop_before, stop_after, restart_stop) {
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, e.to_string())
+            .await;
+        return Err(e);
+    }
     crate::restart_readiness::enforce(
         state,
         managed,
@@ -7957,6 +8000,42 @@ async fn take_origin_main_container(
     )
     .await?;
     Ok(guard)
+}
+
+/// Whether a primary rebuild that waited for its spawn container may go on to
+/// the gate, given the runner's stop-request time before and after the wait,
+/// and the one a restart marked as its own stop
+/// ([`RunnerState::restart_stop_at`]). A stop latched during the wait is newer
+/// than the rebuild request, so it wins: the rebuild is abandoned as a refusal
+/// and nothing is stopped or started.
+///
+/// Two stops do not abandon it. One already latched before the wait does not
+/// move the time ([`RunnerState::latch_stop_request`] keeps the earliest), and
+/// is the stopped runner this rebuild exists to bring back. One a restart made
+/// is that restart's to answer: the container may be held by another primary
+/// rebuild, which stops the runner and releases the container before its
+/// start, and if that rebuild fails, this one is what brings the runner back.
+///
+/// What it cannot see: a stop during the wait while an earlier stop is still
+/// latched (the time does not move), a stop during this rebuild's own build
+/// (the time names this rebuild's stop), and an operator stop latched before
+/// a restart's, which the restart's mark then covers.
+///
+/// [`RunnerState::restart_stop_at`]: crate::state::RunnerState::restart_stop_at
+/// [`RunnerState::latch_stop_request`]: crate::state::RunnerState::latch_stop_request
+fn after_container_wait(
+    stop_before: Option<chrono::DateTime<chrono::Utc>>,
+    stop_after: Option<chrono::DateTime<chrono::Utc>>,
+    restart_stop: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(), SupervisorError> {
+    if stop_after.is_some() && stop_after != stop_before && stop_after != restart_stop {
+        return Err(SupervisorError::RebuildAbandoned(
+            "primary rebuild abandoned: a stop that no restart made was requested while \
+             this rebuild waited for its spawn container"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// The stop → (build) → start body of [`restart_runner_by_id`], run only
@@ -8037,7 +8116,7 @@ async fn restart_after_gate(
         // `intent` rides along so a handoff restart's close-request carries
         // the handoff body and gets the extended graceful wait.
         *acted = true;
-        let stopped = stop_runner_by_id(state, runner_id, true, intent).await?;
+        let stopped = stop_runner_as(state, runner_id, true, intent, StopCause::Restart).await?;
         // Before anything that can be cancelled: the reap of a cancelled restart
         // reads it.
         stop_removed_entry.store(stopped.removed_entry, std::sync::atomic::Ordering::SeqCst);
