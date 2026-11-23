@@ -54,6 +54,10 @@ const MACHINE_LOCAL_ARTIFACTS: &[&str] = &[
     "agent-worktrees/",
     ".agent-worktrees/",
     ".coord-mcp-status",
+    // The runner's breadcrumb atomic-replace temp file
+    // (`coord_mcp::replace_breadcrumb`), left behind by a crash between its
+    // write and its rename; added runner-side beside `.coord-mcp-status`.
+    ".coord-mcp-status.tmp-*",
     // Added runner-side by `703123d50` ("exclude .claude/worktrees/ so a skill
     // worktree cannot pin a repo"). Already ignored here by the broader
     // `.claude/` entry, so only the roster lagged — which is precisely the

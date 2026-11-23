@@ -56,6 +56,9 @@ __pycache__/
 #                      provisioning was DEGRADED. Status, not source.
 #                      qontinui-claude-config promoted this one already
 #                      (its .gitignore line 30 on origin/main).
+#   .coord-mcp-status.tmp-*  that breadcrumb's atomic-replace temp file, which
+#                      a crash between the runner's write and its rename
+#                      leaves behind.
 #
 # Same rationale the `.mcp.json` entry above states for itself: the runner
 # writes these into `.git/info/exclude`, which is local-only and lost on a
@@ -68,3 +71,4 @@ __pycache__/
 # held this repo 26 commits behind main (see the `.claude/` entry above, #166).
 .agent-worktrees/
 .coord-mcp-status
+.coord-mcp-status.tmp-*
