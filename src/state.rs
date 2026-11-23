@@ -886,12 +886,20 @@ pub struct RunnerState {
     /// monitor copies it onto the exited spawn's ring entry when it is dated
     /// at or before the exit ([`SpawnMarker::stop_requested_at`]).
     pub stop_requested_at: Option<DateTime<Utc>>,
-    /// The [`Self::stop_requested_at`] a restart read back right after its own
-    /// stop ([`Self::mark_stop_as_restarts`]), cleared with it by the next
-    /// start. A primary rebuild that waited for its spawn container reads it to
+    /// The [`Self::stop_requested_at`] a restart's own stop set
+    /// ([`Self::latch_restart_stop_request`]), cleared with it by the next
+    /// start. `None` when the restart's stop found an earlier stop latched. A primary rebuild that waited for its spawn container reads it to
     /// tell a stop another restart made, which that restart answers itself,
     /// from one asked for while it waited.
     pub restart_stop_at: Option<DateTime<Utc>>,
+    /// How many stops anything but a restart has asked of this runner since
+    /// the supervisor started tracking it: counted when the stop is asked,
+    /// before its readiness probe and its wait for the lifecycle lock, and
+    /// never decreased (a refused stop still counts). A primary rebuild that
+    /// waited for its spawn container compares it with the count it read
+    /// before the wait, because [`Self::stop_requested_at`] dates a stop only
+    /// once it latches, seconds after it was asked.
+    pub stop_asks: u64,
     pub pid: Option<u32>,
     /// When the API was last observed responding.
     ///
@@ -2315,6 +2323,7 @@ impl RunnerState {
             stop_requested: false,
             stop_requested_at: None,
             restart_stop_at: None,
+            stop_asks: 0,
             pid: None,
             last_seen_responding_at: None,
         }
@@ -2344,10 +2353,19 @@ impl RunnerState {
         self.restart_stop_at = None;
     }
 
-    /// Record the stop request now latched as a restart's own. Called by a
-    /// restart right after its stop returns; see [`Self::restart_stop_at`].
-    pub fn mark_stop_as_restarts(&mut self) {
-        self.restart_stop_at = self.stop_requested_at;
+    /// Latch a restart's own stop request ([`Self::latch_stop_request`]), and
+    /// record its time as the restart's ([`Self::restart_stop_at`]) only when
+    /// this request is the one that set it. A stop already latched keeps its
+    /// time and is not the restart's: an operator's stop latched before the
+    /// restart's would otherwise be marked as the restart's, and a primary
+    /// rebuild queued on the spawn container would read it as a stop the
+    /// restart answers, and go on to start a runner the operator stopped.
+    pub fn latch_restart_stop_request(&mut self, now: DateTime<Utc>) {
+        let sets_the_time = self.stop_requested_at.is_none();
+        self.latch_stop_request(now);
+        if sets_the_time {
+            self.restart_stop_at = self.stop_requested_at;
+        }
     }
 }
 
