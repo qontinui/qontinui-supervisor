@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-runner-client"
-version = "0.2.13"
+version = "0.3.1"
 dependencies = [
  "qontinui-types",
  "reqwest",
@@ -2766,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "qontinui-types"
-version = "5.0.0"
+version = "5.0.1"
 dependencies = [
  "base64",
  "chrono",
