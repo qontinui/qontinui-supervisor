@@ -8,16 +8,16 @@ elements, and asserts expected state via first-class ui_bridge steps.
 Prerequisites:
   - Web frontend running at http://localhost:3001
   - Browser tab open on the frontend (UI Bridge requires WebSocket connection)
-  - Runner running at http://localhost:9876 (for unified workflow seeding)
-  - Supervisor running at http://localhost:9875 (for eval prompt seeding)
+  - Runner running at http://127.0.0.1:9876 (for unified workflow seeding)
+  - Supervisor running at http://127.0.0.1:9875 (for eval prompt seeding)
 
 Usage: python scripts/seed_ui_bridge_ground_truth.py
 """
 import json
 import urllib.request
 
-RUNNER = "http://localhost:9876"
-SUPERVISOR = "http://localhost:9875"
+RUNNER = "http://127.0.0.1:9876"
+SUPERVISOR = "http://127.0.0.1:9875"
 
 
 # ============================================================================

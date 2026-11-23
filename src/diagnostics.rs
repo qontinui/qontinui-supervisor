@@ -360,8 +360,11 @@ pub enum ServingEvent {
     /// watchdog stands down for a runner whose `running` follows the probe.
     NeverBoundSinceSpawn,
     /// The census found zero live `claude` sessions and the restart was
-    /// issued. The only irreversible event in the set.
+    /// issued. Irreversible.
     RestartTaken,
+    /// The first-healthy watchdog killed a spawn that gave it no answer within its
+    /// budget. Irreversible. A crash-watchdog-armed runner then reads this as a crash.
+    FirstHealthyKill,
     /// The census (or the runner's own verdict) counted live sessions, so the
     /// restart was refused. The `census` payload names them.
     RestartRefusedSessionsLive,
@@ -375,6 +378,11 @@ pub enum ServingEvent {
 }
 
 impl ServingEvent {
+    /// Whether this event reports an act that cannot be undone.
+    pub fn is_irreversible(&self) -> bool {
+        matches!(self, Self::RestartTaken | Self::FirstHealthyKill)
+    }
+
     /// The snake_case wire token — identical to the serde rename.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -383,6 +391,7 @@ impl ServingEvent {
             Self::NeverAnsweredSinceSpawn => "never_answered_since_spawn",
             Self::NeverBoundSinceSpawn => "never_bound_since_spawn",
             Self::RestartTaken => "restart_taken",
+            Self::FirstHealthyKill => "first_healthy_kill",
             Self::RestartRefusedSessionsLive => "restart_refused_sessions_live",
             Self::RestartFailed => "restart_failed",
             Self::Disarmed => "disarmed",
@@ -837,6 +846,7 @@ mod tests {
                 "never_bound_since_spawn",
             ),
             (ServingEvent::RestartTaken, "restart_taken"),
+            (ServingEvent::FirstHealthyKill, "first_healthy_kill"),
             (
                 ServingEvent::RestartRefusedSessionsLive,
                 "restart_refused_sessions_live",

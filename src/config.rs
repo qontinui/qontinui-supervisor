@@ -97,6 +97,31 @@ pub enum AmbientTargetDir {
     Ignore,
 }
 
+/// Whether [`crate::state::SupervisorState::new`] takes its `boot_id` from the
+/// persisted `boot.id` file, creating that file if it is absent, or mints one that
+/// lives only in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AmbientBootId {
+    /// The platform's `qontinui-supervisor/boot.id`. Production.
+    Read,
+    /// A fresh id, with no read and no write. What
+    /// [`SupervisorConfig::from_args`] picks in a unit-test build, so a test state
+    /// neither adopts a live supervisor's id nor creates the file that a supervisor
+    /// started later on the same box would adopt as its own.
+    ///
+    /// An integration test under `tests/` links the library without `cfg(test)`,
+    /// so `from_args` gives it `Read`: it builds a struct literal that sets
+    /// `Ignore` instead, and `tests::no_test_config_reads_the_ambient_boot_id`
+    /// holds that.
+    Ignore,
+    /// This file, as `Read` treats the platform's. How a test proves the state
+    /// reads the config. Not `#[cfg(test)]`, so an integration test can reach it
+    /// too; production never builds it, which the binary's own copy of this module
+    /// would flag.
+    #[allow(dead_code)]
+    At(PathBuf),
+}
+
 /// Whether and where the supervisor reaches coord — every path that does: the
 /// dev-action client (the expectations GET at every mint,
 /// `dev_action::prepare_action`, and the attribution watcher's snapshot POST),
@@ -363,6 +388,10 @@ pub struct SupervisorConfig {
     /// would give an integration test `Read`, so one sets `Ignore` in a struct
     /// literal.
     pub ambient_coord: AmbientCoord,
+    /// Where the state's `boot_id` comes from ([`AmbientBootId`]): `Read` in
+    /// production, `Ignore` in a unit-test build. [`Self::from_args`] would give
+    /// an integration test `Read`, so one sets `Ignore` in a struct literal.
+    pub ambient_boot_id: AmbientBootId,
 }
 
 /// Configuration for the parallel cargo build pool.
@@ -1186,11 +1215,11 @@ pub fn resolve_model_id(provider: &str, model_key: &str) -> Option<String> {
 }
 
 impl SupervisorConfig {
-    /// Build the config from the command line. `ambient_target_dir` and
-    /// `ambient_coord` are `Ignore` in a unit-test build and `Read` everywhere
-    /// else, an integration test under `tests/` included, which is why no file
-    /// there calls this (see [`AmbientTargetDir::Ignore`] and
-    /// [`AmbientCoord::Ignore`]).
+    /// Build the config from the command line. `ambient_target_dir`,
+    /// `ambient_coord` and `ambient_boot_id` are `Ignore` in a unit-test build and
+    /// `Read` everywhere else, an integration test under `tests/` included, which
+    /// is why no file there calls this (see [`AmbientTargetDir::Ignore`],
+    /// [`AmbientCoord::Ignore`] and [`AmbientBootId::Ignore`]).
     pub fn from_args(args: CliArgs) -> Self {
         let auto_start = args.auto_start || args.watchdog;
         let dev_logs_dir = args
@@ -1258,6 +1287,11 @@ impl SupervisorConfig {
                 AmbientCoord::Ignore
             } else {
                 AmbientCoord::Read
+            },
+            ambient_boot_id: if cfg!(test) {
+                AmbientBootId::Ignore
+            } else {
+                AmbientBootId::Read
             },
         };
         config.build_pool =
@@ -1842,6 +1876,9 @@ mod tests {
 
     #[test]
     fn test_memory_guard_resolvers_fall_back_to_defaults() {
+        // A test driving a real build switches these floors off while it holds
+        // this lock; reading them here without it would race that window.
+        let _env = crate::test_env::BUILD_GUARD_ENV.blocking_lock();
         // Only assert the no-override path when the env is genuinely unset —
         // asserting unconditionally would fail for an operator who has set a
         // per-machine override, and reading an absent var as "default" is the
@@ -2224,7 +2261,7 @@ mod tests {
     }
 
     /// A `from_args` call, whitespace removed. An integration test links the
-    /// library without `cfg(test)`, so this call hands it both ambient `Read`s.
+    /// library without `cfg(test)`, so this call hands it every ambient `Read`.
     fn from_args_needle() -> Vec<String> {
         vec!["::from_args(".to_string()]
     }
@@ -2416,14 +2453,18 @@ mod tests {
     }
 
     /// Where `squeezed` initialises or assigns the `ambient_coord` field to an
-    /// expression naming the `Read` variant, however the path is qualified, as
-    /// byte offsets into its text. The expression ends at the next `,` or `;`,
-    /// so `from_args`' `if cfg!(test) { … } else { … }` counts as one, and a
-    /// bare mention of the variant passed as a value (the resolver's own tests)
-    /// does not.
+    /// expression naming the `Read` variant. See [`ambient_read_sites`].
     fn ambient_coord_read_sites(squeezed: &Squeezed) -> Vec<usize> {
-        let field = "ambient_coord";
-        let read = format!("AmbientCoord::{}", "Read");
+        ambient_read_sites(squeezed, "ambient_coord", "AmbientCoord")
+    }
+
+    /// Where `squeezed` initialises or assigns `field` to an expression naming the
+    /// `Read` variant of `ambient`, however the path is qualified, as byte offsets
+    /// into its text. The expression ends at the next `,` or `;`, so `from_args`'
+    /// `if cfg!(test) { … } else { … }` counts as one, and a bare mention of the
+    /// variant passed as a value (the resolver's own tests) does not.
+    fn ambient_read_sites(squeezed: &Squeezed, field: &str, ambient: &str) -> Vec<usize> {
+        let read = format!("{ambient}::{}", "Read");
         let mut at = Vec::new();
         for bind in [":", "="] {
             let needle = format!("{field}{bind}");
@@ -2437,6 +2478,85 @@ mod tests {
         }
         at.sort_unstable();
         at
+    }
+
+    #[test]
+    fn a_test_build_reads_no_ambient_boot_id() {
+        let config = SupervisorConfig::from_args(make_test_args(false, false));
+        assert_eq!(config.ambient_boot_id, AmbientBootId::Ignore);
+    }
+
+    #[test]
+    fn no_test_config_reads_the_ambient_boot_id() {
+        // `AmbientBootId::Read` in a test config would read, and on a box with no
+        // supervisor create, the real `boot.id`. The one field init that names the
+        // variant is `from_args`' production arm. Whether a file under `tests/`
+        // calls `from_args` is `no_test_config_reads_the_ambient_coord`'s to fail.
+        let (field, ambient) = ("ambient_boot_id", "AmbientBootId");
+        let read = format!("{ambient}::{}", "Read");
+        for flagged in [
+            format!("SupervisorConfig {{ {field}: crate::config::{read} }};"),
+            format!("{field}: qontinui_supervisor::config::{read},"),
+            format!("config.{field} = {read};"),
+        ] {
+            assert_eq!(
+                ambient_read_sites(&Squeezed::new(&flagged), field, ambient).len(),
+                1,
+                "{flagged}"
+            );
+        }
+        for clean in [
+            format!("resolve_boot_id({read}, &path)"),
+            format!("{field}: {ambient}::Ignore,\nlet a = {read};"),
+            format!("pub {field}: {ambient},"),
+            format!("{field}: {ambient}::At(root.path().join(\"boot.id\")),"),
+        ] {
+            assert_eq!(
+                ambient_read_sites(&Squeezed::new(&clean), field, ambient),
+                Vec::<usize>::new(),
+                "{clean}"
+            );
+        }
+
+        let config_rs = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("config.rs");
+        let mut outside_from_args = Vec::new();
+        let mut inside_from_args = 0usize;
+        for path in crate_sources() {
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
+            let squeezed = Squeezed::new(&source);
+            let from_args = (path == config_rs).then(|| from_args_span(&squeezed));
+            for at in ambient_read_sites(&squeezed, field, ambient) {
+                if from_args.as_ref().is_some_and(|s| s.contains(&at)) {
+                    inside_from_args += 1;
+                } else {
+                    outside_from_args.push(format!("{}:{}", path.display(), squeezed.lines[at]));
+                }
+            }
+        }
+        assert_eq!(
+            inside_from_args, 1,
+            "`from_args` must pick the persisted boot id for production exactly once"
+        );
+        assert!(
+            outside_from_args.is_empty(),
+            "these configs touch the real boot.id; name `{ambient}::Ignore`:\n  {}",
+            outside_from_args.join("\n  ")
+        );
+    }
+
+    /// The byte range of `from_args` in a squeezed `config.rs`.
+    fn from_args_span(squeezed: &Squeezed) -> std::ops::Range<usize> {
+        let start = squeezed
+            .text
+            .find("pubfnfrom_args(")
+            .expect("config.rs defines from_args");
+        let len = squeezed.text[start + 1..]
+            .find("pubfn")
+            .expect("a function follows from_args");
+        start..start + 1 + len
     }
 
     #[test]
@@ -2501,18 +2621,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}"));
             files_scanned += 1;
             let squeezed = Squeezed::new(&source);
-            let from_args_span = (path == config_rs).then(|| {
-                let start = squeezed
-                    .text
-                    .find("pubfnfrom_args(")
-                    .expect("config.rs defines from_args");
-                let len = squeezed.text[start + 1..]
-                    .find("pubfn")
-                    .expect("a function follows from_args");
-                start..start + 1 + len
-            });
+            let from_args = (path == config_rs).then(|| from_args_span(&squeezed));
             for at in ambient_coord_read_sites(&squeezed) {
-                if from_args_span.as_ref().is_some_and(|s| s.contains(&at)) {
+                if from_args.as_ref().is_some_and(|s| s.contains(&at)) {
                     inside_from_args += 1;
                 } else {
                     outside_from_args.push(format!("{}:{}", path.display(), squeezed.lines[at]));

@@ -100,10 +100,15 @@ pub fn unhealthy_after_start_reason(
 /// the runner started, stopped or removed since the exit it answers),
 /// [`SupervisorError::ShuttingDown`] (a start arrived after the shutdown latched),
 /// [`SupervisorError::SelfRestartRefused`] (a self-restart that would die with its unit),
+/// [`SupervisorError::RebuildAbandoned`] (a primary rebuild a stop overtook while it
+/// waited for its spawn container; one abandoned after its stop or build ran is
+/// marked [`SupervisorError::AfterAct`] and reads `Errored`),
 /// [`SupervisorError::UnverifiedExe`] (the exe a start resolved has no identity),
 /// [`SupervisorError::NoDisplay`] (a Linux start has no display),
 /// [`SupervisorError::PortHeldByLiveRunner`] (a live runner holds the port),
-/// [`SupervisorError::BuildPoolFull`] (the pool was full under `no-wait`) and
+/// [`SupervisorError::BuildPoolFull`] (the pool was full under `no-wait`),
+/// [`SupervisorError::SpawnContainerBusy`] (another build held the spawn
+/// container under `no-wait`) and
 /// [`SupervisorError::InsufficientDisk`] (the disk guard refused the build).
 /// Each refuses the step it guards before that step has started a process or a
 /// build, which is what `Refused` asserts: nothing ran. That holds for a start
@@ -131,10 +136,12 @@ pub fn run_result_for(err: &SupervisorError) -> ActionRunResult {
         | SupervisorError::StartSuperseded(_)
         | SupervisorError::ShuttingDown(_)
         | SupervisorError::SelfRestartRefused(_)
+        | SupervisorError::RebuildAbandoned(_)
         | SupervisorError::UnverifiedExe(_)
         | SupervisorError::NoDisplay(_)
         | SupervisorError::PortHeldByLiveRunner { .. }
         | SupervisorError::BuildPoolFull { .. }
+        | SupervisorError::SpawnContainerBusy { .. }
         | SupervisorError::InsufficientDisk { .. }) => ActionRunResult::Refused {
             reason: e.to_string(),
         },
@@ -191,7 +198,8 @@ pub fn start_verdict(probe: SyncProbe) -> StartVerdict {
 ///   checked, and the health wait decides ([`start_verdict`]).
 /// - Any other status is `Errored`, carrying the body's `error` token
 ///   (`runner_died_during_startup`, `runner_started_but_unresponsive`,
-///   `frontend_dist_missing`, `frontend_stale`, the paired-profile failure).
+///   `frontend_dist_missing`, `frontend_build_tree_removed`, `frontend_stale`,
+///   the paired-profile failure).
 /// - An `Err` is [`run_result_for`]'s: `Refused` when it provably ran nothing,
 ///   else `Errored`, `Timeout` and `Process` included: `Timeout` has three raise
 ///   sites (the queue watcher, the cargo timeout, the prewarm) that one variant
@@ -393,6 +401,10 @@ mod tests {
                 detail: "unverified".to_string(),
             })),
             SupervisorError::PortHeldByLiveRunner { port: 9877, pid: 1 },
+            SupervisorError::SpawnContainerBusy {
+                container: "/ws/.spawn-origin_main".to_string(),
+                holder: Some("spawn-test test-1".to_string()),
+            },
         ]
     }
 
@@ -583,6 +595,11 @@ mod tests {
     /// the first date, and then reads it. Source level, for the same reason as the test
     /// above. It reads spellings, so it does not check which argument the date is
     /// passed as.
+    ///
+    /// The slow work it is checked against is the first that follows either door's
+    /// wait: resolving the exe the response reports (`exe_meta`). spawn-test reads its
+    /// frontend verdict before it starts the runner, so that is no longer after its
+    /// wait.
     #[test]
     fn a_spawn_doors_wait_dates_its_answer() {
         fn squeezed(text: &str) -> String {
@@ -593,18 +610,20 @@ mod tests {
         }
 
         let src = include_str!("../routes/runners.rs").replace("\r\n", "\n");
-        for (signature, first_check, stamp, stamps) in [
+        for (signature, first_check, stamp, stamps, slow_work) in [
             (
                 "async fn execute_spawn_build_inner(",
                 "probe_runner_health(",
                 "side.answered_at.get_or_insert_with(chrono::Utc::now);",
                 2,
+                "letexe_meta=",
             ),
             (
                 "async fn spawn_named_inner(",
                 "client.get(&health_url)",
                 "answered_at.get_or_insert_with(chrono::Utc::now);",
                 1,
+                "letexe_meta=",
             ),
         ] {
             let body = squeezed(crate::source_scan::fn_body(&src, signature).expect(signature));
@@ -618,9 +637,7 @@ mod tests {
                     && body.find("client.get(&health_url)").expect("its wait") < last,
                 "{signature} must date an answer it has, not one it is waiting for"
             );
-            let slow_work = body
-                .find("resolve_frontend_stale_for_spawn(")
-                .expect("the slow work after the wait");
+            let slow_work = body.find(slow_work).expect("the slow work after the wait");
             assert!(
                 last < slow_work,
                 "{signature} must date its answer before the slow work after its wait"
@@ -784,6 +801,7 @@ mod tests {
             (500, "runner_died_during_startup"),
             (502, "runner_started_but_unresponsive"),
             (503, "frontend_dist_missing"),
+            (503, "frontend_build_tree_removed"),
             (503, "frontend_stale"),
             (400, "profile_not_found"),
             (500, "profile_apply_failed"),

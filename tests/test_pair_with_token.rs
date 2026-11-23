@@ -69,6 +69,7 @@ fn test_config() -> SupervisorConfig {
         temp_runner_display: None,
         ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
         ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_boot_id: qontinui_supervisor::config::AmbientBootId::Ignore,
     }
 }
 
@@ -297,8 +298,10 @@ async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
     // which the stub command ignores. The stub exits non-zero, and we
     // assert the response carries the discriminator + exit_code + the
     // captured (empty) stderr.
-    let stub_path = pick_failing_stub();
     let tmp = tempfile::tempdir().expect("tempdir");
+    // Per-test private dir: a fixed path in the shared temp dir is rewritten
+    // by concurrent cargo runs (other worktrees), which races exec (ETXTBSY).
+    let stub_path = pick_failing_stub(tmp.path());
     let state = Arc::new(SupervisorState::new(test_config()));
     let app = build_app_copying_into(state, copy_root_in(tmp.path()));
     let (status, body) = post_json(
@@ -484,21 +487,21 @@ fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(windows)]
-fn pick_failing_stub() -> PathBuf {
+fn pick_failing_stub(dir: &std::path::Path) -> PathBuf {
     // On Windows there's no `/bin/false`. Use a small .bat file written to
     // a tempdir that exits with code 2 regardless of args. We can't use
     // `cmd /c exit 2` directly as the override because tokio's Command
     // expects a binary, not a shell built-in (it would try to exec
     // "/bin/cmd" or similar).
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.cmd");
+    let tmp = dir.join("failing_stub.cmd");
     std::fs::write(&tmp, b"@exit /b 2\r\n").expect("write stub");
     tmp
 }
 
 #[cfg(not(windows))]
-fn pick_failing_stub() -> PathBuf {
+fn pick_failing_stub(dir: &std::path::Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.sh");
+    let tmp = dir.join("failing_stub.sh");
     std::fs::write(&tmp, b"#!/bin/sh\nexit 2\n").expect("write stub");
     let mut perms = std::fs::metadata(&tmp).expect("metadata").permissions();
     perms.set_mode(0o755);

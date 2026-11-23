@@ -842,6 +842,7 @@ impl NormOrigin {
 mod unit_tests {
     use super::*;
     use axum::http::HeaderValue;
+    use std::collections::BTreeSet;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -929,37 +930,37 @@ mod unit_tests {
         assert!(!ok("127.0.0.1.evil.example:9875"));
     }
 
-    /// Every route `build_router` registers (in `server.rs` and the routers it
-    /// merges) has a first segment in [`API_SEGMENTS`] or
-    /// [`SHARED_SPA_SEGMENTS`], so a new API prefix cannot silently become
-    /// reachable by a cross-site navigation. And no dashboard client route is
-    /// an API segment, so deep links keep working.
+    /// The router sources, as (module name as `crate::routes::<name>`,
+    /// source). One list, so the scan and the merge allowlist cannot drift.
+    const SCANNED_ROUTERS: &[(&str, &str)] = &[
+        ("server", include_str!("server.rs")),
+        ("velocity", include_str!("routes/velocity.rs")),
+        ("evaluation", include_str!("routes/evaluation.rs")),
+        ("velocity_tests", include_str!("routes/velocity_tests.rs")),
+        (
+            "velocity_improvement",
+            include_str!("routes/velocity_improvement.rs"),
+        ),
+        ("dev_endpoints", include_str!("routes/dev_endpoints.rs")),
+        ("dashboard", include_str!("routes/dashboard.rs")),
+    ];
+
+    /// Every literal route path `build_router` registers — `server.rs` and the
+    /// routers it merges, closed over `.merge(` — normalised by
+    /// [`normalise_path`].
     ///
-    /// The scan reads only the sources in [`SCANNED_ROUTERS`], so it also
-    /// checks — in every one of them, not just `server.rs` — that no route
-    /// reaches the router by a path it cannot read: a `.merge(` of anything
-    /// but another scanned module, a non-literal `.route(` path, or one of the
-    /// forbidden service/nest registrations.
-    #[test]
-    fn api_segments_cover_every_registered_route() {
-        /// The router sources, as (module name as `crate::routes::<name>`,
-        /// source). One list, so the scan and the merge allowlist cannot drift.
-        const SCANNED_ROUTERS: &[(&str, &str)] = &[
-            ("server", include_str!("server.rs")),
-            ("velocity", include_str!("routes/velocity.rs")),
-            ("evaluation", include_str!("routes/evaluation.rs")),
-            ("velocity_tests", include_str!("routes/velocity_tests.rs")),
-            (
-                "velocity_improvement",
-                include_str!("routes/velocity_improvement.rs"),
-            ),
-            ("dev_endpoints", include_str!("routes/dev_endpoints.rs")),
-            ("dashboard", include_str!("routes/dashboard.rs")),
-        ];
-        let sources: Vec<&str> = SCANNED_ROUTERS.iter().map(|(_, src)| *src).collect();
+    /// It also checks, in every scanned source and not just `server.rs`, that
+    /// no route reaches the router by a path this scan cannot read: a
+    /// `.merge(` of anything but another scanned module, a non-literal
+    /// `.route(` path, or one of the forbidden service/nest registrations. So
+    /// a caller can trust the set is the whole registered surface. Panics
+    /// (failing the calling test) when any of that does not hold, or when the
+    /// scan finds too few routes to be reading the real router.
+    fn registered_route_paths() -> BTreeSet<String> {
         let route = regex::Regex::new(r#"\.route\(\s*"([^"]+)""#).unwrap();
-        let mut seen = 0;
         let merge = regex::Regex::new(r"\.merge\(\s*crate::routes::(\w+)::").unwrap();
+        let mut paths = BTreeSet::new();
+        let mut seen = 0;
         for (name, src) in SCANNED_ROUTERS {
             // `.fallback(` is fine (dashboard.rs serves the SPA through one);
             // `.fallback_service(` is not, because a service fallback (a
@@ -1001,22 +1002,729 @@ mod unit_tests {
             );
             for cap in route.captures_iter(src) {
                 seen += 1;
-                let path = &cap[1];
-                if path == "/" {
-                    continue;
-                }
-                let first = path.trim_start_matches('/').split('/').next().unwrap();
-                assert!(
-                    API_SEGMENTS.contains(&first) || SHARED_SPA_SEGMENTS.contains(&first),
-                    "route {path}: add {first:?} to API_SEGMENTS (or SHARED_SPA_SEGMENTS if the dashboard has a client route under it)"
-                );
+                paths.insert(normalise_path(&cap[1]));
             }
         }
         assert!(seen > 100, "the scan found only {seen} routes");
         assert!(
-            sources[0].matches(".merge(").count() >= 6,
+            SCANNED_ROUTERS[0].1.matches(".merge(").count() >= 6,
             "server.rs no longer merges the stateless routers this scan expects"
         );
+        paths
+    }
+
+    /// `path` with every parameter segment (`{x}`, `:x`, or a URL segment
+    /// built from an interpolated `{x}`) written `{}`, and every wildcard
+    /// segment (`{*x}`, `*x`) written `*`.
+    fn normalise_path(path: &str) -> String {
+        path.split('/')
+            .map(|seg| {
+                if seg.starts_with("{*") || seg.starts_with('*') {
+                    "*"
+                } else if seg.starts_with(':') || (seg.contains('{') && seg.contains('}')) {
+                    "{}"
+                } else {
+                    seg
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Whether the normalised self-call `call` would reach the normalised
+    /// registered route `route`: segment by segment, a route's `{}` takes any
+    /// one segment and its `*` takes the rest. A call's own `{}` (an
+    /// interpolated segment) is taken to match any one segment, since its
+    /// runtime value is unknown here.
+    fn route_matches(route: &str, call: &str) -> bool {
+        let route: Vec<&str> = route.split('/').collect();
+        let call: Vec<&str> = call.split('/').collect();
+        for (i, seg) in route.iter().enumerate() {
+            if *seg == "*" {
+                return call.len() > i;
+            }
+            match call.get(i) {
+                Some(c) if c == seg || *seg == "{}" || *c == "{}" => {}
+                _ => return false,
+            }
+        }
+        route.len() == call.len()
+    }
+
+    /// The path of every request this production source sends to the
+    /// supervisor's OWN API, normalised by [`normalise_path`].
+    ///
+    /// A self-call is recognised in these shapes, all built on
+    /// [`crate::loopback::loopback_base`] with this supervisor's own port
+    /// (`config.port`, `state.config.port`, `self.config.port`,
+    /// `supervisor_port`, `self.supervisor_port`) as its argument, a
+    /// rustfmt-split `loopback_base(\n    port,\n)` included:
+    ///
+    /// - `format!("{}/…", loopback_base(<own port>))`;
+    /// - a local bound to that base, then either a `"{local}/…"` string
+    ///   literal or a positional `format!("{}/…", local)`. Only the rest of
+    ///   the block the binding sits in is read, up to a `let <local>` rebind
+    ///   at the binding's own depth, so a same-named local bound to another
+    ///   base elsewhere in the file is not taken for this one.
+    ///
+    /// Reach limits of the rebind cut: a shadow made by a pattern
+    /// (`if let Some(base) = …`, `match`, a destructuring `let (base, _)`)
+    /// or by a closure parameter (`|base| …`) is not seen, and the uses after
+    /// it are still read as this binding's. A `let` right after `if`,
+    /// `while` or `&&` is a condition binding that shadows only its own
+    /// block, so it is not a cut either. A `let <local>` inside a string or
+    /// comment is not a cut, but only because the block walk skips those; a
+    /// literal or comment shape the walk does not recognise (see
+    /// [`scope_end`]) would be matched. A multi-byte character outside a
+    /// recognised literal is stepped over byte by byte and never read as a
+    /// cut.
+    ///
+    /// Reach, so a green run is not over-read: a self-call spelled any other
+    /// way (a hard-coded `127.0.0.1:9875`, a base passed in from elsewhere) is
+    /// outside it. See [`normalise_call_path`] for how a path is read.
+    fn self_call_paths(production: &str) -> Vec<String> {
+        const OWN_PORT: &str = r"&?(?:(?:state|self)\.)?(?:config\.port|supervisor_port)\s*,?\s*\)";
+        const BASE: &str = r"(?:crate::)?(?:loopback::)?loopback_base\(\s*";
+        let binding =
+            regex::Regex::new(&format!(r"let\s+(?:mut\s+)?(\w+)\s*=\s*{BASE}{OWN_PORT}")).unwrap();
+        let inline = regex::Regex::new(&format!(
+            r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{BASE}{OWN_PORT}"#
+        ))
+        .unwrap();
+        let mut raw: Vec<String> = inline
+            .captures_iter(production)
+            .map(|c| c[1].to_string())
+            .collect();
+        for local in binding.captures_iter(production) {
+            let from = local.get(0).unwrap().end();
+            let name = regex::escape(&local[1]);
+            // A later `let <name>` at the binding's own brace depth shadows
+            // it, so its scope ends there. One inside an inner block shadows
+            // only that block and does not end it.
+            let rebind = regex::Regex::new(&format!(r"^let\s+(?:mut\s+)?{name}\b")).unwrap();
+            let bytes = production.as_bytes();
+            // The walk steps byte by byte, so `i` can sit inside a multi-byte
+            // character: compare bytes, and slice only through `get`.
+            let stop_at = |i: usize| {
+                bytes[i..].starts_with(b"let")
+                    // Defensive: `<ident ending in let> <name>` is not valid
+                    // Rust, so this check decides no real source today.
+                    && (i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_'))
+                    && !follows_a_condition(bytes, i)
+                    && production.get(i..).is_some_and(|rest| rebind.is_match(rest))
+            };
+            let scope = &production[from..scope_end(production, from, stop_at)];
+            let named = regex::Regex::new(&format!(r#""\{{{name}\}}(/[^"]*)""#)).unwrap();
+            let positional = regex::Regex::new(&format!(
+                r#"format!\(\s*"\{{\}}(/[^"]*)"\s*,\s*{name}\s*[,)]"#
+            ))
+            .unwrap();
+            raw.extend(named.captures_iter(scope).map(|c| c[1].to_string()));
+            raw.extend(positional.captures_iter(scope).map(|c| c[1].to_string()));
+        }
+        raw.iter().map(|p| normalise_call_path(p)).collect()
+    }
+
+    /// Whether the `let` at `i` is a condition binding (`if let`,
+    /// `while let`, `&& let`): the previous token, past whitespace, is `if`,
+    /// `while` or `&&`.
+    fn follows_a_condition(bytes: &[u8], i: usize) -> bool {
+        let before = &bytes[..i];
+        let end = before.len()
+            - before
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_whitespace())
+                .count();
+        let before = &before[..end];
+        if before.ends_with(b"&&") {
+            return true;
+        }
+        let word_len = before
+            .iter()
+            .rev()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_')
+            .count();
+        matches!(&before[end - word_len..], b"if" | b"while")
+    }
+
+    /// A self-call's path as [`route_matches`] reads it. A query string or
+    /// fragment is dropped. A `{…}` interpolation that FOLLOWS other
+    /// characters in a segment (`/x{query}`, `/runs{suffix}`) is dropped and
+    /// the path is read up to it: read as a parameter it would become `{}`,
+    /// which matches any segment and would let `/dev-start{q}` pass as
+    /// `/health`. A segment that is wholly an interpolation (`/{id}`) stays a
+    /// parameter.
+    ///
+    /// Reach limit: the value of a dropped interpolation is unknown here. It
+    /// is usually a query string or suffix, but it may carry further segments
+    /// (`{me}/runs{rest}` with `rest = "/a/b"`), and then the path checked is
+    /// only a prefix of the one sent.
+    fn normalise_call_path(path: &str) -> String {
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        let segments: Vec<&str> = path
+            .split('/')
+            .map(|seg| match seg.find('{') {
+                Some(at) if at > 0 => &seg[..at],
+                _ => seg,
+            })
+            .collect();
+        normalise_path(&segments.join("/"))
+    }
+
+    /// The byte offset where a scope that starts at `from` ends: the `}` that
+    /// closes the block containing `from`, or the first CODE position at the
+    /// same brace depth as `from` for which `stop_at(i)` holds, whichever
+    /// comes first (the end of `text` when neither does). Braces inside
+    /// string, raw string and char literals and inside comments are not
+    /// counted, and `stop_at` is never asked about a position inside one, so a
+    /// `"{base}/x"` format string does not move the count and a `let` in a
+    /// comment is not a stop.
+    ///
+    /// Reach limits: a nested block comment (`/* a /* b */ c */`) ends at its
+    /// first `*/`, and a char literal holding a multi-byte character (`'é'`)
+    /// is not recognised as one. Neither holds a brace in this crate today;
+    /// either could shift the count if one did.
+    fn scope_end(text: &str, from: usize, stop_at: impl Fn(usize) -> bool) -> usize {
+        let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let bytes = text.as_bytes();
+        let mut depth = 0usize;
+        let mut i = from;
+        while i < bytes.len() {
+            if depth == 0 && stop_at(i) {
+                return i;
+            }
+            match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    i = text[i..].find('\n').map_or(bytes.len(), |n| i + n);
+                    continue;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    i = text[i + 2..]
+                        .find("*/")
+                        .map_or(bytes.len(), |n| i + 2 + n + 2);
+                    continue;
+                }
+                // `r"…"`, `r#"…"#`, and the byte / C-string forms `br…`,
+                // `cr…`: the `r` starts a token, or follows a `b` / `c` that
+                // does.
+                b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#'))
+                    && (i == 0
+                        || !is_ident(bytes[i - 1])
+                        || (matches!(bytes[i - 1], b'b' | b'c')
+                            && (i == 1 || !is_ident(bytes[i - 2])))) =>
+                {
+                    let hashes = bytes[i + 1..].iter().take_while(|b| **b == b'#').count();
+                    let open = i + 1 + hashes;
+                    if bytes.get(open) == Some(&b'"') {
+                        let close = format!("\"{}", "#".repeat(hashes));
+                        i = text[open + 1..]
+                            .find(&close)
+                            .map_or(bytes.len(), |n| open + 1 + n + close.len());
+                        continue;
+                    }
+                }
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                }
+                b'\'' if bytes.get(i + 1) == Some(&b'\\') => {
+                    // `'\''`, `'\n'`, `'\u{7f}'`: the closing quote is at or
+                    // after the char following the backslash.
+                    i = text
+                        .get(i + 3..)
+                        .and_then(|t| t.find('\''))
+                        .map_or(bytes.len(), |n| i + 3 + n);
+                }
+                b'\'' if bytes.get(i + 2) == Some(&b'\'') => i += 2,
+                b'{' => depth += 1,
+                b'}' if depth == 0 => return i,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        bytes.len()
+    }
+
+    /// Every `.rs` file under `src/`, as (path relative to the crate, text).
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut out = Vec::new();
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .expect("source is readable")
+                        .replace("\r\n", "\n");
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    out.push((rel, text));
+                }
+            }
+        }
+        out
+    }
+
+    /// The self-calls in `sources` (as (name, production text)) whose path no
+    /// registered route answers, as `name: path` lines; and how many
+    /// self-calls were read in all.
+    fn unregistered_self_calls(
+        sources: &[(String, &str)],
+        routes: &BTreeSet<String>,
+    ) -> (Vec<String>, usize) {
+        let mut read = 0;
+        let mut dead = Vec::new();
+        for (name, production) in sources {
+            for call in self_call_paths(production) {
+                read += 1;
+                if !routes.iter().any(|r| route_matches(r, &call)) {
+                    dead.push(format!("{name}: {call}"));
+                }
+            }
+        }
+        (dead, read)
+    }
+
+    /// No production request the supervisor sends to its own API names a
+    /// route it does not register.
+    ///
+    /// Why: `velocity_improvement::restart_frontend` POSTed to
+    /// `/dev-start/frontend` for seven months after `c415c5f` deleted every
+    /// `/dev-start/*` route, and the dashboard showed "Restarting Frontend"
+    /// while nothing restarted (plan
+    /// `2026-11-17-supervisor-loopback-follow-ups-dead-dev-start-test-env-header-fragment-marker`).
+    /// Zero self-calls is the expected reading today, so the fixture tests
+    /// below are what prove this can fail. The `self-calls read: N, routes
+    /// registered: M` line is printed on every run, but cargo captures it on
+    /// a passing test: it is visible under `--nocapture` and in a failing
+    /// run's output, not on an ordinary green run. See [`self_call_paths`]
+    /// for what the scan recognises.
+    #[test]
+    fn supervisor_self_calls_name_registered_routes() {
+        let routes = registered_route_paths();
+        let files = crate_sources();
+        let sources: Vec<(String, &str)> = files
+            .iter()
+            .map(|(name, text)| (name.clone(), crate::source_scan::production_span(text)))
+            .collect();
+        let (dead, read) = unregistered_self_calls(&sources, &routes);
+        println!(
+            "self-calls read: {read}, routes registered: {}",
+            routes.len()
+        );
+        assert!(
+            files.len() > 50,
+            "read only {} sources under src/",
+            files.len()
+        );
+        assert!(
+            dead.is_empty(),
+            "supervisor self-calls to routes it does not register:\n{}",
+            dead.join("\n")
+        );
+    }
+
+    /// Dashboard client sources the census reads: the React client's API module
+    /// and the legacy static page.
+    const CLIENT_SOURCES: &[(&str, &str)] = &[
+        (
+            "frontend/src/lib/api.ts",
+            include_str!("../frontend/src/lib/api.ts"),
+        ),
+        (
+            "static/dashboard.html",
+            include_str!("../static/dashboard.html"),
+        ),
+    ];
+
+    /// Client paths the supervisor serves by a mechanism the route scan cannot
+    /// see (static assets, upgrades). Each entry carries its reason. Empty today.
+    const CLIENT_PATH_ALLOWLIST: &[(&str, &str)] = &[];
+
+    /// The path of every supervisor request a dashboard client source makes with
+    /// a string-literal path: the first argument of `fetchJson` / `fetchJSON` /
+    /// `postAction`, or of `fetch(` (optionally `BASE + '…'`). A template's
+    /// `${…}` segment is normalised like a route parameter; a query string, or
+    /// a `${…}` appended mid-segment, is cut off. Paths that do not start with
+    /// `new EventSource(BASE + '…')` is read too; `new WebSocket(url)` is not. Paths that do not start with
+    /// `/` (the runner's absolute URLs, `fetch(`${BASE}${path}`)`) are not
+    /// supervisor paths and are skipped. HTTP method is not checked.
+    fn client_paths(src: &str) -> Vec<String> {
+        let call = regex::Regex::new(
+            r#"(?:\bfetchJson|\bfetchJSON|\bpostAction)(?:<[^(]*?>)?\(\s*['"`](/[^'"`]*)|\b(?:fetch|new EventSource)\(\s*(?:BASE\s*\+\s*)?['"`](/[^'"`]*)"#,
+        )
+        .unwrap();
+        call.captures_iter(src)
+            .map(|c| {
+                let raw = c.get(1).or_else(|| c.get(2)).unwrap().as_str();
+                let mut cut = raw.len();
+                if let Some(i) = raw.find('?') {
+                    cut = cut.min(i);
+                }
+                if let Some(i) = raw.find("${") {
+                    if !raw[..i].ends_with('/') {
+                        cut = cut.min(i);
+                    }
+                }
+                normalise_path(&raw[..cut])
+            })
+            .collect()
+    }
+
+    /// Of `sources` (`(name, text)`), every client path that names no route in
+    /// `routes` and is not allowlisted, as `name: path` — and how many were read.
+    fn unregistered_client_paths(
+        sources: &[(&str, &str)],
+        routes: &BTreeSet<String>,
+    ) -> (Vec<String>, usize) {
+        let mut dead = Vec::new();
+        let mut read = 0;
+        for (name, text) in sources {
+            for path in client_paths(text) {
+                read += 1;
+                let allowed = CLIENT_PATH_ALLOWLIST
+                    .iter()
+                    .any(|(p, _)| route_matches(&normalise_path(p), &path));
+                if !allowed && !routes.iter().any(|r| route_matches(r, &path)) {
+                    dead.push(format!("{name}: {path}"));
+                }
+            }
+        }
+        (dead, read)
+    }
+
+    /// Every path the dashboard clients request is a route the supervisor
+    /// registers. `/dev-start/*` and `/workflow-loop/*` were removed on
+    /// 2026-04-06 (`c415c5f`) while the dashboard kept calling them, and the
+    /// client tests mocked `fetch`, so nothing reddened (plan
+    /// `2026-11-17-supervisor-dashboard-delete-dead-dev-start-panel-and-census-client-paths`).
+    /// The census can miss a path built another way, so it also fails on a
+    /// vacuous read.
+    #[test]
+    fn dashboard_client_paths_name_registered_routes() {
+        let routes = registered_route_paths();
+        let (dead, read) = unregistered_client_paths(CLIENT_SOURCES, &routes);
+        println!(
+            "client paths read: {read}, routes registered: {}",
+            routes.len()
+        );
+        assert!(read > 40, "read only {read} client paths");
+        assert!(
+            dead.is_empty(),
+            "dashboard calls routes the supervisor does not register:\n{}",
+            dead.join("\n")
+        );
+    }
+
+    #[test]
+    fn client_census_flags_a_dead_dev_start_call() {
+        let routes = registered_route_paths();
+        let src = "export const api = { devStartStatus: () =>\n  fetchJson<{ services: { name: string }[] }>('/dev-start/status'),\n  go: (a: string) => fetchJson<X>(`/dev-start/${a}`, { method: 'POST' }),\n  ok: () => fetchJson<Y>('/health'),\n};";
+        let (dead, read) = unregistered_client_paths(&[("fixture", src)], &routes);
+        assert_eq!(read, 3);
+        assert_eq!(
+            dead,
+            vec![
+                "fixture: /dev-start/status".to_string(),
+                "fixture: /dev-start/{}".to_string()
+            ]
+        );
+        let html = "fetch(BASE + '/workflow-loop/stop', { method: 'POST' }); postAction('/dev-start/all');";
+        let (dead, _) = unregistered_client_paths(&[("fixture.html", html)], &routes);
+        assert_eq!(dead.len(), 2, "{dead:?}");
+    }
+
+    /// The pre-deletion `restart_frontend` body, as it stood at `208b3f6`.
+    const OLD_RESTART_FRONTEND: &str = r#"
+async fn restart_frontend(state: &SharedState, restart_backend: bool) -> Result<(), String> {
+    let client = &state.http_client;
+    let supervisor = crate::loopback::loopback_base(state.config.port);
+
+    if restart_backend {
+        let _ = client
+            .post(format!("{supervisor}/dev-start/backend"))
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await;
+    }
+
+    let resp = client
+        .post(format!("{supervisor}/dev-start/frontend"))
+        .timeout(Duration::from_secs(180))
+        .send()
+        .await
+        .map_err(|e| format!("Frontend restart request failed: {}", e))?;
+    Ok(())
+}
+"#;
+
+    #[test]
+    fn self_call_guard_flags_the_old_dev_start_restart() {
+        let routes = registered_route_paths();
+        let (dead, read) = unregistered_self_calls(
+            &[("velocity_improvement.rs".to_string(), OLD_RESTART_FRONTEND)],
+            &routes,
+        );
+        assert_eq!(read, 2, "both /dev-start POSTs are self-calls");
+        for path in ["/dev-start/frontend", "/dev-start/backend"] {
+            assert!(
+                dead.contains(&format!("velocity_improvement.rs: {path}")),
+                "{path} not flagged: {dead:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_call_guard_passes_a_registered_route() {
+        let routes = registered_route_paths();
+        let bound = r#"
+fn probe(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{me}/health?verbose=1"));
+}
+"#;
+        let inline =
+            r#"let url = format!("{}/health", loopback::loopback_base(self.supervisor_port));"#;
+        let (dead, read) = unregistered_self_calls(
+            &[
+                ("bound.rs".to_string(), bound),
+                ("inline.rs".to_string(), inline),
+            ],
+            &routes,
+        );
+        assert_eq!(read, 2);
+        assert!(dead.is_empty(), "{dead:?}");
+        // A port that is not this supervisor's own is not a self-call.
+        let other_port =
+            r#"let url = format!("{}/dev-start/x", crate::loopback::loopback_base(port));"#;
+        let (_, other) = unregistered_self_calls(&[("port.rs".to_string(), other_port)], &routes);
+        assert_eq!(other, 0);
+    }
+
+    /// A1: a binding's `"{local}/…"` uses are read only in the rest of its own
+    /// block. Here the own-port `base` comes FIRST, and the later `runner`
+    /// takes a runner URL as a PARAMETER named `base` (no `let`, so no rebind
+    /// cut can hide it): a file-wide search, or a walk that over-counts an
+    /// opening brace, also reads `runner`'s `"{base}/runner-only"`.
+    ///
+    /// Between the binding and its use sit brace-bearing literals, a comment
+    /// and a lifetime, each of which the block walk must skip. A closing brace
+    /// that is counted ends the scope before the use (read 0); an opening
+    /// brace that is counted carries the scope into `runner` (read 2). The
+    /// closing literals come FIRST, so a walk that skipped no string at all
+    /// would still see an unmatched `}` rather than a `"}"` / `"{"` pair that
+    /// cancels out. Each raw literal holds a `"` before its `{`, so only real
+    /// raw-string handling (prefix included) skips it; a plain-string read
+    /// would end at that quote and count the brace.
+    #[test]
+    fn self_call_guard_reads_a_binding_only_in_its_own_block() {
+        let routes = registered_route_paths();
+        let src = r##"
+fn own(state: &SharedState) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let close = ('}', "}");
+    let open = ('{', "{", r#""{"#, br#""{"#, cr#"a"{"#); // {
+    fn f<'a>(s: &'a str) -> &'a str {
+        s
+    }
+    let _ = client.get(format!("{base}/health"));
+}
+
+fn runner(base: &str) {
+    let _ = client.get(format!("{base}/runner-only"));
+}
+"##;
+        let (dead, read) = unregistered_self_calls(&[("two_fns.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "only the own-port fn's /health is a self-call");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A later `let <name>` in the same block shadows the own-port binding, so
+    /// a use after it is not read as a self-call.
+    #[test]
+    fn self_call_guard_stops_at_a_shadowing_rebind() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, port: u16) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{base}/health"));
+    let mut base = crate::loopback::runner_loopback_base(port);
+    let _ = client.get(format!("{base}/runner-only"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("shadow.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "only the use before the rebind is a self-call");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A `let` after `if`, `while` or `&&` binds only inside its own block,
+    /// so the outer binding's later use is still read, and here flagged.
+    #[test]
+    fn self_call_guard_ignores_a_condition_binding() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, x: bool) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    if let base = other() {
+        drop(base);
+    }
+    while let base = other() {}
+    while x && let base = other() {}
+    let _ = client.post(format!("{base}/dead-route"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("cond.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "the outer use is still this binding's");
+        assert_eq!(dead, ["cond.rs: /dead-route"]);
+    }
+
+    /// A multi-byte char literal before the use: the walk steps through its
+    /// bytes, and the rebind check must not slice inside the character.
+    #[test]
+    fn self_call_guard_survives_a_multi_byte_char() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    let c = '…';
+    let _ = client.get(format!("{base}/health"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("utf8.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1);
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    /// A rebind inside an INNER block shadows only that block, so the outer
+    /// binding's later use is still read, and here flagged.
+    #[test]
+    fn self_call_guard_ignores_a_rebind_in_an_inner_block() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState, x: bool) {
+    let base = crate::loopback::loopback_base(state.config.port);
+    if x {
+        let base = other();
+    }
+    let _ = client.post(format!("{base}/dead-route"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("inner.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1, "the outer use is still this binding's");
+        assert_eq!(dead, ["inner.rs: /dead-route"]);
+    }
+
+    /// `let mut` binds an own-port base as well as `let` does.
+    #[test]
+    fn self_call_guard_reads_a_let_mut_binding() {
+        let routes = registered_route_paths();
+        let src = r#"
+fn f(state: &SharedState) {
+    let mut me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.post(format!("{me}/dev-start/frontend"));
+}
+"#;
+        let (dead, read) = unregistered_self_calls(&[("mut.rs".to_string(), src)], &routes);
+        assert_eq!(read, 1);
+        assert_eq!(dead, ["mut.rs: /dev-start/frontend"]);
+    }
+
+    /// A2: the positional, rustfmt-split and suffix-interpolated spellings are
+    /// all read, and an interpolated suffix does not become a parameter that
+    /// matches any route.
+    #[test]
+    fn self_call_guard_reads_every_recognised_spelling() {
+        let routes = registered_route_paths();
+        let read_one = |src: &str| {
+            let (dead, read) = unregistered_self_calls(&[("f.rs".to_string(), src)], &routes);
+            assert_eq!(read, 1, "expected one self-call in {src}");
+            dead
+        };
+        // Positional `format!("{}/…", local)`.
+        let positional = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.post(format!("{}/dev-start/frontend", me));
+}
+"#;
+        assert_eq!(read_one(positional), ["f.rs: /dev-start/frontend"]);
+        assert!(read_one(&positional.replace("/dev-start/frontend", "/health")).is_empty());
+        // A rustfmt-split argument list, trailing comma included.
+        let split = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(
+        state.config.port,
+    );
+    let _ = client.post(format!("{me}/dev-start/frontend"));
+}
+"#;
+        assert_eq!(read_one(split), ["f.rs: /dev-start/frontend"]);
+        // The inline form, rustfmt-split.
+        let split_inline = r#"
+fn f(state: &SharedState) {
+    let _ = client.post(format!(
+        "{}/dev-start/frontend",
+        crate::loopback::loopback_base(
+            state.config.port,
+        )
+    ));
+}
+"#;
+        assert_eq!(read_one(split_inline), ["f.rs: /dev-start/frontend"]);
+        // An interpolated suffix is not a wildcard segment.
+        let suffix = r#"
+fn f(state: &SharedState) {
+    let me = crate::loopback::loopback_base(state.config.port);
+    let _ = client.get(format!("{me}/dev-start{query}"));
+}
+"#;
+        assert_eq!(read_one(suffix), ["f.rs: /dev-start"]);
+        assert!(read_one(&suffix.replace("/dev-start{query}", "/health{query}")).is_empty());
+    }
+
+    #[test]
+    fn route_matching_reads_parameters_and_wildcards() {
+        assert!(route_matches(
+            "/eval/runs/{}",
+            &normalise_path("/eval/runs/{id}")
+        ));
+        assert!(route_matches("/eval/runs/{}", "/eval/runs/abc"));
+        assert!(!route_matches("/eval/runs/{}", "/eval/runs"));
+        assert!(!route_matches("/eval/runs/{}", "/eval/runs/a/b"));
+        assert!(route_matches(
+            &normalise_path("/assets/{*rest}"),
+            "/assets/a/b"
+        ));
+        assert!(!route_matches("/health", "/healthz"));
+    }
+
+    /// Every route `build_router` registers (in `server.rs` and the routers it
+    /// merges) has a first segment in [`API_SEGMENTS`] or
+    /// [`SHARED_SPA_SEGMENTS`], so a new API prefix cannot silently become
+    /// reachable by a cross-site navigation. And no dashboard client route is
+    /// an API segment, so deep links keep working.
+    ///
+    /// The routes come from [`registered_route_paths`], which reads only the
+    /// sources in [`SCANNED_ROUTERS`] and so also checks that no route reaches
+    /// the router by a path it cannot read.
+    #[test]
+    fn api_segments_cover_every_registered_route() {
+        for path in registered_route_paths() {
+            if path == "/" {
+                continue;
+            }
+            let first = path.trim_start_matches('/').split('/').next().unwrap();
+            assert!(
+                API_SEGMENTS.contains(&first) || SHARED_SPA_SEGMENTS.contains(&first),
+                "route {path}: add {first:?} to API_SEGMENTS (or SHARED_SPA_SEGMENTS if the dashboard has a client route under it)"
+            );
+        }
 
         let app = include_str!("../frontend/src/App.tsx");
         let client = regex::Regex::new(r#"<Route\s+path="/([^/"]*)"#).unwrap();
@@ -1314,6 +2022,7 @@ mod router_tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
         }
     }
 

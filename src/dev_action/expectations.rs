@@ -8,7 +8,7 @@
 //! initiating agent is warned *before* the action completes (e.g.
 //! "LEGACY_EXE_FALLBACK active — 3/5 of restarts from this state white-screened").
 //!
-//! # Wire contract (coord, already built, public, no JWT)
+//! # Wire contract (coord, public; the device bearer is observed, never required)
 //!
 //! `GET <coord_base>/coord/dev-actions/expectations?action_kind=<kind>&state_ids=A,B,C&top_k=100`
 //!
@@ -35,6 +35,18 @@
 //! timeout, NEVER panic, NEVER fail the action path. An empty array is the
 //! correct, honest default when coord is unreachable or has no history.
 //!
+//! # The device bearer
+//!
+//! The GET carries this box's coord device JWT when one resolves (plan
+//! `2026-10-27-bayesian-consequence-model-for-the-dev-twin` Phase 5).
+//! coord observes it and never requires it (that plan's Phase 4: route
+//! `dev_actions_expectations` of `coord_data_plane_auth_requests_total`), so
+//! an absent or refused bearer changes nothing a caller reads; what it buys is
+//! the evidence Phase 7 needs before the anonymous arms can close. The caller
+//! resolves it ([`resolve_expectations_bearer`]) under its own short budget,
+//! because the cascade's last rung is a runner mint whose timeout is longer
+//! than this whole fetch's.
+//!
 //! An empty array alone cannot say WHICH of those it is, and neither can the
 //! `risk: null` it folds to: coord being down and coord having no rows read
 //! alike, and the LKG restart guard fails open on both. So the fetch also keeps
@@ -47,6 +59,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::dev_action::policy::{assess_action_risk, ActionRisk};
+use crate::fleet::{DeviceSources, ResolvedBearer};
 
 /// Short timeout for the outbound coord expectations GET. This is on the
 /// synchronous ACK path, so it MUST be short — 2s, far below the 5s ingest
@@ -64,6 +77,43 @@ fn expectations_timeout() -> Duration {
 #[cfg(test)]
 fn expectations_timeout() -> Duration {
     crate::test_clock::poll_budget(Duration::from_secs(30))
+}
+
+/// How long [`resolve_expectations_bearer`] may spend on the device-JWT
+/// cascade before the fetch goes out anonymously. The seeded rungs are file
+/// and env reads; only the runner mint can take long, and its own timeout
+/// (3 s) is longer than the whole ACK-path fetch.
+pub const EXPECTATIONS_BEARER_BUDGET: Duration = Duration::from_millis(750);
+
+/// Source label when [`EXPECTATIONS_BEARER_BUDGET`] ran out before a bearer
+/// resolved: the fetch is sent anonymously, which coord still serves.
+pub const SOURCE_BUDGET_SPENT: &str =
+    "none (the device-JWT cascade outlasted the expectations bearer budget)";
+
+/// The device bearer for an expectations fetch to `base`, resolved through
+/// [`crate::fleet::resolve_device_bearer_cached_for`] (transport guard first) within
+/// [`EXPECTATIONS_BEARER_BUDGET`]. Never fails: no base, no credential, a
+/// withheld transport or a spent budget all resolve to no token with the
+/// reason as its label, and coord serves an anonymous fetch exactly as before.
+pub(crate) async fn resolve_expectations_bearer(
+    base: Option<&str>,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
+    let Some(base) = base else {
+        return (None, crate::fleet::SOURCE_NONE);
+    };
+    match tokio::time::timeout(
+        EXPECTATIONS_BEARER_BUDGET,
+        crate::fleet::resolve_device_bearer_cached_for(base, sources),
+    )
+    .await
+    {
+        Ok(resolved) => resolved,
+        Err(_) => {
+            debug!("dev_action::expectations: {SOURCE_BUDGET_SPENT}");
+            (None, SOURCE_BUDGET_SPENT)
+        }
+    }
 }
 
 /// `top_k` for the fetch the risk assessment reads: coord's ceiling (its
@@ -157,8 +207,13 @@ pub struct FetchedExpectations {
 /// "build"`); `state_ids` are the canonical SCREAMING_SNAKE active-state ids
 /// (the same `states_active` already stamped into the ACK). It takes no
 /// `top_k`: `expectations_url` always asks for [`RISK_FETCH_TOP_K`] rows.
+///
+/// `bearer` is attached when it carries a token
+/// ([`crate::fleet::attach_bearer_quietly`]); resolve it with
+/// [`resolve_expectations_bearer`].
 pub async fn fetch_expectations(
     base: Option<&str>,
+    bearer: ResolvedBearer,
     action_kind: &str,
     state_ids: &[&str],
 ) -> FetchedExpectations {
@@ -183,7 +238,10 @@ pub async fn fetch_expectations(
         }
     };
 
-    match client.get(&url).send().await {
+    match crate::fleet::attach_bearer_quietly(client.get(&url), bearer)
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {
@@ -258,6 +316,68 @@ fn ack_predicted(mut predicted: Vec<PredictedSignature>) -> Vec<PredictedSignatu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_bearer() -> ResolvedBearer {
+        (None, crate::fleet::SOURCE_NONE)
+    }
+
+    /// The fetch carries the device bearer it was handed, and a fetch handed
+    /// none sends no `Authorization` header at all (coord counts it
+    /// `anonymous`, never `invalid_token`).
+    #[tokio::test]
+    async fn the_fetch_sends_the_device_bearer_it_was_handed_and_none_without_one() {
+        let coord = crate::dev_action::test_support::serve_planted_answer(serde_json::json!({
+            "evidence_basis": "prior_only",
+            "expectations": [],
+        }))
+        .await;
+        let fetched = fetch_expectations(
+            Some(&coord.base),
+            (Some("header.payload.sig".to_string()), "test"),
+            "restart",
+            &[],
+        )
+        .await;
+        assert_eq!(fetched.basis.as_deref(), Some("prior_only"));
+        let fetched = fetch_expectations(Some(&coord.base), no_bearer(), "restart", &[]).await;
+        assert_eq!(fetched.basis.as_deref(), Some("prior_only"));
+        let auth: Vec<Option<String>> = coord.seen().into_iter().map(|r| r.authorization).collect();
+        assert_eq!(
+            auth,
+            [Some("Bearer header.payload.sig".to_string()), None],
+            "first fetch authed, second anonymous"
+        );
+    }
+
+    /// No base, or a base the transport guard refuses, resolves no bearer and
+    /// reads nothing: a cleartext non-loopback coord never gets the JWT.
+    /// Sources that read no identity (a planted or ignored coord) resolve no
+    /// bearer even over https, so the cache can never hand one this box's token.
+    #[tokio::test]
+    async fn sources_that_read_no_identity_resolve_no_bearer_over_https() {
+        for access in [
+            crate::config::AmbientCoord::Ignore,
+            crate::config::AmbientCoord::At("https://coord.example.com".into()),
+        ] {
+            let sources = DeviceSources::for_access(&access);
+            let (token, label) =
+                resolve_expectations_bearer(Some("https://coord.example.com"), &sources).await;
+            assert!(token.is_none(), "{access:?}");
+            assert_eq!(label, crate::fleet::SOURCE_NONE, "{access:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_base_or_a_cleartext_remote_base_resolves_no_bearer() {
+        let sources = DeviceSources::fixture("http://127.0.0.1:1");
+        let (token, label) = resolve_expectations_bearer(None, &sources).await;
+        assert!(token.is_none());
+        assert_eq!(label, crate::fleet::SOURCE_NONE);
+        let (token, label) =
+            resolve_expectations_bearer(Some("http://coord.example.com"), &sources).await;
+        assert!(token.is_none());
+        assert_eq!(label, crate::fleet::SOURCE_WITHHELD);
+    }
 
     /// `PredictedSignature` serializes with the EXACT field names the agent
     /// reads off the ACK's `predicted` array — `signature`, `posterior_mean`,
@@ -451,7 +571,7 @@ mod tests {
             "expectations": [],
         }))
         .await;
-        let fetched = fetch_expectations(Some(&coord.base), "restart", &[]).await;
+        let fetched = fetch_expectations(Some(&coord.base), no_bearer(), "restart", &[]).await;
         assert!(fetched.rows.is_empty());
         assert_eq!(fetched.basis.as_deref(), Some("re-accruing"));
     }
@@ -470,7 +590,7 @@ mod tests {
             }],
         }))
         .await;
-        let fetched = fetch_expectations(Some(&coord.base), "restart", &[]).await;
+        let fetched = fetch_expectations(Some(&coord.base), no_bearer(), "restart", &[]).await;
         assert_eq!(fetched.rows.len(), 1);
         assert_eq!(fetched.basis, None);
     }
@@ -481,7 +601,7 @@ mod tests {
     #[tokio::test]
     async fn no_answer_from_coord_has_no_basis() {
         use axum::http::StatusCode;
-        let fetched = fetch_expectations(None, "restart", &[]).await;
+        let fetched = fetch_expectations(None, no_bearer(), "restart", &[]).await;
         assert!(fetched.rows.is_empty());
         assert_eq!(fetched.basis, None);
 
@@ -503,7 +623,7 @@ mod tests {
         let garbled =
             crate::dev_action::test_support::serve_planted_status(StatusCode::OK, "not json").await;
         for base in [refused, failing, garbled] {
-            let fetched = fetch_expectations(Some(&base), "restart", &[]).await;
+            let fetched = fetch_expectations(Some(&base), no_bearer(), "restart", &[]).await;
             assert!(fetched.rows.is_empty(), "{base}");
             assert_eq!(fetched.basis, None, "{base}");
         }

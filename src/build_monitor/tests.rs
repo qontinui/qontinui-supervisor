@@ -153,6 +153,11 @@ fn only_lock_waits_count_as_queue_time() {
         "a running cargo build is WORK, not queue time — this is the arm whose \
              timeout abandoned live compiles"
     );
+    assert!(
+        !BuildPhase::SlotHeld.is_queue_wait(),
+        "a build holding its permit is not waiting for one — reading it as a slot \
+             wait 504'd zero-budget spawns that had a free slot"
+    );
 }
 
 /// A timeout must never trigger the poisoned-slot self-heal: wiping the
@@ -244,6 +249,7 @@ fn build_phase_round_trips_and_maps_to_message() {
         BuildPhase::AwaitingNpmLock,
         BuildPhase::BuildingFrontend,
         BuildPhase::Compiling,
+        BuildPhase::SlotHeld,
     ] {
         // u8 round-trip.
         assert_eq!(BuildPhase::from_u8(phase.as_u8()), phase);
@@ -278,6 +284,36 @@ fn build_phase_round_trips_and_maps_to_message() {
         !compile_msg.contains("for a cargo build slot"),
         "{compile_msg}"
     );
+
+    // SlotHeld says the slot was held, never that it was waited for.
+    let held_msg = BuildPhase::SlotHeld.timeout_message(20, 1);
+    assert!(held_msg.contains("preparing the build"), "{held_msg}");
+    assert!(held_msg.contains("already held"), "{held_msg}");
+    assert!(!held_msg.contains("for a cargo build slot"), "{held_msg}");
+}
+
+/// The permit-held phase is a new marker value, appended after `Compiling` so
+/// no existing value changes meaning.
+#[test]
+fn slot_held_is_marker_value_four() {
+    assert_eq!(BuildPhase::SlotHeld.as_u8(), 4);
+    assert_eq!(BuildPhase::from_u8(4), BuildPhase::SlotHeld);
+}
+
+/// Only `Compiling` ends the queue: every other phase can still be followed by
+/// a frontend-lock wait (a worktree build waits for that lock in its prebuild
+/// and again before `pnpm run build`), so the watcher must keep watching.
+#[test]
+fn only_compiling_ends_the_queue() {
+    assert!(BuildPhase::Compiling.ends_the_queue());
+    for phase in [
+        BuildPhase::AwaitingSlot,
+        BuildPhase::AwaitingNpmLock,
+        BuildPhase::BuildingFrontend,
+        BuildPhase::SlotHeld,
+    ] {
+        assert!(!phase.ends_the_queue(), "{phase:?} cannot end the queue");
+    }
 }
 
 /// An out-of-range marker value decodes to the conservative `AwaitingSlot`
@@ -285,6 +321,7 @@ fn build_phase_round_trips_and_maps_to_message() {
 /// slot wait, not a panic).
 #[test]
 fn build_phase_from_u8_out_of_range_defaults_to_awaiting_slot() {
+    assert_eq!(BuildPhase::from_u8(5), BuildPhase::AwaitingSlot);
     assert_eq!(BuildPhase::from_u8(7), BuildPhase::AwaitingSlot);
     assert_eq!(BuildPhase::from_u8(255), BuildPhase::AwaitingSlot);
 }
@@ -1090,6 +1127,7 @@ fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
         temp_runner_display: None,
         ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
         ambient_coord: crate::config::AmbientCoord::Ignore,
+        ambient_boot_id: crate::config::AmbientBootId::Ignore,
     };
     Arc::new(SupervisorState::new(config))
 }
@@ -2224,7 +2262,9 @@ mod unlink_before_install {
 
         let calls: Arc<Mutex<Vec<(PathBuf, String)>>> = Arc::default();
         let rec = calls.clone();
-        prebuild_worktree_frontend_with(&state, &slot, &wt, false, move |cwd, args| {
+        let phase =
+            std::sync::atomic::AtomicU8::new(crate::build_monitor::BuildPhase::SlotHeld.as_u8());
+        prebuild_worktree_frontend_with(&state, &slot, &wt, false, &phase, move |cwd, args| {
             rec.lock().unwrap().push((cwd.clone(), args.to_string()));
             async move {
                 if args.starts_with("install") {

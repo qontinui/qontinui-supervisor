@@ -48,8 +48,10 @@ pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
     let runner_path = path.strip_prefix("/runner-api").unwrap_or(path);
 
     let target_url = format!(
-        "http://127.0.0.1:{}{}{}",
-        state.runner_api_port, runner_path, query
+        "{}{}{}",
+        crate::loopback::runner_loopback_base(state.runner_api_port),
+        runner_path,
+        query
     );
     debug!(
         "Runner monitor proxy: {} {} -> {}",

@@ -22,6 +22,7 @@ use crate::dev_action::{
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::loopback::{runner_loopback_base, runner_ui_bridge_base};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::settings;
@@ -801,6 +802,12 @@ pub async fn list_runners(
         // Set after the literal: one more key inside `json!` above exceeds the
         // macro's recursion limit.
         entry["isolation_unit"] = json!(isolation_unit);
+        // Live, not historical: the spawn a first-healthy watchdog tracks right
+        // now, which holds a serving restart while it names the current spawn.
+        // Same key and meaning as `WatchdogHealth` on `GET /health`.
+        entry["watchdog"]["first_healthy_tracked_spawn_started_at"] = json!(watchdog
+            .first_healthy_tracked_spawn_at()
+            .map(|spawn| spawn.to_rfc3339()));
         entry["isolation"] = json!(isolation_json);
         // Phase 8b: a `fresh_device_identity` runner's own device id, read
         // lazily from `<root>/home/machine.json` — the observable for an id
@@ -885,7 +892,7 @@ pub async fn runners_by_unit(
         result.push(json!({
             "runner_id": managed.config.id,
             "port": port,
-            "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+            "ui_bridge_url": runner_ui_bridge_base(port),
             "git_sha": b.git_sha,
             "attempt_id": b.attempt_id,
         }));
@@ -1947,7 +1954,7 @@ pub async fn proxy_ui_bridge(
     let uri = req.uri().clone();
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
 
-    let target_url = format!("http://127.0.0.1:{}/ui-bridge/{}{}", port, path, query);
+    let target_url = format!("{}/ui-bridge/{}{}", runner_loopback_base(port), path, query);
 
     let content_type = req
         .headers()
@@ -2040,14 +2047,31 @@ pub struct SpawnTestRequest {
     /// Only meaningful when `rebuild: true`. `None` means wait indefinitely
     /// (the default).
     ///
-    /// It bounds only the queue phases — waiting on a cargo build permit and,
-    /// after that, on the serialized frontend (pnpm) lock. **The clock stops
-    /// the moment the build starts doing work**: a build that has its slot and
-    /// is compiling can no longer be 504'd out from under itself, however
-    /// small a value you pass. Until 2026-08-03 this bounded the whole
-    /// build+spawn future despite its name and docs, so a caller asking "don't
-    /// make me queue for more than 60s" also got their compiling build
-    /// abandoned at 60s — losing everything it had compiled.
+    /// It bounds only the queue phases — waiting for the managed container,
+    /// on the pre-permit memory guard, on a cargo build permit and, after
+    /// that, on the serialized frontend (pnpm) lock. **The clock does not run
+    /// while the build is doing work**, and only queue time is summed: a build
+    /// that has its slot and is compiling can no longer be 504'd out from under
+    /// itself, however small a value you pass.
+    ///
+    /// **`0` means "a free slot right now, else a 504 at once".** One that
+    /// would have to queue (a busy pool, or a busy frontend lock) is answered
+    /// 504 immediately, with the message naming the phase it would have waited
+    /// in. A spawn that finds a permit free reaches its build provided nothing
+    /// before the permit yields: the build is polled first and marks itself
+    /// `SlotHeld` the instant the permit is held. **Residual:** the pre-permit
+    /// disk and memory guards read a lock and emit logs while the marker still
+    /// says `AwaitingSlot`, so a contended yield there (or a memory-guard
+    /// deferral) can still 504 a zero budget. That is the guard's wait being
+    /// counted, which is the bound working, but it is not a free-slot
+    /// guarantee. That is not
+    /// `X-Queue-Mode: no-wait`, which answers a busy pool with 503
+    /// `build_pool_full` and its queue position.
+    ///
+    /// Until 2026-08-03 this bounded the whole build+spawn future despite its
+    /// name and docs, so a caller asking "don't make me queue for more than
+    /// 60s" also got their compiling build abandoned at 60s — losing
+    /// everything it had compiled.
     ///
     /// Use `wait_timeout_secs` to bound the post-spawn health wait; there is
     /// deliberately no knob that kills a healthy in-flight compile.
@@ -2056,7 +2080,7 @@ pub struct SpawnTestRequest {
     /// Optional post-spawn health probe window in milliseconds.
     ///
     /// After the child process is spawned, the supervisor polls
-    /// `GET http://localhost:{port}/health` every 200ms until it succeeds or
+    /// `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
     /// this many milliseconds elapse. Defaults to 60000 (60 seconds).
     ///
     /// Set to `0` to skip the probe entirely (legacy behavior — return
@@ -2804,30 +2828,58 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
 /// accurate to well under a second.
 const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Resolve only if `timeout` elapses while the build is STILL in a queue phase
-/// (see [`crate::build_monitor::BuildPhase::is_queue_wait`]); returns the phase
-/// that was blocking so the caller can compose a phase-accurate message.
+/// Resolve once the build has spent `timeout` IN QUEUE PHASES (see
+/// [`crate::build_monitor::BuildPhase::is_queue_wait`]) and is still in one;
+/// returns the phase that was blocking so the caller can compose a
+/// phase-accurate message.
 ///
-/// Once the build leaves its queue phases — the cargo permit and, after it, the
-/// frontend lock are both held and real work has started — this future never
-/// resolves, so `queue_timeout_secs` can no longer 504 a build that is
-/// compiling. Phases advance monotonically within one attempt, so "left the
-/// queue" is a latch, not a sample that can flap back.
+/// **Only queue time is charged.** A worktree build waits for its cargo
+/// permit, works under it (`SlotHeld`, the frontend prebuild), and then waits
+/// again for the frontend lock — so the phases are not monotonic, and a
+/// wall-clock budget would charge the work between the two waits to the second
+/// one, 504ing a build whose actual queue time was far under the bound. Each
+/// poll interval is charged only when it began in a queue phase, and the
+/// watcher keeps polling through work phases rather than giving up on them,
+/// because a frontend-lock wait can still follow. Only
+/// [`crate::build_monitor::BuildPhase::ends_the_queue`] (`Compiling`) stops it
+/// for good, so `queue_timeout_secs` can never 504 a build that is compiling.
+///
+/// The charge is per poll interval, so a phase change part-way through one is
+/// charged to whichever phase the interval began in: each transition out of a
+/// queue phase overcharges by up to one [`QUEUE_PHASE_POLL`] (100 ms), and
+/// each transition into one undercharges by as much. Negligible against any
+/// budget measured in seconds.
+///
+/// A zero `timeout` fires on the first poll that reads a queue phase, which is
+/// what `queue_timeout_secs: 0` means: "a free slot now, else a 504". That is
+/// truthful only because the build is polled first
+/// ([`race_build_against_queue_budget`]) and stores `SlotHeld` the moment its
+/// permit is held.
 async fn wait_out_queue_timeout(
     timeout: std::time::Duration,
     marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> crate::build_monitor::BuildPhase {
-    let start = std::time::Instant::now();
+    let mut queued_for = std::time::Duration::ZERO;
+    // When the previous poll read a queue phase: the interval since then is
+    // charged against the budget.
+    let mut queued_since: Option<tokio::time::Instant> = None;
     loop {
+        let now = tokio::time::Instant::now();
+        if let Some(since) = queued_since.take() {
+            queued_for += now.saturating_duration_since(since);
+        }
         let phase = crate::build_monitor::BuildPhase::from_u8(
             marker.load(std::sync::atomic::Ordering::Relaxed),
         );
-        if !phase.is_queue_wait() {
-            // Work has started — stop counting, forever.
+        if phase.ends_the_queue() {
+            // Compiling: no queue phase can follow — stop counting, forever.
             std::future::pending::<()>().await;
         }
-        if start.elapsed() >= timeout {
-            return phase;
+        if phase.is_queue_wait() {
+            if queued_for >= timeout {
+                return phase;
+            }
+            queued_since = Some(now);
         }
         tokio::time::sleep(QUEUE_PHASE_POLL).await;
     }
@@ -2864,7 +2916,8 @@ async fn mint_spawn_action(
 }
 
 /// The git repo root whose object db + refs the spawn-response provenance
-/// compares must be run in: the tree that was ACTUALLY compiled.
+/// compares must be run in: one that holds the tree that was ACTUALLY
+/// compiled.
 ///
 /// `built_root` is `Some(<runner root>)` for a provenance build (`git_ref` /
 /// `worktree_path`) and `None` for a live-tree build. Running an ancestry
@@ -2874,21 +2927,43 @@ async fn mint_spawn_action(
 /// guaranteed to exist in the canonical object db, and its `origin/main` is not
 /// guaranteed to be the same ref, so the compare is at best coincidentally
 /// right. Probing the built tree makes the sha always resolvable there.
+///
+/// A managed `.spawn-<ref>` container's runner worktree is the exception: it
+/// is a linked worktree OF the runner repo, sharing that repo's object store
+/// and refs, so the runner repo resolves its sha and its `origin/main` alike —
+/// and the runner repo outlives the container. These compares run after the
+/// spawn has released the container's lock, when a sweep may already have
+/// deleted it, and a compare run in a deleted tree fails quietly
+/// (`not_computable`, a `null` warning) and drops the stale-build warning.
 fn provenance_compare_root(
     state: &SharedState,
     built_root: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
-    match built_root {
-        Some(root) => root.to_path_buf(),
-        // `project_dir` is the runner's `src-tauri`; git resolves upward from
-        // any subdir, but use the repo root for parity with the other drift
-        // call sites.
-        None => state
+    // `project_dir` is the runner's `src-tauri`; git resolves upward from any
+    // subdir, but use the repo root for parity with the other drift call
+    // sites.
+    let live_repo_root = || {
+        state
             .config
             .project_dir
             .parent()
             .unwrap_or(&state.config.project_dir)
-            .to_path_buf(),
+            .to_path_buf()
+    };
+    match built_root {
+        Some(root)
+            if crate::spawn_worktree::is_managed_runner_worktree(
+                &state.config.project_dir,
+                root,
+            ) =>
+        {
+            // The repo `prepare_worktree` added the worktree to. It resolved
+            // then, so a miss now is the live layout itself gone.
+            crate::spawn_worktree::find_repo_root(&state.config.project_dir)
+                .unwrap_or_else(|_| live_repo_root())
+        }
+        Some(root) => root.to_path_buf(),
+        None => live_repo_root(),
     }
 }
 
@@ -3178,8 +3253,8 @@ pub async fn spawn_test(
                     "submission_id": existing_id.to_string(),
                     "id": existing.runner_id,
                     "port": existing.port,
-                    "api_url": format!("http://localhost:{}", existing.port),
-                    "ui_bridge_url": format!("http://localhost:{}/ui-bridge", existing.port),
+                    "api_url": runner_loopback_base(existing.port),
+                    "ui_bridge_url": runner_ui_bridge_base(existing.port),
                     "poll_url": format!("/build/{}/status", existing_id),
                     "message": format!(
                         "an identical spawn-test build ({}) is already in flight for this \
@@ -3217,8 +3292,10 @@ pub async fn spawn_test(
     // would pick the same free port — the second spawn would then collide.
     //
     // We insert the ManagedRunner before the (potentially long) build so
-    // subsequent scanners see the reservation. If the build fails, the
-    // placeholder is removed.
+    // subsequent scanners see the reservation. A `PlaceholderReservation`
+    // owns it from the insert on and gives it back on every outcome that does
+    // not start the runner — every refusal, `Ok` or `Err`, a panic and a
+    // cancelled future alike.
     //
     // We also keep an Arc to the ManagedRunner for the rest of this handler
     // so the eventual start call uses it directly, bypassing an id-based
@@ -3226,7 +3303,7 @@ pub async fn spawn_test(
     // possible when a concurrent path (reaper, stop_all, failed probe on a
     // sibling spawn) removes our id between insertion and start. Smoke tests
     // hit this ~1 in 10 times under load.
-    let (id, port, managed, in_flight_guard) = {
+    let (id, port, managed, in_flight_guard, reservation) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -3287,7 +3364,8 @@ pub async fn spawn_test(
         // `submit_spawn` clears the marker through `Drop`.
         let in_flight_guard = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
         runners.insert(id.clone(), managed.clone());
-        (id, port, managed, in_flight_guard)
+        let reservation = PlaceholderReservation::new(&state, &id, &managed);
+        (id, port, managed, in_flight_guard, reservation)
     };
 
     // friction-1: stamp the owning requester onto the runner so `GET /runners`
@@ -3352,8 +3430,6 @@ pub async fn spawn_test(
     //   return the stored outcome. Both paths share one state machine.
     let want_async = body.r#async;
     let exec_state = state.clone();
-    let exec_managed = managed.clone();
-    let exec_id = id.clone();
     let agent_id = body.requester_id.clone();
     // S3: label the submission with the build's ACTUAL source root, not the
     // supervisor's live `project_dir`. Derived from the request's provenance
@@ -3383,18 +3459,10 @@ pub async fn spawn_test(
             // probe → wait pipeline; released when this future completes or
             // is dropped. Both the sync and `async: true` paths run this future.
             let _in_flight = in_flight_guard;
-            let runner_id = exec_id.clone();
+            let runner_id = reservation.id.clone();
             let (status, body_json, stderr_tail) = finish_spawn_build(
                 &exec_release_state,
-                execute_spawn_build(
-                    exec_state,
-                    body,
-                    exec_id,
-                    port,
-                    exec_managed,
-                    no_wait,
-                    run_guard,
-                ),
+                execute_spawn_build(exec_state, body, reservation, port, no_wait, run_guard),
                 &runner_id,
                 port,
                 release_key,
@@ -3423,8 +3491,8 @@ pub async fn spawn_test(
                 "status": "queued",
                 "id": id,
                 "port": port,
-                "api_url": format!("http://localhost:{}", port),
-                "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+                "api_url": runner_loopback_base(port),
+                "ui_bridge_url": runner_ui_bridge_base(port),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
                     "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
@@ -3561,7 +3629,7 @@ pub async fn spawn_test_in_flight(
                 "port": inflight.port,
                 "build_id": inflight.submission_id.to_string(),
                 "submission_id": inflight.submission_id.to_string(),
-                "api_url": format!("http://localhost:{}", inflight.port),
+                "api_url": runner_loopback_base(inflight.port),
                 "poll_url": format!("/build/{}/status", inflight.submission_id),
                 "logs_url": format!("/runners/{}/logs", inflight.runner_id),
                 "stop_url": format!("/runners/{}/stop", inflight.runner_id),
@@ -3618,9 +3686,15 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 ///
 /// Returns `(StatusCode, body)` rather than a `Response` so the result can be
 /// stored on the submission's terminal state and rebuilt into a `Response`
-/// later. On any internal `SupervisorError` the placeholder port reservation
-/// is released (as the inline path did) and the error is rendered to its
-/// canonical `(status, body)` via [`SupervisorError::to_status_body`].
+/// later. An internal `SupervisorError` is rendered to its canonical
+/// `(status, body)` via [`SupervisorError::to_status_body`].
+///
+/// **It releases the placeholder reservation, whatever the inner fn
+/// answered.** The inner fn disarms `reservation` only once
+/// `manager::start_managed_runner` has returned `Ok`; every other outcome — an
+/// `Err`, or an `Ok` with a pre-start refusal such as the frontend 503 — leaves
+/// it armed, and the awaited [`PlaceholderReservation::release`] here gives
+/// the port back before the caller sees the answer.
 ///
 /// `no_wait` mirrors the `X-Queue-Mode: no-wait` header semantics for the
 /// build-pool-full short-circuit.
@@ -3634,13 +3708,13 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 async fn execute_spawn_build(
     state: SharedState,
     body: SpawnTestRequest,
-    id: String,
+    mut reservation: PlaceholderReservation,
     port: u16,
-    managed: Arc<ManagedRunner>,
     no_wait: bool,
     run_guard: RunResultGuard,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
     let action_id = run_guard.record().action_id;
+    let id = reservation.id.clone();
     let mut side = SpawnBuildSideChannel::default();
     // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
     // placeholder insert and moves its guard into the future that awaits this
@@ -3655,9 +3729,17 @@ async fn execute_spawn_build(
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
     let result = execute_spawn_build_inner(
-        &state, body, &id, port, &managed, no_wait, action_id, &mut side,
+        &state,
+        body,
+        &mut reservation,
+        port,
+        no_wait,
+        action_id,
+        &mut side,
     )
     .await;
+    // One owner of the release: a no-op once the start succeeded.
+    reservation.release().await;
     record_start_verdict(
         &state,
         &id,
@@ -3673,15 +3755,20 @@ async fn execute_spawn_build(
         .await,
         run_guard,
     );
+    // The build tree is merged on both arms too: a compile failure is exactly
+    // when a caller needs to know which runner commit and which schemas commit
+    // were compiled (`SpawnBuildSideChannel::tree`).
     match result {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
         Err(e) => {
             let (status, mut body) = e.to_status_body();
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
@@ -3722,6 +3809,141 @@ impl SpawnInFlightGuard {
 impl Drop for SpawnInFlightGuard {
     fn drop(&mut self) {
         self.managed.set_spawn_in_flight(None);
+    }
+}
+
+/// RAII owner of a spawn-test's placeholder registry entry — the port
+/// reservation `spawn_test` inserts before any admission decision.
+///
+/// **It releases on ANY outcome unless disarmed**, and it is disarmed only once
+/// `manager::start_managed_runner` has returned `Ok` (from then on the runner
+/// may be running and its id is the caller's handle on it). So every refusal
+/// gives the port back — an `Err`, a pre-start `Ok((non-2xx, body))`, a panic,
+/// a cancelled future — through one owner instead of a `runners.remove(id)` at
+/// each return, one of which (the no-wait `BuildPoolFull`) was missing and
+/// leaked a never-started placeholder per refused spawn.
+///
+/// Ordinary paths call the awaited [`Self::release`] at the chokepoint
+/// (`execute_spawn_build`), so the entry is gone before the caller is answered.
+/// `Drop` is the backstop for a panic or cancellation, and mirrors
+/// `build_monitor::SlotGuard`: it cannot await the registry's lock, so it
+/// tries it, and on contention hands the removal to a task — only when a
+/// tokio runtime is current, since `tokio::spawn` outside one panics. Either
+/// way it removes the entry only while it is still THIS reservation's
+/// `ManagedRunner` (`Arc::ptr_eq`), never a later entry under the same id.
+///
+/// **Once the start has been entered, `Drop` leaves the entry alone.** A panic
+/// or cancellation INSIDE `manager::start_managed_runner` can land after its
+/// child was spawned; removing the entry then would orphan a live process,
+/// and `finish_spawn_build`'s `panicked` answer tells the caller to stop the
+/// runner by this id, which needs the entry. A start that RETURNS `Err` is
+/// different: [`Self::start_failed`] clears the mark, so the explicit
+/// [`Self::release`] — or `Drop`, if that release is cancelled — removes it.
+struct PlaceholderReservation {
+    state: SharedState,
+    id: String,
+    managed: Arc<ManagedRunner>,
+    armed: bool,
+    start_entered: bool,
+}
+
+impl PlaceholderReservation {
+    /// Take ownership of the placeholder `managed`, registered under `id`.
+    fn new(state: &SharedState, id: &str, managed: &Arc<ManagedRunner>) -> Self {
+        Self {
+            state: state.clone(),
+            id: id.to_string(),
+            managed: Arc::clone(managed),
+            armed: true,
+            start_entered: false,
+        }
+    }
+
+    /// Set immediately before `manager::start_managed_runner` is called: from
+    /// here a `Drop` (a panic or cancellation inside the start) may be
+    /// abandoning a spawned child, so it no longer removes the entry.
+    fn entering_start(&mut self) {
+        self.start_entered = true;
+    }
+
+    /// The start RETURNED `Err`: it hands back no runner, so the entry is a
+    /// never-started placeholder again and `Drop` must remove it — a release
+    /// cancelled on the registry lock after a failed start would otherwise
+    /// leave it to the stale sweep.
+    fn start_failed(&mut self) {
+        self.start_entered = false;
+    }
+
+    /// The runner started: from here its entry is the caller's, not ours.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Give the reservation back now, unless disarmed. Idempotent.
+    ///
+    /// The removal happens BEFORE `armed` is cleared: a future cancelled while
+    /// waiting for the registry lock leaves the reservation armed, so its
+    /// `Drop` still releases it. `remove_if_reserved` is idempotent.
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut runners = self.state.runners.write().await;
+        remove_if_reserved(&mut runners, &self.id, &self.managed);
+        drop(runners);
+        self.armed = false;
+    }
+}
+
+/// Remove `id` from `runners` only while it still maps to `managed`.
+fn remove_if_reserved(
+    runners: &mut std::collections::HashMap<String, Arc<ManagedRunner>>,
+    id: &str,
+    managed: &Arc<ManagedRunner>,
+) {
+    if runners
+        .get(id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, managed))
+    {
+        runners.remove(id);
+    }
+}
+
+impl Drop for PlaceholderReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.start_entered {
+            warn!(
+                "spawn-test {} ended inside its start (a panic or cancellation); its registry \
+                 entry is kept because the runner's process may already be running — stop it \
+                 by this id",
+                self.id
+            );
+            return;
+        }
+        if let Ok(mut runners) = self.state.runners.try_write() {
+            remove_if_reserved(&mut runners, &self.id, &self.managed);
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "spawn-test placeholder {} could not be released: its registry lock was held \
+                 and no tokio runtime is current; the stale sweep will reap it",
+                self.id
+            );
+            return;
+        };
+        let (state, id, managed) = (
+            self.state.clone(),
+            self.id.clone(),
+            Arc::clone(&self.managed),
+        );
+        handle.spawn(async move {
+            let mut runners = state.runners.write().await;
+            remove_if_reserved(&mut runners, &id, &managed);
+        });
     }
 }
 
@@ -3773,6 +3995,178 @@ struct SpawnBuildSideChannel {
     /// its boot had ended by THEN ([`crate::dev_action::held_to_own_boot`]), and the
     /// door records its verdict only after the slow work that follows the wait.
     answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tree this spawn's build compiles: the runner tree and the
+    /// `qontinui-schemas` sibling its path-deps resolve to. Set once that tree
+    /// is prepared or validated, so it is known before the build runs. `None`
+    /// for a live-tree spawn, and for any failure that happened before the tree
+    /// was ready.
+    ///
+    /// It is here because a FAILED build needs it most. When a spawn worktree's
+    /// build fails to compile against its schemas sibling (2026-11-11: four
+    /// `E0425`s against schemas `origin/main`, where the runner's own declared
+    /// pin built clean), the caller has to know which schemas commit the build
+    /// used. Before this field, only the success body named it, and every
+    /// `return Err(e)` lost it.
+    tree: Option<SpawnBuildTree>,
+}
+
+/// The tree a spawn-test build compiles, recorded before the build runs: the
+/// runner tree, plus the `qontinui-schemas` sibling its
+/// `../../qontinui-schemas/...` path-deps resolve to.
+///
+/// [`SpawnBuildTree::attach`] is the only thing that writes these fields to a
+/// spawn-test body. The success body and every failure body that follows the
+/// tree's preparation therefore carry the same values under the same keys.
+#[derive(Clone, Debug, PartialEq)]
+enum SpawnBuildTree {
+    /// A managed `.spawn-<ref>/` worktree: the default `origin/main` build or an
+    /// explicit `git_ref`, with the container's own pinned schemas worktree.
+    Managed {
+        requested_ref: String,
+        /// `git rev-parse HEAD` of the runner worktree.
+        resolved_sha: String,
+        /// The response's `source` (`SpawnBuildSource::label`): `origin_main`
+        /// for the default, `worktree` for an explicit ref.
+        source: &'static str,
+        schemas_path: std::path::PathBuf,
+        /// `git rev-parse HEAD` of the pinned schemas worktree.
+        schemas_sha: String,
+        /// The sha the runner tree declared in `.github/sibling-pins.conf`,
+        /// else `origin/main`.
+        schemas_pin_ref: String,
+        /// True when `schemas_pin_ref` came from the declared pin.
+        schemas_pin_declared: bool,
+    },
+    /// A caller-owned `worktree_path` checkout, built in place against its own
+    /// `../qontinui-schemas` sibling.
+    CallerOwned {
+        worktree_path: std::path::PathBuf,
+        resolved_sha: Option<String>,
+        schemas_path: Option<std::path::PathBuf>,
+        schemas_sha: Option<String>,
+        /// The sibling is the SHARED workspace-root checkout (drift hazard).
+        schemas_is_shared: bool,
+    },
+}
+
+impl SpawnBuildTree {
+    fn managed(wt: &crate::spawn_worktree::PreparedWorktree, source: &'static str) -> Self {
+        SpawnBuildTree::Managed {
+            requested_ref: wt.requested_ref.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            source,
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_resolved_sha.clone(),
+            schemas_pin_ref: wt.schemas_pin_ref.clone(),
+            schemas_pin_declared: wt.schemas_pin_declared,
+        }
+    }
+
+    fn caller_owned(wt: &crate::spawn_worktree::ValidatedExistingWorktree) -> Self {
+        SpawnBuildTree::CallerOwned {
+            worktree_path: wt.worktree_path.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_sha.clone(),
+            schemas_is_shared: wt.schemas_is_shared,
+        }
+    }
+
+    /// Merge this tree's provenance fields into a rendered spawn-test body:
+    /// success, a non-2xx `Ok`, or a `SupervisorError::to_status_body()` error.
+    ///
+    /// - `source`: `origin_main` | `worktree` | `worktree_path`.
+    /// - `git_ref` / `git_ref_resolved` (managed only), `worktree_path`
+    ///   (caller-owned only).
+    /// - `git_ref_resolved_sha` / `git_ref_resolved_sha_short`: the runner
+    ///   tree's HEAD. Absent for a caller-owned tree that is not a git checkout.
+    /// - `schemas_path` / `schemas_sha` / `schemas_is_shared`.
+    /// - `schemas_pin_ref` / `schemas_pin_source` (`sibling_pins_conf` |
+    ///   `origin_main_fallback`): managed only, because a caller-owned tree's
+    ///   sibling is whatever the caller checked out.
+    ///
+    /// The values come from the tree, so re-attaching onto a body that already
+    /// carries them changes nothing. A non-object body is left alone rather
+    /// than reshaped, as in [`attach_build_slot_id`].
+    fn attach(&self, body: &mut serde_json::Value) {
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        let mut put = |k: &str, v: serde_json::Value| {
+            obj.insert(k.to_string(), v);
+        };
+        match self {
+            SpawnBuildTree::Managed {
+                requested_ref,
+                resolved_sha,
+                source,
+                schemas_path,
+                schemas_sha,
+                schemas_pin_ref,
+                schemas_pin_declared,
+            } => {
+                put("source", json!(source));
+                put("git_ref", json!(requested_ref));
+                put("git_ref_resolved", json!(requested_ref));
+                put("git_ref_resolved_sha", json!(resolved_sha));
+                put(
+                    "git_ref_resolved_sha_short",
+                    json!(resolved_sha.chars().take(12).collect::<String>()),
+                );
+                put("schemas_path", json!(schemas_path.to_string_lossy()));
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_pin_ref", json!(schemas_pin_ref));
+                put(
+                    "schemas_pin_source",
+                    json!(if *schemas_pin_declared {
+                        "sibling_pins_conf"
+                    } else {
+                        "origin_main_fallback"
+                    }),
+                );
+                // The pinned sibling lives inside the spawn container, never
+                // the shared checkout.
+                put("schemas_is_shared", json!(false));
+            }
+            SpawnBuildTree::CallerOwned {
+                worktree_path,
+                resolved_sha,
+                schemas_path,
+                schemas_sha,
+                schemas_is_shared,
+            } => {
+                put("source", json!("worktree_path"));
+                put("worktree_path", json!(worktree_path.to_string_lossy()));
+                if let Some(sha) = resolved_sha {
+                    put("git_ref_resolved_sha", json!(sha));
+                    put(
+                        "git_ref_resolved_sha_short",
+                        json!(sha.chars().take(12).collect::<String>()),
+                    );
+                }
+                put(
+                    "schemas_path",
+                    json!(schemas_path.as_ref().map(|p| p.to_string_lossy())),
+                );
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_is_shared", json!(schemas_is_shared));
+            }
+        }
+    }
+}
+
+/// Merge the spawn's build tree ([`SpawnBuildSideChannel::tree`]) into an
+/// already-rendered body, success or failure.
+///
+/// With no tree it writes NOTHING. That covers a failure before the tree was
+/// prepared (a `git_ref` whose worktree could not be made, a `worktree_path`
+/// that failed validation), where any `source` would claim a tree the request
+/// never reached. The success body's own `source: "live_tree"` for a live-tree
+/// spawn is written where that body is built, not here.
+fn attach_build_tree(body: &mut serde_json::Value, tree: Option<&SpawnBuildTree>) {
+    if let Some(tree) = tree {
+        tree.attach(body);
+    }
 }
 
 /// Merge `build_slot_id` into an already-rendered error body.
@@ -3797,8 +4191,8 @@ fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usiz
 /// A panic skips everything `execute_spawn_build` would have attached, so it is
 /// caught here, where the reservation is known: it answers `panicked` naming the
 /// runner, which a caller needs to follow or stop it, since the process may
-/// already be running. A placeholder that never started is left to the stale
-/// sweep.
+/// already be running. A placeholder that never started is released by its
+/// [`PlaceholderReservation`] as the panic unwinds through the build future.
 async fn finish_spawn_build<F>(
     state: &SharedState,
     build: F,
@@ -3848,33 +4242,236 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), json!(id));
         obj.insert("port".to_string(), json!(port));
-        obj.insert(
-            "api_url".to_string(),
-            json!(format!("http://localhost:{port}")),
-        );
+        obj.insert("api_url".to_string(), json!(runner_loopback_base(port)));
         obj.insert(
             "ui_bridge_url".to_string(),
-            json!(format!("http://localhost:{port}/ui-bridge")),
+            json!(runner_ui_bridge_base(port)),
         );
         obj.insert("logs_url".to_string(), json!(format!("/runners/{id}/logs")));
         obj.insert("stop_url".to_string(), json!(format!("/runners/{id}/stop")));
     }
 }
 
+/// A spawn-test's wait for its managed container while another build held
+/// it: whom it waited for, and for how long, so a queue-timeout 504 can say
+/// how much of `queue_timeout_secs` went to it.
+#[derive(Clone, Debug)]
+struct ContainerWait {
+    container: std::path::PathBuf,
+    /// Who held the container when the wait began.
+    held: crate::spawn_worktree::ContainerHeld,
+    waited: std::time::Duration,
+}
+
+/// A spawn-test's managed container, taken ([`take_container_for_spawn`]).
+struct ContainerTaken {
+    guard: crate::spawn_worktree::SpawnContainerGuard,
+    /// What the wait left of the caller's queue budget for the build's own
+    /// queue wait, `None` when the caller set no budget. A wait never leaves
+    /// it at zero: a wait that spent the whole budget is a 504.
+    budget_left: Option<std::time::Duration>,
+    /// The wait, when another build held the container.
+    wait: Option<ContainerWait>,
+}
+
+/// Take a spawn-test's container lock under the caller's queue contract.
+///
+/// Waiting for the container is a queue wait like waiting for a build slot:
+/// under `X-Queue-Mode: no-wait` a container another build holds answers 503
+/// `spawn_container_busy` at once, naming that build, and a
+/// `queue_timeout_secs` budget bounds the wait, answering 504 naming the build
+/// still holding it. What the wait leaves of the budget is what the build then
+/// queues with ([`ContainerTaken::budget_left`]), and a wait that leaves
+/// nothing is a 504 as well ([`queue_budget_left`]). Without either, it waits
+/// as long as the holder builds, and the log says whom it waits for.
+async fn take_container_for_spawn(
+    state: &SharedState,
+    container: &std::path::Path,
+    taker: &str,
+    no_wait: bool,
+    queue_budget: Option<std::time::Duration>,
+) -> Result<ContainerTaken, SupervisorError> {
+    let held = match state.spawn_container_locks.try_take(container, taker) {
+        Ok(guard) => {
+            return Ok(ContainerTaken {
+                guard,
+                budget_left: queue_budget,
+                wait: None,
+            })
+        }
+        Err(held) => held,
+    };
+    if no_wait {
+        return Err(SupervisorError::SpawnContainerBusy {
+            container: container.display().to_string(),
+            holder: held.holder,
+        });
+    }
+    // The tokio clock, the one the timeout below runs on.
+    let waiting_since = tokio::time::Instant::now();
+    let take = state.take_spawn_container_lock(container, taker);
+    let guard = match queue_budget {
+        None => take.await,
+        Some(budget) => match tokio::time::timeout(budget, take).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                let still_held = crate::spawn_worktree::ContainerHeld {
+                    holder: state.spawn_container_locks.holder(container),
+                };
+                return Err(container_wait_spent_the_budget(
+                    budget, container, still_held,
+                ));
+            }
+        },
+    };
+    let wait = ContainerWait {
+        container: container.to_path_buf(),
+        held,
+        waited: waiting_since.elapsed(),
+    };
+    // On a refusal `guard` drops here, releasing the container.
+    let budget_left = queue_budget
+        .map(|budget| queue_budget_left(budget, &wait))
+        .transpose()?;
+    Ok(ContainerTaken {
+        guard,
+        budget_left,
+        wait: Some(wait),
+    })
+}
+
+/// What the wait for the container left of `budget` for the build's own queue
+/// wait. A wait that left nothing is a 504 naming the build it waited for,
+/// decided here: handed on, a zero remainder would start the build's queue
+/// watcher on a zero timer, racing the build in a `select!`.
+fn queue_budget_left(
+    budget: std::time::Duration,
+    wait: &ContainerWait,
+) -> Result<std::time::Duration, SupervisorError> {
+    match budget.checked_sub(wait.waited) {
+        Some(left) if !left.is_zero() => Ok(left),
+        _ => Err(container_wait_spent_the_budget(
+            budget,
+            &wait.container,
+            format!("{} when the wait began", wait.held),
+        )),
+    }
+}
+
+/// The 504 when waiting for the container spent all of `queue_timeout_secs`,
+/// so the build never queued for a slot. `holder` names the build waited for.
+fn container_wait_spent_the_budget(
+    budget: std::time::Duration,
+    container: &std::path::Path,
+    holder: impl std::fmt::Display,
+) -> SupervisorError {
+    SupervisorError::Timeout(format!(
+        "Build queue timeout: all of queue_timeout_secs={} went to waiting for spawn container \
+         {container:?} ({holder}), so the build never queued for a cargo build slot",
+        budget.as_secs()
+    ))
+}
+
+/// The 504 message of a spawn-test build whose own queue wait (for a cargo
+/// slot, then the frontend lock) ran out of budget. `queue_timeout_secs` is
+/// the caller's whole budget. After a wait for the container, the message
+/// splits the budget between the two waits, rather than charging all of it to
+/// the slot or the frontend lock.
+fn spawn_queue_timeout_message(
+    phase: crate::build_monitor::BuildPhase,
+    queue_timeout_secs: u64,
+    container_wait: Option<&ContainerWait>,
+    available_permits: usize,
+) -> String {
+    let Some(wait) = container_wait else {
+        return phase.timeout_message(queue_timeout_secs, available_permits);
+    };
+    let container_secs = wait.waited.as_secs().min(queue_timeout_secs);
+    format!(
+        "{}, after {container_secs}s of queue_timeout_secs={queue_timeout_secs} went to waiting \
+         for spawn container {:?} ({} when the wait began)",
+        phase.timeout_message(queue_timeout_secs - container_secs, available_permits),
+        wait.container,
+        wait.held,
+    )
+}
+
+/// Race a spawn-test build against its queue budget: the build's own result,
+/// or a 504 naming the phase that was still waiting when `budget` ran out.
+///
+/// `queue_timeout_secs` bounds the QUEUE, not the build. It used to wrap the
+/// whole future, so a caller passing a small bound to say "don't make me wait
+/// for a busy pool" got a 504 that ALSO abandoned an already-compiling slot —
+/// throwing away a live build (and everything it had compiled) for a wait that
+/// had already ended. The watcher ([`wait_out_queue_timeout`]) counts only the
+/// time the build's phase marker spends in a queue phase, so the field means
+/// what it is documented to mean.
+///
+/// **`biased;`, with the build first.** An unbiased `select!` picks its first
+/// branch at random, and with a zero budget the watcher resolves on its first
+/// poll whenever the marker still reads a queue phase — so a spawn that had a
+/// free slot got a spurious "waited 0s for a cargo build slot" about half the
+/// time. Polled first, the build runs to its first real yield, and the marker
+/// it leaves there says truthfully whether it is still queued (the build
+/// stores [`crate::build_monitor::BuildPhase::SlotHeld`] the moment its
+/// permit is held). A yield BEFORE the permit — inside the disk or memory
+/// guard — still reads `AwaitingSlot` and is counted, so a zero budget can
+/// still fire there under contention. Both attempts of a spawn — the first and
+/// the poisoned-slot retry — come through here, since both go through
+/// `run_detailed`.
+async fn race_build_against_queue_budget<F>(
+    state: &SharedState,
+    build: F,
+    phase_marker: Arc<std::sync::atomic::AtomicU8>,
+    budget: std::time::Duration,
+    queue_timeout_secs: u64,
+    container_wait: Option<&ContainerWait>,
+) -> Result<crate::build_monitor::BuildAttempt, (SupervisorError, crate::build_monitor::BuildAttempt)>
+where
+    F: std::future::Future<
+        Output = Result<
+            crate::build_monitor::BuildAttempt,
+            (SupervisorError, crate::build_monitor::BuildAttempt),
+        >,
+    >,
+{
+    let watcher = wait_out_queue_timeout(budget, phase_marker);
+    tokio::pin!(build);
+    tokio::select! {
+        biased;
+        r = &mut build => r,
+        phase = watcher => {
+            let available_permits = state.build_pool.permits.available_permits();
+            Err((
+                SupervisorError::Timeout(spawn_queue_timeout_message(
+                    phase,
+                    queue_timeout_secs,
+                    container_wait,
+                    available_permits,
+                )),
+                crate::build_monitor::BuildAttempt::default(),
+            ))
+        }
+    }
+}
+
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
-/// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
-/// removal on the error paths below is unchanged.
-#[allow(clippy::too_many_arguments)]
+/// flow is preserved verbatim from the pre-Item-6 handler. It never removes the
+/// placeholder itself: it disarms `reservation` once the runner has started,
+/// and the caller releases it on every other outcome.
 async fn execute_spawn_build_inner(
     state: &SharedState,
     body: SpawnTestRequest,
-    id: &str,
+    reservation: &mut PlaceholderReservation,
     port: u16,
-    managed: &Arc<ManagedRunner>,
     no_wait: bool,
     action_id: uuid::Uuid,
     side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
+    let id_owned = reservation.id.clone();
+    let id = id_owned.as_str();
+    let managed_owned = Arc::clone(&reservation.managed);
+    let managed = &managed_owned;
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
     // `body.rebuild` is false, `attempted` stays false and `succeeded`
@@ -3898,7 +4495,9 @@ async fn execute_spawn_build_inner(
     );
     // Set when a managed-worktree build occurred — either an explicit `git_ref`
     // or the DEFAULT `origin/main`: (requested_ref, resolved_sha).
-    // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
+    // The response fields (`git_ref`, `git_ref_resolved_sha`, the schemas
+    // pin) come from `side.tree`, set at the same point, so that a failure
+    // body carries them too.
     let mut git_ref_info: Option<(String, String)> = None;
     // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
     // the `cleanup_worktree_on_fail` flag to wipe the spawn container on a
@@ -3913,13 +4512,21 @@ async fn execute_spawn_build_inner(
     // machinery (the type-level guarantee from the plan).
     let mut worktree_path_info: Option<crate::spawn_worktree::ValidatedExistingWorktree> = None;
 
-    // Set to the spawn container path of a `git_ref` build that materialized a
-    // fresh `.spawn-*` container, so we can (a) mark it active for the duration
-    // of the build (the pruner's active-build exclusion) and (b) run an
-    // opportunistic prune sweep after the build, scrubbing OTHER stale
-    // containers this new one's parent dir accumulated. `None` for live-tree /
-    // worktree_path builds (no supervisor-owned scratch container involved).
-    let mut active_spawn_container: Option<std::path::PathBuf> = None;
+    // The lock on this spawn's managed `.spawn-<ref>` container
+    // (`SupervisorState::take_spawn_container_lock`), the one signal that the
+    // container is in use. Taken before `prepare_worktree` materializes or
+    // resets the tree, held through the build AND the frontend verdict that
+    // reads the built tree, then dropped explicitly once nothing reads the
+    // container any more. While it is held, a same-ref spawn-test or a primary
+    // rebuild waits instead of resetting the tree, and every sweep keeps the
+    // container as in use. Declared here, at function scope, because the
+    // verdict is read after the rebuild block: a guard scoped to that block
+    // ended before the verdict, which let a sweep (or a queued same-ref build)
+    // delete or rebuild the tree the verdict then read (plan
+    // `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+    // `None` for the live tree and a caller-owned `worktree_path`, which the
+    // supervisor neither resets nor prunes.
+    let mut container_guard: Option<crate::spawn_worktree::SpawnContainerGuard> = None;
 
     // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
     // runner root of the tree that was actually built. The spawned exe embeds
@@ -3989,33 +4596,45 @@ async fn execute_spawn_build_inner(
         // path (`origin/main`) as well as the explicit-`git_ref` path — the
         // shared checkout is only compiled on an explicit `from_working_tree`.
         // Any git failure aborts the request (no silent fallback to the live
-        // tree — provenance is the whole point). Release the placeholder port
-        // on failure so it doesn't leak.
-        // Held across BOTH materialize and build so a concurrent spawn of the
-        // same ref can't `git reset --hard` the container out from under this
-        // build (the race the default-origin/main flip made common — see
-        // `SupervisorState::spawn_container_locks`). `None` for the non-managed
-        // sources (live tree / caller-owned worktree_path): those are not
-        // reset by the supervisor, so they need no guard. The guard drops at
-        // the end of this function scope, after the build completes.
-        let _container_guard: Option<tokio::sync::OwnedMutexGuard<()>> =
-            match build_source.managed_ref() {
-                Some(git_ref) => {
-                    match crate::spawn_worktree::container_path_for_ref(
-                        &state.config.project_dir,
-                        git_ref,
-                    ) {
-                        Ok(container) => {
-                            Some(state.spawn_container_lock(&container).lock_owned().await)
-                        }
-                        // Can't derive the container path (malformed layout) —
-                        // prepare_worktree below will surface the real error;
-                        // proceed unguarded rather than 500 here.
-                        Err(_) => None,
+        // tree — provenance is the whole point). The caller's reservation
+        // gives the placeholder port back on every such refusal.
+        //
+        // The container's lock first (see `container_guard`), under the
+        // caller's queue contract (`take_container_for_spawn`): its wait is a
+        // queue wait, so it answers `no_wait` and counts against
+        // `queue_timeout_secs`. A container path that cannot be derived
+        // (malformed layout) takes no lock: `prepare_worktree` fails on the
+        // same derivation before it touches anything, and surfaces the real
+        // error.
+        let queue_budget = body.queue_timeout_secs.map(std::time::Duration::from_secs);
+        // What the container wait leaves of the budget for the build's own
+        // queue wait, and the wait itself, which that wait's 504 names.
+        let mut build_queue_budget = queue_budget;
+        let mut container_wait: Option<ContainerWait> = None;
+        if let Some(git_ref) = build_source.managed_ref() {
+            if let Ok(container) =
+                crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, git_ref)
+            {
+                let taker = match body.requester_id.as_deref() {
+                    Some(requester) => format!("spawn-test {id} (requester {requester})"),
+                    None => format!("spawn-test {id}"),
+                };
+                match take_container_for_spawn(state, &container, &taker, no_wait, queue_budget)
+                    .await
+                {
+                    Ok(ContainerTaken {
+                        guard,
+                        budget_left,
+                        wait,
+                    }) => {
+                        container_guard = Some(guard);
+                        build_queue_budget = budget_left;
+                        container_wait = wait;
                     }
+                    Err(e) => return Err(e),
                 }
-                None => None,
-            };
+            }
+        }
         let build_dir_override = match build_source.managed_ref() {
             Some(git_ref) => {
                 match crate::spawn_worktree::prepare_worktree(&state.config.project_dir, git_ref)
@@ -4028,15 +4647,17 @@ async fn execute_spawn_build_inner(
                                 LogSource::Supervisor,
                                 LogLevel::Info,
                                 format!(
-                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} (requester={:?})",
+                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} {} (requester={:?})",
                                     wt.requested_ref,
                                     wt.resolved_sha,
                                     wt.worktree_path,
+                                    wt.schemas_pin_summary(),
                                     body.requester_id
                                 ),
                             )
                             .await;
                         git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
+                        side.tree = Some(SpawnBuildTree::managed(&wt, build_source.label()));
                         // Stash paths for the optional cleanup-on-fail branch
                         // below. `find_repo_root` walks up from the
                         // configured project_dir; if it errors here (the
@@ -4061,15 +4682,6 @@ async fn execute_spawn_build_inner(
                                 schemas_wt_path: Some(wt.schemas_path.clone()),
                             });
                         }
-                        // Mark this container active so the pruner never reaps
-                        // it while the build below is in flight. Removed after
-                        // the build completes (success or failure) — see the
-                        // unregister + opportunistic-sweep block after the build.
-                        {
-                            let mut active = state.active_spawn_worktrees.lock().unwrap();
-                            active.insert(wt.container_path.clone());
-                        }
-                        active_spawn_container = Some(wt.container_path.clone());
                         // The staleness check must inspect the tree whose
                         // dist/ the spawned exe embeds. That is the runner
                         // worktree root (`<ws>/.spawn-<ref>/qontinui-runner`),
@@ -4078,11 +4690,7 @@ async fn execute_spawn_build_inner(
                         built_root = Some(wt.worktree_path.clone());
                         Some(wt.src_tauri)
                     }
-                    Err(e) => {
-                        let mut runners = state.runners.write().await;
-                        runners.remove(id);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             // No managed worktree. If `worktree_path` was supplied (mutually
@@ -4133,14 +4741,11 @@ async fn execute_spawn_build_inner(
                             // Staleness check must inspect the caller-owned
                             // tree whose dist/ the spawned exe embeds.
                             built_root = Some(validated.worktree_path.clone());
+                            side.tree = Some(SpawnBuildTree::caller_owned(&validated));
                             worktree_path_info = Some(validated);
                             Some(src_tauri)
                         }
-                        Err(e) => {
-                            let mut runners = state.runners.write().await;
-                            runners.remove(id);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 None => None,
@@ -4160,10 +4765,10 @@ async fn execute_spawn_build_inner(
             .await;
 
         // Run the build, optionally bounded by a queue timeout.
-        // On any failure (build error, timeout, etc.), remove the placeholder
-        // we reserved above so the port doesn't leak — UNLESS the caller
-        // opted into `allow_stale_fallback`, in which case we keep the
-        // placeholder and fall through to spawn from the previous slot exe.
+        // On any failure (build error, timeout, etc.) return the error, and
+        // the caller's reservation frees the placeholder's port — UNLESS the
+        // caller opted into `allow_stale_fallback`, in which case we fall
+        // through to spawn from the previous slot exe.
         // Phase 3: `frontend_only` FORCES a fresh `pnpm run build` in the
         // isolated override tree even when the dist-present idempotency gate
         // would otherwise skip it (a TS edit after the tree's last build would
@@ -4187,14 +4792,17 @@ async fn execute_spawn_build_inner(
         // whatever branch the shared checkout happened to be parked on.
         let source_kind =
             build_source.build_source_kind(git_ref_info.as_ref().map(|(_, s)| s.as_str()));
-        let run_detailed = |override_dir: Option<std::path::PathBuf>| {
+        let run_detailed = |override_dir: Option<std::path::PathBuf>,
+                            queue_budget: Option<std::time::Duration>,
+                            container_wait: Option<ContainerWait>| {
             let requester = requester_id.clone();
             let source_kind = source_kind.clone();
             async move {
                 // Shared phase marker the build future advances
-                // (AwaitingSlot → AwaitingNpmLock → BuildingFrontend →
-                // Compiling). On a queue timeout the future is cancelled
-                // mid-flight and returns no `BuildAttempt`, so reading this
+                // (AwaitingSlot → SlotHeld → AwaitingNpmLock →
+                // BuildingFrontend → Compiling, a worktree build visiting the
+                // frontend-lock wait twice). On a queue timeout the future is
+                // cancelled mid-flight and returns no `BuildAttempt`, so reading this
                 // marker is the ONLY way to compose a phase-accurate message —
                 // it reflects exactly what the cancelled future was doing.
                 let phase_marker = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
@@ -4208,40 +4816,35 @@ async fn execute_spawn_build_inner(
                     source_kind,
                     phase_marker.clone(),
                 );
-                match queue_timeout_secs {
-                    Some(secs) => {
-                        // `queue_timeout_secs` bounds the QUEUE, not the build.
-                        // It used to wrap the whole future, so a caller passing
-                        // a small bound to say "don't make me wait for a busy
-                        // pool" got a 504 that ALSO abandoned an already-
-                        // compiling slot — throwing away a live build (and
-                        // everything it had compiled) for a wait that had
-                        // already ended. The watcher below stops counting the
-                        // moment the build leaves its queue phases, so the
-                        // field now means what it is documented to mean.
-                        let timeout = std::time::Duration::from_secs(secs);
-                        let watcher = wait_out_queue_timeout(timeout, phase_marker.clone());
-                        tokio::pin!(fut);
-                        tokio::select! {
-                            r = &mut fut => r,
-                            phase = watcher => {
-                                let available_permits =
-                                    state.build_pool.permits.available_permits();
-                                Err((
-                                    SupervisorError::Timeout(
-                                        phase.timeout_message(secs, available_permits),
-                                    ),
-                                    crate::build_monitor::BuildAttempt::default(),
-                                ))
-                            }
-                        }
+                match queue_budget {
+                    // `budget` is what is left of the caller's budget for this
+                    // attempt; the message names the caller's whole budget, and
+                    // how much of it a wait for the container took first.
+                    Some(budget) => {
+                        race_build_against_queue_budget(
+                            state,
+                            fut,
+                            phase_marker,
+                            budget,
+                            queue_timeout_secs.unwrap_or(budget.as_secs()),
+                            container_wait.as_ref(),
+                        )
+                        .await
                     }
                     None => fut.await,
                 }
             }
         };
 
-        let mut build_result = run_detailed(build_dir_override.clone()).await;
+        // The first attempt queues with what the container wait left of the
+        // budget, and its 504 says how the budget was split; a poisoned-slot
+        // retry below queues afresh with all of it.
+        let mut build_result = run_detailed(
+            build_dir_override.clone(),
+            build_queue_budget,
+            container_wait,
+        )
+        .await;
 
         // Poisoned-slot self-heal (Issue 3 fix part 2). On a build FAILURE
         // whose stderr is NOT a genuine compiler diagnostic (no `error[E####]`,
@@ -4298,7 +4901,8 @@ async fn execute_spawn_build_inner(
                                 e
                             ),
                         }
-                        let retry = run_detailed(build_dir_override.clone()).await;
+                        let retry =
+                            run_detailed(build_dir_override.clone(), queue_budget, None).await;
                         match &retry {
                             Ok(_) => {
                                 tracing::info!(
@@ -4444,56 +5048,68 @@ async fn execute_spawn_build_inner(
                     // Fall through to exe-resolution + spawn below. If the
                     // resolution fails, we'll surface 500 there.
                 } else {
-                    // Release the placeholder port reservation.
-                    if let Some(container) = active_spawn_container.take() {
-                        state
-                            .active_spawn_worktrees
-                            .lock()
-                            .unwrap()
-                            .remove(&container);
-                    }
-                    let mut runners = state.runners.write().await;
-                    runners.remove(id);
+                    // The caller's reservation frees the placeholder's port.
+                    // (Returning drops `container_guard`: nothing will read
+                    // the tree.)
                     return Err(e);
                 }
             }
         }
+    }
 
-        // Build finished (success, or stale-fallback that didn't early-return).
-        // Unregister the active spawn container so the pruner may reap it once
-        // it ages out, then run an OPPORTUNISTIC prune sweep: a freshly-built
-        // `.spawn-*` container is the natural trigger to scrub OTHER stale
-        // scratch containers its parent dir accumulated. Best-effort + bounded
-        // — the sweep itself never fails the spawn request.
-        if let Some(container) = active_spawn_container.take() {
+    // The frontend verdict, read while `container_guard` still holds the
+    // managed container: the built tree's `dist/` cannot be deleted by a sweep
+    // or emptied by a queued same-ref build's `vite build` between the build
+    // and this read. Invariant: it inspects the tree whose dist/ the spawned
+    // exe embeds — the provenance build tree (`built_root`) when a
+    // `git_ref`/`worktree_path` build happened, the live tree otherwise. A
+    // build that failed into the stale fallback embedded no tree at all: its
+    // exe is a previous build's, so no tree on disk speaks for it (and
+    // `cleanup_worktree_on_fail` may have just removed this one) and only the
+    // slot's own frontend flag is read. It is ACTED on below, before any
+    // runner starts.
+    let checked_tree = if matches!(build_succeeded, Some(false)) {
+        None
+    } else {
+        match (built_root.as_deref(), git_ref_info.is_some()) {
+            (Some(root), true) => Some(CheckedTree::Managed(root)),
+            (Some(root), false) => Some(CheckedTree::CallerOwned(root)),
+            (None, _) => state.config.project_dir.parent().map(CheckedTree::Live),
+        }
+    };
+    let (frontend_stale, stale_reason, stale_slot_id) =
+        resolve_frontend_stale_for_spawn(state, checked_tree.map(CheckedTree::root)).await;
+
+    // Nothing reads the managed container after this point: the exe and its
+    // sidecars are deployed from the build slot, the runner runs in the live
+    // tree, and the provenance compares below run in the runner repo
+    // (`provenance_compare_root`). Release it so a queued same-ref build can
+    // start, and so a sweep may prune it once it ages out.
+    drop(container_guard);
+
+    // A managed build is the natural trigger to scrub OTHER stale scratch
+    // containers the workspace root accumulated: an OPPORTUNISTIC sweep. It
+    // runs after this spawn released its own container, so a queued same-ref
+    // build does not wait for it. That container stays under any retention
+    // window longer than the build, since `prepare_worktree` stamped it used
+    // when the build began; `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS=0` prunes
+    // it, which is harmless, because nothing reads it after the release.
+    // Best-effort + bounded — the sweep itself never fails the spawn request.
+    if git_ref_info.is_some() {
+        let report = state.sweep_spawn_worktrees(None).await;
+        if !report.removed.is_empty() || !report.failed.is_empty() {
             state
-                .active_spawn_worktrees
-                .lock()
-                .unwrap()
-                .remove(&container);
-
-            let active_now: std::collections::HashSet<std::path::PathBuf> =
-                state.active_spawn_worktrees.lock().unwrap().clone();
-            let report = crate::spawn_worktree::prune_spawn_worktrees(
-                &state.config.project_dir,
-                &active_now,
-                std::time::SystemTime::now(),
-            )
-            .await;
-            if !report.removed.is_empty() || !report.failed.is_empty() {
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Info,
-                        format!(
-                            "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
-                            report.removed.len(),
-                            report.failed.len()
-                        ),
-                    )
-                    .await;
-            }
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!(
+                        "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
+                        report.removed.len(),
+                        report.failed.len()
+                    ),
+                )
+                .await;
         }
     }
 
@@ -4531,22 +5147,16 @@ async fn execute_spawn_build_inner(
                     )
                     .await;
             }
-            Err(e) => {
-                let mut runners = state.runners.write().await;
-                runners.remove(id);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 
     // Check that a runner binary exists in some build slot (or at the legacy path).
     // Without this check, a fresh supervisor would succeed the request only to
-    // fail inside `start_managed_runner` with a less helpful error. If the check
-    // fails, remove the placeholder we reserved above so the port frees up.
+    // fail inside `start_managed_runner` with a less helpful error. A refusal
+    // here frees the placeholder's port through the caller's reservation.
     // Skip when use_lkg pinned an override above — we already verified that path.
     if !body.use_lkg && manager::resolve_source_exe(state).await.is_err() {
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
         return Err(SupervisorError::Process(
             "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
@@ -4558,6 +5168,24 @@ async fn execute_spawn_build_inner(
     // mark the build_result as reusing-stale so callers can detect it.
     if matches!(build_succeeded, Some(false)) {
         build_reused_stale = true;
+    }
+
+    // Refuse on the frontend verdict BEFORE starting a runner — never start
+    // one only to kill it. `DistMissing` and `BuildTreeRemoved` refuse
+    // unconditionally (`FrontendStaleReason::refuses_unconditionally`): a
+    // runner that embeds no frontend serves a blank screen at every route,
+    // and one whose built tree is gone embeds a frontend nobody can verify.
+    // The stale-but-functional reasons refuse only under `frontend_strict`.
+    // Placed after the exe checks above, so a spawn with no runner binary at
+    // all still says so. An `Ok` refusal still frees the placeholder's port:
+    // the reservation is released on every outcome that started no runner.
+    if let Some(reason) =
+        stale_reason.filter(|reason| reason.refuses_unconditionally() || body.frontend_strict)
+    {
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
+        ));
     }
 
     // Log label only — this value never reaches `RunnerConfig` (the
@@ -4575,8 +5203,8 @@ async fn execute_spawn_build_inner(
     // Either way the files land in THIS runner's per-instance config dir
     // BEFORE the runner starts — the dir the spawn exports as
     // `QONTINUI_SECURE_STORAGE_DIR`, and the only one the child reads its
-    // pairing from. On failure release the placeholder port and return the
-    // structured error body.
+    // pairing from. On failure return the structured error body; the caller's
+    // reservation frees the placeholder's port.
     //
     // Reported on the spawn-test response as `paired_state`, plus the legacy
     // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
@@ -4604,20 +5232,20 @@ async fn execute_spawn_build_inner(
         }
         Err((status, body_json)) => {
             // The copy may have already created the destination instance dir
-            // before a `fs::copy` failed. We are about to drop this runner
-            // from the registry, and the instance-dir reaper only visits
-            // REGISTERED runners — so the dir would leak forever. `id` is
-            // uuid-unique, so nothing else owns this path.
+            // before a `fs::copy` failed. The reservation is about to drop
+            // this runner from the registry, and the instance-dir reaper only
+            // visits REGISTERED runners — so the dir would leak forever. `id`
+            // is uuid-unique, so nothing else owns this path.
             if let Some(dest) = crate::process::instance_config_dir(id) {
                 let _ = std::fs::remove_dir_all(&dest);
             }
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-            drop(runners);
             return Ok((status, body_json));
         }
     };
 
+    // From here a panic or cancellation may abandon a spawned child, so the
+    // reservation's `Drop` keeps the entry; an `Err` return still releases it.
+    reservation.entering_start();
     // Start the runner using the Arc captured at insertion time. This avoids
     // an id-based lookup, which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
@@ -4632,17 +5260,21 @@ async fn execute_spawn_build_inner(
     )
     .await
     {
-        // Clean up on failure — the registry entry AND the instance dir the
-        // paired-state copy just populated (it holds a copy of the
-        // operator's credential store, and the instance-dir reaper only
-        // visits registered runners, so it would otherwise leak forever).
+        // Clean up on failure — the instance dir the paired-state copy just
+        // populated (it holds a copy of the operator's credential store, and
+        // the instance-dir reaper only visits registered runners, so it would
+        // otherwise leak forever). The registry entry goes with the
+        // reservation, which is still armed.
         if let Some(dest) = crate::process::instance_config_dir(id) {
             let _ = std::fs::remove_dir_all(&dest);
         }
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
+        reservation.start_failed();
         return Err(e);
     }
+    // Started: the runner may be running, and its id is the caller's handle on
+    // it, so no later outcome gives the reservation back. A failure from here
+    // on stops the runner and removes its entry itself (the probe below).
+    reservation.disarm();
 
     state
         .logs
@@ -4797,7 +5429,7 @@ async fn execute_spawn_build_inner(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -4857,7 +5489,7 @@ async fn execute_spawn_build_inner(
 
                     // Clear localStorage for this port to avoid stale tab state
                     let clear_url =
-                        format!("http://localhost:{}/ui-bridge/control/clear-storage", port);
+                        format!("{}/control/clear-storage", runner_ui_bridge_base(port));
                     if let Err(e) = client
                         .post(&clear_url)
                         .json(&serde_json::json!({}))
@@ -4889,75 +5521,6 @@ async fn execute_spawn_build_inner(
             .ok()
             .and_then(|p| crate::process::manager::binary_meta(&p))
     };
-
-    // Determine if the slot we used for the binary has a stale frontend
-    // baked in (build failure) OR if `src/` is newer than `dist/index.html`
-    // (someone forgot to `npm run build`). Either way, the runner ships with
-    // a UI that doesn't reflect current source.
-    //
-    // Invariant: the staleness check must inspect the tree whose dist/ the
-    // spawned exe embeds — the provenance build tree (`built_root`) when a
-    // `git_ref`/`worktree_path` build happened, the live tree otherwise.
-    let (frontend_stale, stale_reason, stale_slot_id) = resolve_frontend_stale_for_spawn(
-        state,
-        built_root.as_deref().or(state.config.project_dir.parent()),
-    )
-    .await;
-
-    // Short-circuit with 503 before reporting success when the spawned
-    // runner would serve a broken or stale UI. Two triggers:
-    //
-    //  1. `DistMissing` — ALWAYS hard-fails, regardless of `frontend_strict`.
-    //     A missing `dist/index.html` is not "stale but functional": the
-    //     runner has NO embedded frontend and serves `asset not found:
-    //     index.html` at every route — a blank screen. Returning
-    //     `status=healthy` here lies to the caller (a manual-test run caught
-    //     exactly this: gutted `node_modules/.bin` + empty `dist/` → the
-    //     freshly-built runner embedded a blank frontend, yet spawn-test only
-    //     warned and reported healthy). A blank UI is never healthy, so the
-    //     default path must refuse the spawn, not warn-and-serve.
-    //
-    //  2. Any other `frontend_stale` reason (`BuildFailed` / `SrcDrift`) —
-    //     hard-fails only when the caller opted into strict-frontend
-    //     enforcement via `frontend_strict: true`. These are stale-but-
-    //     functional (the UI renders, just not the latest source), so the
-    //     default stays warn-and-serve for back-compat.
-    let dist_missing = matches!(stale_reason, Some(FrontendStaleReason::DistMissing));
-    if frontend_stale && (dist_missing || body.frontend_strict) {
-        // Stop the runner we just spawned — we will not ship a broken/stale
-        // UI to the caller. `force: true` for the same reason as the
-        // failed-probe teardown above: nothing has ever run on this runner.
-        let _ = manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
-        {
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-        }
-        state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let message = if dist_missing {
-            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
-             missing, so the runner would embed no frontend and serve a blank screen \
-             (`asset not found: index.html`) at every route. Run \
-             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
-             unconditional: a missing dist is never reported as healthy."
-                .to_string()
-        } else {
-            format!(
-                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
-                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
-                 or pass {{\"frontend_strict\": false}} to override.",
-                reason_str
-            )
-        };
-        let body = json!({
-            "error": if dist_missing { "frontend_dist_missing" } else { "frontend_stale" },
-            "message": message,
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
-    }
 
     // Item A: assemble the build_result JSON object. `slot_id` reads
     // last_successful_slot AFTER the build (or after the no-op when
@@ -5027,8 +5590,8 @@ async fn execute_spawn_build_inner(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         // Per-runner log endpoints — these capture the runner's own
         // stdout/stderr. /logs/history on the supervisor has the
         // supervisor's own buffer and does NOT include runner logs, so
@@ -5160,65 +5723,34 @@ async fn execute_spawn_build_inner(
         }
     }
 
-    // Provenance for a git_ref build: the requested ref and the SHA the
-    // managed worktree actually resolved to. Only present when a git_ref
-    // build occurred (rebuild:true + git_ref).
-    //
-    // Field shape (kept stable for downstream callers / agents):
-    //   git_ref               — the input ref verbatim (e.g. "origin/main").
-    //   git_ref_resolved      — echo alias of git_ref so callers that want a
-    //                           "resolved" label don't have to special-case.
-    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the
-    //                           prepared worktree.
+    // Build-tree provenance: which runner tree and which schemas sibling were
+    // compiled. A managed worktree (the default `origin/main` build or a
+    // `git_ref`) and a caller-owned `worktree_path` are rendered by
+    // `SpawnBuildTree::attach`, which `execute_spawn_build` also applies to
+    // every failure body. Field shape (kept stable for downstream callers):
+    //   source                — `origin_main` (the default), `worktree` (an
+    //                           explicit ref), `worktree_path`, or `live_tree`.
+    //                           Callers that need a single-field "where did
+    //                           the binary come from?" answer branch on this.
+    //   git_ref / git_ref_resolved
+    //                         — the input ref verbatim, and its echo alias.
+    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the tree.
     //   git_ref_resolved_sha_short
-    //                         — 12-char abbreviated SHA for log-readable
-    //                           comparison against `git rev-parse origin/main
-    //                           | head -c 12`. Always derived from
-    //                           git_ref_resolved_sha; never re-shells out to
-    //                           git so it's a pure presentational helper.
-    //   source                — "worktree" when this build came from the
-    //                           managed detached worktree; absent when the
-    //                           live tree was used. Callers that need a
-    //                           single-field "where did the binary come
-    //                           from?" answer can branch on this.
-    if let Some((requested_ref, resolved_sha)) = &git_ref_info {
-        let short = resolved_sha.chars().take(12).collect::<String>();
-        resp["git_ref"] = json!(requested_ref);
-        resp["git_ref_resolved"] = json!(requested_ref);
-        resp["git_ref_resolved_sha"] = json!(resolved_sha);
-        resp["git_ref_resolved_sha_short"] = json!(short);
-        // `origin_main` for the DEFAULT path, `worktree` for an explicitly
-        // requested ref — so a caller can tell "the supervisor picked merged
-        // truth for me" from "I asked for this ref" without re-reading
-        // `git_ref`.
-        resp["source"] = json!(build_source.label());
-    } else if let Some(wt) = &worktree_path_info {
-        // Phase 2 — `worktree_path` provenance. Echo the canonical path, the
-        // worktree's HEAD SHA (when it's a git checkout) reusing the same
-        // `git_ref_resolved_sha`/`_short` field names callers already parse,
-        // and the schemas-sibling drift provenance (`schemas_path`,
-        // `schemas_sha`, `schemas_is_shared`). `source: "worktree_path"`
-        // distinguishes it from a managed `git_ref` worktree.
-        resp["source"] = json!("worktree_path");
-        resp["worktree_path"] = json!(wt.worktree_path.to_string_lossy());
-        if let Some(sha) = &wt.resolved_sha {
-            let short = sha.chars().take(12).collect::<String>();
-            resp["git_ref_resolved_sha"] = json!(sha);
-            resp["git_ref_resolved_sha_short"] = json!(short);
-        }
-        resp["schemas_path"] = match &wt.schemas_path {
-            Some(p) => json!(p.to_string_lossy()),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_sha"] = match &wt.schemas_sha {
-            Some(s) => json!(s),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_is_shared"] = json!(wt.schemas_is_shared);
-    } else {
+    //                         — its 12-char prefix, for comparison against
+    //                           `git rev-parse origin/main | head -c 12`.
+    //   worktree_path         — the caller-owned checkout (that arm only).
+    //   schemas_path / schemas_sha / schemas_is_shared
+    //                         — the schemas sibling the path-deps resolved to.
+    //   schemas_pin_ref / schemas_pin_source
+    //                         — managed worktrees only: the runner tree's
+    //                           declared `.github/sibling-pins.conf` sha
+    //                           (`sibling_pins_conf`), or `origin/main`
+    //                           (`origin_main_fallback`).
+    match &side.tree {
+        Some(tree) => tree.attach(&mut resp),
         // Explicit "live_tree" provenance so callers can always branch on a
         // present field rather than needing missing-field handling.
-        resp["source"] = json!("live_tree");
+        None => resp["source"] = json!("live_tree"),
     }
 
     // Item 8 — build-vintage warning. `source` says WHICH tree was compiled but
@@ -5312,19 +5844,7 @@ async fn execute_spawn_build_inner(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
 
         // The legacy `X-Frontend-Stale: 1` response header can't ride a stored
         // submission outcome, so the sync handler re-attaches it by branching on
@@ -5347,6 +5867,18 @@ async fn execute_spawn_build_inner(
 ///   `supervisor-frontend-build-silent-success.md`. Surface it loudly
 ///   instead so callers learn the runner will serve `asset not found:
 ///   index.html`.
+/// - `BuildTreeRemoved`: the built tree's root itself does not exist, so
+///   nothing can say which frontend the binary embeds. Reporting that as
+///   `DistMissing` claimed a blank UI it had not observed, and its `npm run
+///   build` remedy sent the operator after a dist/ that was never the problem
+///   (plan
+///   `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+///   A managed build reads its verdict while it holds the container's lock,
+///   so no sweep removes its tree first; it still meets this when something
+///   outside the supervisor removed the tree. A caller-owned `worktree_path`
+///   meets it when its owner removed it, and the live tree when that checkout
+///   is gone. A build that failed into the stale fallback never reads a tree
+///   here: its exe is a previous build's.
 ///
 /// Reported back to callers via `frontend_stale_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5354,6 +5886,7 @@ enum FrontendStaleReason {
     BuildFailed,
     SrcDrift,
     DistMissing,
+    BuildTreeRemoved,
 }
 
 impl FrontendStaleReason {
@@ -5362,7 +5895,142 @@ impl FrontendStaleReason {
             FrontendStaleReason::BuildFailed => "build_failed",
             FrontendStaleReason::SrcDrift => "src_newer_than_dist",
             FrontendStaleReason::DistMissing => "dist_missing",
+            FrontendStaleReason::BuildTreeRemoved => "build_tree_removed",
         }
+    }
+
+    /// Whether a spawn door refuses on this reason whatever `frontend_strict`
+    /// says. `DistMissing` is not "stale but functional": the runner has NO
+    /// embedded frontend and serves `asset not found: index.html` at every
+    /// route — a blank screen, never healthy (a manual-test run caught a
+    /// gutted `node_modules/.bin` + empty `dist/` reported healthy). With
+    /// `BuildTreeRemoved` nobody can say which frontend it embeds, and an
+    /// UNKNOWN is not reported as healthy either. `BuildFailed` / `SrcDrift`
+    /// are stale but functional (the UI renders, just not the latest source),
+    /// so they refuse only when the caller opts in with `frontend_strict`.
+    fn refuses_unconditionally(self) -> bool {
+        matches!(
+            self,
+            FrontendStaleReason::DistMissing | FrontendStaleReason::BuildTreeRemoved
+        )
+    }
+}
+
+/// The tree a spawn door's frontend verdict reads, and so who can bring it
+/// back when it is gone ([`FrontendStaleReason::BuildTreeRemoved`]).
+#[derive(Clone, Copy, Debug)]
+enum CheckedTree<'a> {
+    /// A managed `.spawn-<ref>` container's runner worktree: a spawn
+    /// materializes it again.
+    Managed(&'a std::path::Path),
+    /// A caller-owned `worktree_path` checkout: only its owner can restore it.
+    CallerOwned(&'a std::path::Path),
+    /// The live runner checkout the supervisor's `--project-dir` names.
+    Live(&'a std::path::Path),
+}
+
+impl<'a> CheckedTree<'a> {
+    fn root(self) -> &'a std::path::Path {
+        match self {
+            CheckedTree::Managed(root)
+            | CheckedTree::CallerOwned(root)
+            | CheckedTree::Live(root) => root,
+        }
+    }
+
+    /// What brings this tree back once it is gone. Only a managed container
+    /// comes back with a retry.
+    fn remedy_when_removed(self) -> &'static str {
+        match self {
+            CheckedTree::Managed(_) => {
+                "Retry the spawn: it materializes the container again. The spawn-worktree sweeps (the startup sweep, the sweep after a spawn-test build, `DELETE /spawn-worktrees`) keep a container while a build holds its lock, so something outside the supervisor removed it."
+            }
+            CheckedTree::CallerOwned(_) => {
+                "The supervisor never creates or removes a `worktree_path` tree, so a retry of this request cannot help: restore that checkout, or pass a `worktree_path` that exists."
+            }
+            CheckedTree::Live(_) => {
+                "It is the live runner checkout the supervisor's `--project-dir` names, so a retry cannot help: restore that checkout."
+            }
+        }
+    }
+}
+
+/// The 503 body a spawn door answers with when it refuses a spawn on its
+/// frontend verdict: `reason` refuses unconditionally, or the caller asked
+/// for `frontend_strict`. `checked` is the tree the verdict read.
+///
+/// `error` is a token per refusal (`frontend_dist_missing`,
+/// `frontend_build_tree_removed`, `frontend_stale` for a strict refusal),
+/// and each message names the remedy that fits its own cause. A removed tree
+/// is not a dist/ problem, so its message never recommends rebuilding the
+/// frontend, and it offers a retry only where a retry brings the tree back.
+fn frontend_refusal_body(
+    reason: FrontendStaleReason,
+    stale_slot_id: Option<usize>,
+    checked: Option<CheckedTree<'_>>,
+) -> serde_json::Value {
+    let (error, message) = match reason {
+        FrontendStaleReason::DistMissing => (
+            "frontend_dist_missing",
+            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
+             missing, so the runner would embed no frontend and serve a blank screen \
+             (`asset not found: index.html`) at every route. Run \
+             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
+             unconditional: a missing dist is never reported as healthy."
+                .to_string(),
+        ),
+        FrontendStaleReason::BuildTreeRemoved => (
+            "frontend_build_tree_removed",
+            format!(
+                "frontend_build_tree_removed: refusing to spawn — the tree this spawn built \
+                 ({}) no longer exists, so nothing can say which frontend the runner would \
+                 embed, and its dist/ was never the problem. {}",
+                checked.map_or_else(
+                    || "unresolved".to_string(),
+                    |tree| tree.root().display().to_string()
+                ),
+                checked.map_or("", CheckedTree::remedy_when_removed),
+            ),
+        ),
+        FrontendStaleReason::BuildFailed | FrontendStaleReason::SrcDrift => (
+            "frontend_stale",
+            format!(
+                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
+                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
+                 or pass {{\"frontend_strict\": false}} to override.",
+                reason.as_str()
+            ),
+        ),
+    };
+    json!({
+        "error": error,
+        "message": message,
+        "frontend_stale": true,
+        "frontend_stale_reason": reason.as_str(),
+        "stale_slot_id": stale_slot_id,
+    })
+}
+
+/// The `warnings` entry of a spawn served with a stale frontend, the same at
+/// both spawn doors. The doors answer a reason that refuses unconditionally
+/// with [`frontend_refusal_body`] instead, so only `BuildFailed` / `SrcDrift`
+/// reach this from them; the other arms describe their reason all the same.
+fn frontend_stale_warning(
+    reason: Option<FrontendStaleReason>,
+    stale_slot_id: Option<usize>,
+) -> String {
+    match reason {
+        Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
+            Some(sid) => format!(
+                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                sid
+            ),
+            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        },
+        Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+        Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
+        Some(FrontendStaleReason::BuildTreeRemoved) => "frontend_stale: the tree this spawn built no longer exists, so nothing can say which frontend the runner embeds.".to_string(),
+        None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
     }
 }
 
@@ -5406,7 +6074,9 @@ async fn resolve_frontend_stale_for_spawn(
         return (true, Some(FrontendStaleReason::BuildFailed), None);
     }
 
-    // (2) On-disk dist/ check — handles two cases:
+    // (2) On-disk dist/ check — handles three cases:
+    //   - the built tree itself is gone (`BuildTreeRemoved`): its dist/ says
+    //     nothing about what the binary embeds.
     //   - `dist/index.html` is missing entirely (the silent-success bug:
     //     prior to 2026-05-11 this returned "not stale" and the runner
     //     went on to serve `asset not found: index.html`).
@@ -5427,8 +6097,12 @@ async fn resolve_frontend_stale_for_spawn(
 /// return the appropriate `FrontendStaleReason` (or `None` if the dist on
 /// disk genuinely covers the current source).
 ///
-/// Three outcomes:
+/// Four outcomes:
 ///
+/// - `Some(BuildTreeRemoved)` — `runner_root` itself is gone (positively
+///   absent, not merely unreadable), so its dist/ says nothing about the
+///   frontend the binary embeds. Read as `DistMissing` before, it sent a
+///   caller after an `npm run build` that could not help.
 /// - `Some(DistMissing)` — `dist/index.html` doesn't exist on disk. Prior
 ///   to 2026-05-11 this silently returned "not stale", which let the
 ///   runner spawn with no embedded frontend and serve `asset not found:
@@ -5442,6 +6116,12 @@ async fn resolve_frontend_stale_for_spawn(
 ///   to).
 async fn check_dist_freshness(runner_root: &std::path::Path) -> Option<FrontendStaleReason> {
     use std::time::SystemTime;
+
+    // Only a positive answer of absence counts: an error reading the root is
+    // left to the dist/ check below, as it was before this arm existed.
+    if matches!(runner_root.try_exists(), Ok(false)) {
+        return Some(FrontendStaleReason::BuildTreeRemoved);
+    }
 
     let dist_index = runner_root.join("dist").join("index.html");
     let src_root = runner_root.join("src");
@@ -5538,7 +6218,7 @@ enum ProbeOutcome {
     },
 }
 
-/// Poll `GET http://localhost:{port}/health` every 200ms until it succeeds or
+/// Poll `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
 /// `timeout_ms` elapses. On failure, also reports whether the child process
 /// is still alive and snapshots the last 20 log lines from the runner's
 /// per-runner buffer.
@@ -5551,7 +6231,7 @@ async fn probe_runner_health(
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let interval = std::time::Duration::from_millis(200);
     let start = std::time::Instant::now();
-    let url = format!("http://localhost:{}/health", port);
+    let url = format!("{}/health", runner_loopback_base(port));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build()
@@ -5808,6 +6488,49 @@ pub async fn spawn_named(
         (id, port, managed)
     };
 
+    // Everything after the reservation runs on its own task, from the dev-action mint
+    // (a coord fetch, so a window a client can hang up in) through the build, the
+    // start, the health wait, the `DistMissing` teardown and the recorded verdict. A
+    // client that hangs up (dropping this future) changes nothing about what happens
+    // to the runner or to its action; one that stays sees exactly the response it
+    // always did.
+    let (status, resp) = manager::run_detached(spawn_named_after_reservation(
+        state,
+        Arc::new(body),
+        name,
+        id,
+        port,
+        managed,
+        no_wait,
+    ))
+    .await?;
+    let frontend_stale = resp
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut response = (status, Json(resp)).into_response();
+    if status == axum::http::StatusCode::OK && frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+    }
+    Ok(response)
+}
+
+/// What a spawn-named does once its placeholder holds the port, on the task
+/// [`spawn_named`] detaches it onto: stamp the requester, mint the dev-action, run
+/// [`spawn_named_inner`], record the terminal result and render the body. Always
+/// `Ok`: a failed spawn is a status and a body, stamped with its action like a
+/// successful one, so the caller can reach the verdict.
+async fn spawn_named_after_reservation(
+    state: SharedState,
+    body: Arc<SpawnNamedRequest>,
+    name: String,
+    id: String,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // friction-1: stamp the owning requester (mirror of spawn_test).
     if body.requester_id.is_some() {
         *managed.requester_id.write().await = body.requester_id.clone();
@@ -5823,9 +6546,9 @@ pub async fn spawn_named(
     )
     .await;
     let action_id = minted.record.action_id;
-    // The inner future runs inside this handler, so a client disconnect drops
-    // it: the guard records the action abandoned then.
-    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's handler future");
+    // The guard records the action abandoned if this task is dropped or panics
+    // before the verdict below; a client hanging up does not drop it.
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's detached task");
 
     let mut answered_at = None;
     let result = spawn_named_inner(
@@ -5863,18 +6586,7 @@ pub async fn spawn_named(
     };
     // Dev-action snapshot fields (in-place ACK enrichment per §6.1), on a
     // failed response too, so its caller can reach the verdict.
-    let resp = minted.stamp(resp);
-    let frontend_stale = resp
-        .get("frontend_stale")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut response = (status, Json(resp)).into_response();
-    if status == axum::http::StatusCode::OK && frontend_stale {
-        response
-            .headers_mut()
-            .insert("X-Frontend-Stale", "1".parse().unwrap());
-    }
-    Ok(response)
+    Ok((status, minted.stamp(resp)))
 }
 
 /// spawn-named from "Item A" on: build, start, wait, assemble. Returns the
@@ -6020,9 +6732,13 @@ async fn spawn_named_inner(
     // non-pool artifact instead of refusing it — and the response says so.
     *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
 
-    // Start the runner using the Arc captured at insertion time (race-free
-    // — no re-lookup of `id` which could fail transiently under concurrent
-    // load).
+    // This whole function runs on the task [`spawn_named`] detaches
+    // ([`spawn_named_after_reservation`]), so the start, its settings row and the
+    // health wait below all outlive a client that hangs up: a live named runner with
+    // no row would not survive a supervisor restart.
+    //
+    // Start the runner using the Arc captured at insertion time (race-free — no
+    // re-lookup of `id` which could fail transiently under concurrent load).
     if let Err(e) = manager::start_managed_runner(
         &state,
         &managed,
@@ -6075,7 +6791,7 @@ async fn spawn_named_inner(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -6138,24 +6854,33 @@ async fn spawn_named_inner(
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
     // spawn-named has no provenance selectors — it always builds the live
-    // tree, so the live tree IS the built tree here.
+    // tree, so the live tree IS the built tree here. As at spawn-test, a
+    // build that failed into the stale fallback reuses a previous build's
+    // exe, which no tree on disk speaks for: only the slot's flag is read.
+    let checked_tree = if build_reused_stale {
+        None
+    } else {
+        state.config.project_dir.parent().map(CheckedTree::Live)
+    };
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state, state.config.project_dir.parent()).await;
+        resolve_frontend_stale_for_spawn(&state, checked_tree.map(CheckedTree::root)).await;
 
-    // DistMissing hard-fail (symmetric with spawn_test). A missing
+    // The unconditional refusals, symmetric with spawn_test
+    // (`FrontendStaleReason::refuses_unconditionally`). A missing
     // `dist/index.html` means the runner embeds NO frontend and serves a
-    // blank screen (`asset not found: index.html`) at every route — never a
+    // blank screen (`asset not found: index.html`) at every route, and a
+    // removed tree means nobody can say which frontend it embeds — never a
     // `healthy` outcome. Unlike `SrcDrift`/`BuildFailed` (stale-but-
-    // functional), this is unconditional. Tear the named runner back down
-    // (stop, drop from the registry, AND remove the just-persisted settings
-    // entry so it doesn't resurrect on the next supervisor restart) and
-    // return 503 instead of reporting a blank UI as healthy.
-    if frontend_stale && matches!(stale_reason, Some(FrontendStaleReason::DistMissing)) {
+    // functional), these do not wait for an opt-in. Tear the named runner
+    // back down (stop, drop from the registry, AND remove the just-persisted
+    // settings entry so it doesn't resurrect on the next supervisor restart)
+    // and return 503 instead of reporting it as healthy.
+    if let Some(reason) = stale_reason.filter(|reason| reason.refuses_unconditionally()) {
         // `force: true`: a NAMED runner, so the gate would otherwise apply —
         // but this is the teardown of a runner spawned moments ago that we are
-        // refusing to hand back because it embeds no frontend. It has never
-        // hosted a session, and leaving it running while also returning 503
-        // would leak it.
+        // refusing to hand back because of its frontend. It has never hosted
+        // a session, and leaving it running while also returning 503 would
+        // leak it.
         let _ = manager::stop_runner_by_id(&state, &id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
@@ -6164,18 +6889,10 @@ async fn spawn_named_inner(
         let settings_path = settings::settings_path(&state.config);
         settings::remove_runner(&settings_path, &id);
         state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let body = json!({
-            "error": "frontend_dist_missing",
-            "message": "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html \
-                is missing, so the runner would embed no frontend and serve a blank screen \
-                (`asset not found: index.html`) at every route. Run \
-                `cd qontinui-runner && npm run build` to rebuild dist/, then retry.",
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
+        ));
     }
 
     // Item A: assemble build_result alongside the existing top-level
@@ -6197,8 +6914,8 @@ async fn spawn_named_inner(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "build_result": build_result,
@@ -6232,19 +6949,7 @@ async fn spawn_named_inner(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
         // The handler adds the `X-Frontend-Stale: 1` header for this body.
         return Ok((axum::http::StatusCode::OK, resp));
     }
@@ -6662,9 +7367,10 @@ pub async fn list_builds(
 
 #[derive(Deserialize, Default)]
 pub struct PruneSpawnQuery {
-    /// Retention window override in hours. A container is prunable once its
-    /// mtime is older than this (dirty registered worktrees need DOUBLE). When
-    /// omitted, the engine resolves the window from
+    /// Retention window override in hours. A container is prunable once it
+    /// was last used longer ago than this (its mtime, which `prepare_worktree`
+    /// stamps on every use; dirty registered worktrees need DOUBLE) and no
+    /// build holds it. When omitted, the engine resolves the window from
     /// `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS` / its 48h default.
     #[serde(default)]
     pub older_than_hours: Option<u64>,
@@ -6675,10 +7381,13 @@ pub struct PruneSpawnQuery {
 ///
 /// Thin wrapper over the existing engine
 /// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
-/// owns ALL selection + safety (prefix-under-root filter, active-build
-/// exclusion, age + dirty double-retention). This handler only:
-///   1. passes the LIVE active-container set from state (same source the
-///      opportunistic sweep uses),
+/// owns ALL selection + safety (prefix-under-root filter, the in-use
+/// exclusion, last-use age + dirty double-retention). This handler only:
+///   1. runs it through `SupervisorState::sweep_spawn_worktrees`, on a task of
+///      its own and with the supervisor's container locks, so a container a
+///      build holds is kept as in use — even under `older_than_hours=0`, which
+///      otherwise prunes every container at once — and a client that hangs up
+///      mid-sweep cannot cut a removal short,
 ///   2. forwards the optional `older_than_hours` window override,
 ///   3. measures container sizes BEFORE the delete so it can report
 ///      `bytes_freed`,
@@ -6711,17 +7420,10 @@ pub async fn prune_spawn_worktrees_endpoint(
             Err(_) => std::collections::HashMap::new(),
         };
 
-    // Live active-build container set — mirror the opportunistic sweep.
-    let active_now: std::collections::HashSet<std::path::PathBuf> =
-        state.active_spawn_worktrees.lock().unwrap().clone();
-
-    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
-        &state.config.project_dir,
-        &active_now,
-        std::time::SystemTime::now(),
-        query.older_than_hours,
-    )
-    .await;
+    // On a task of its own: a client that hangs up mid-sweep drops only its
+    // wait, so the sweep holds each container's lock until that container's
+    // removal is done (`SupervisorState::sweep_spawn_worktrees`).
+    let report = state.sweep_spawn_worktrees(query.older_than_hours).await;
 
     let bytes_freed: u64 = report
         .removed

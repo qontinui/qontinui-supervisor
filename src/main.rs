@@ -30,6 +30,7 @@ mod fs_atomic;
 mod git_provenance;
 mod health_cache;
 mod log_capture;
+mod loopback;
 mod origin_guard;
 mod otel;
 mod pii_scrub;
@@ -62,6 +63,8 @@ mod spawn_worktree;
 mod state;
 #[cfg(test)]
 mod test_clock;
+#[cfg(test)]
+mod test_env;
 #[cfg(test)]
 mod test_ports;
 mod trace_propagation;
@@ -583,7 +586,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
-    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+    // The same constant every URL the supervisor builds for itself or a runner
+    // names (`loopback::loopback_base`), so the address a client dials is the
+    // one this listener binds.
+    let bind_addr = std::net::SocketAddr::from((loopback::LOOPBACK_IP, port));
     let listener = {
         let mut attempts = 0;
         loop {
@@ -615,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    info!("Supervisor listening on http://127.0.0.1:{}", port);
+    info!("Supervisor listening on {}", loopback::loopback_base(port));
 
     // Spawn the ambient dashboard WebView2 window (item B of the post-3J UI
     // Bridge improvements plan). Runs on its own dedicated OS thread so it
@@ -633,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
         if state.config.no_webview {
             info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW)");
         } else {
-            webview::spawn_webview_thread(format!("http://127.0.0.1:{}/", port));
+            webview::spawn_webview_thread(format!("{}/", loopback::loopback_base(port)));
         }
     }
 
@@ -648,19 +654,17 @@ async fn main() -> anyhow::Result<()> {
 
     // One-shot startup sweep of stale `.spawn-*` scratch worktree containers
     // (deferred #64 Phase 4). Non-blocking — spawned as its own task so a slow
-    // `git worktree remove` of a GB-scale checkout never delays serving. No
-    // build is active at startup, so the active-container exclusion set is
-    // empty. Best-effort: the pruner logs + swallows every failure internally.
+    // `git worktree remove` of a GB-scale checkout never delays serving. It
+    // runs concurrently with whatever the supervisor does next, so it is handed
+    // the container locks: a spawn-test or primary rebuild that has already
+    // taken its container's lock keeps that container, and one that arrives
+    // while the sweep removes it waits for the removal and then materializes
+    // a fresh one. Best-effort: the pruner logs + swallows every failure
+    // internally.
     {
         let state_for_prune = state.clone();
         tokio::spawn(async move {
-            let active = std::collections::HashSet::new();
-            let report = spawn_worktree::prune_spawn_worktrees(
-                &state_for_prune.config.project_dir,
-                &active,
-                std::time::SystemTime::now(),
-            )
-            .await;
+            let report = state_for_prune.sweep_spawn_worktrees(None).await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
                 state_for_prune
                     .logs

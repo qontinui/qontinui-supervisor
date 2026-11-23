@@ -157,8 +157,10 @@ pub struct ManagedRunner {
     /// Orders this runner's starts, stops and removals against each other.
     ///
     /// `start_managed_runner` holds it from before what its `StartAs` requires,
-    /// a restart's re-insert included, until it returns, so through recording the
-    /// spawn and spawning that spawn's exit monitor.
+    /// a restart's re-insert included, until the start ends, so through recording
+    /// the spawn and spawning that spawn's exit monitor. An `Arc` because that
+    /// start runs on its own task, which owns the guard, so a caller that goes away
+    /// cannot end the start between the two.
     /// `stop_runner_by_id` holds it from its latch through its reset and a
     /// `test-*` runner's teardown. `reap_stale_test_runners`, the purge-stale
     /// sweep and `DELETE /runners/{id}` `try_lock` it, skip or refuse on contention
@@ -168,7 +170,7 @@ pub struct ManagedRunner {
     /// `restart_after_gate` holds it around neither of its two calls. The exit
     /// monitor never takes it: a stop's graceful wait, under this lock, is
     /// waiting for the monitor to clear `running`.
-    pub lifecycle: tokio::sync::Mutex<()>,
+    pub lifecycle: Arc<tokio::sync::Mutex<()>>,
     /// The spawn-isolation verdict of this supervisor's most recent start of
     /// the runner (plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
     /// and-orphans-its-temp-runners`, Phase 1b). On Linux a user-owned runner is
@@ -214,14 +216,15 @@ pub struct SpawnMarker {
     /// not: an exit nobody asked for, a crash, an unrequested clean exit, the
     /// first-healthy watchdog's kill of a wedged boot, which latches no stop,
     /// or an exit that had already happened when the stop was latched
-    /// ([`SpawnRing::stamp_exit`]). And `None` while no exit is stamped.
+    /// ([`SpawnRing::stamp_exit`]). While no exit is stamped it is `None`, unless a
+    /// later start has cleared a stop request meant for this spawn and carried it
+    /// here ([`SpawnRing::carry_stop_request`]), since the flag that monitor would
+    /// have read is gone by then.
     ///
-    /// Two lags the lifecycle lock cannot close, since the monitor waits
-    /// outside it. `exited_at` is read after the wait's wake-up, so a stop
-    /// latched between the real exit and that wake-up still dates before it
-    /// and reads as the exit's request. And a monitor that wakes only after a
-    /// later start recorded its spawn reads that start's cleared flag, so a
-    /// requested exit read that late stamps `None` (see the residual of
+    /// One lag the lifecycle lock cannot close, since the monitor waits outside
+    /// it: `exited_at` is read after the wait's wake-up, so a stop latched between
+    /// the real exit and that wake-up still dates before it and reads as the
+    /// exit's request (see the residual of
     /// `dev_action::attribution::is_startup_panic_of`).
     pub stop_requested_at: Option<DateTime<Utc>>,
     /// The panic the exit monitor parsed from the runner's panic log at that
@@ -313,10 +316,12 @@ impl SpawnRing {
     /// Stamp the exit of the spawn recorded at `spawned_at`: when it exited,
     /// and when a stop requested that exit. The monitor names the spawn it
     /// watches rather than a pid, so an exit cannot land on another spawn that
-    /// got the same pid from the OS. A request dated after `exited_at` is
-    /// dropped: that exit had already happened, so that stop did not ask for
-    /// it. Returns `false`, and changes nothing, when no entry matches: the
-    /// ring dropped that spawn.
+    /// got the same pid from the OS. A request a later start carried onto the entry
+    /// wins over the one the monitor read: it is known to be this spawn's, while the
+    /// flag may by then be a stop of the later spawn. A request dated after
+    /// `exited_at` is dropped: that exit had already happened, so that stop did
+    /// not ask for it. Returns `false`, and changes nothing, when no entry matches:
+    /// the ring dropped that spawn.
     pub fn stamp_exit(
         &mut self,
         spawned_at: DateTime<Utc>,
@@ -330,11 +335,27 @@ impl SpawnRing {
         {
             Some(spawn) => {
                 spawn.exited_at = Some(exited_at);
-                spawn.stop_requested_at =
-                    stop_requested_at.filter(|requested| *requested <= exited_at);
+                spawn.stop_requested_at = spawn
+                    .stop_requested_at
+                    .or(stop_requested_at)
+                    .filter(|requested| *requested <= exited_at);
                 true
             }
             None => false,
+        }
+    }
+
+    /// Keep a stop request that the next start is about to clear, on the spawn it
+    /// was meant for: the newest entry, while its exit is not stamped. That
+    /// spawn's monitor has not read the flag yet and will read it cleared.
+    /// An entry whose exit is stamped keeps what its monitor read.
+    pub fn carry_stop_request(&mut self, requested_at: DateTime<Utc>) {
+        if let Some(spawn) = self
+            .entries
+            .back_mut()
+            .filter(|spawn| spawn.exited_at.is_none())
+        {
+            spawn.stop_requested_at = Some(requested_at);
         }
     }
 
@@ -511,7 +532,7 @@ impl ManagedRunner {
             resolved_exe: RwLock::new(None),
             allow_unverified_exe: RwLock::new(false),
             spawn_in_flight: std::sync::Mutex::new(None),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             isolation: RwLock::new(None),
         }
     }
@@ -621,10 +642,11 @@ pub struct SupervisorState {
     pub cached_runner_health: RwLock<Vec<CachedRunnerHealth>>,
     pub health_cache_notify: Notify,
     pub http_client: reqwest::Client,
-    /// Port the legacy `/ui-bridge/*`, `/runner-api/*` and `/graphql` proxies
-    /// forward to.
+    /// Port of the primary runner: the legacy `/ui-bridge/*`, `/runner-api/*`
+    /// and `/graphql` proxies forward to it, and the temp-runner spawn asks it
+    /// for a placement (`process::env_forwarders`).
     /// Always [`crate::config::RUNNER_API_PORT`] in production; a field only so
-    /// a test can point those proxies at a stub runner on an ephemeral port.
+    /// a test can point those callers at a stub runner on an ephemeral port.
     pub runner_api_port: u16,
     /// Runtime-configurable auto-login credentials for temp test runners.
     /// Set via `POST /test-login` and read by `forward_test_auto_login_env`.
@@ -769,43 +791,15 @@ pub struct SupervisorState {
     /// single-flights the *one* live-tree rebuild with no key at all, which is
     /// only correct because there is exactly one such tree.
     pub spawn_test_inflight: RwLock<HashMap<SpawnDedupKey, SpawnInflight>>,
-    /// Spawn-worktree containers (`<workspace_root>/.spawn-<ref>/`) that are
-    /// currently being built. A `git_ref` spawn-test materializes such a
-    /// container, then holds a build-pool slot while compiling the tree inside
-    /// it. The container is the supervisor's to delete once idle, but it is
-    /// NEVER safe to remove while that build is in flight.
-    ///
-    /// [`crate::routes::runners::spawn_test`] inserts the container path before
-    /// the build and removes it after (success or failure). The spawn-worktree
-    /// pruner ([`crate::spawn_worktree::prune_spawn_worktrees`]) consults this
-    /// set as its active-build exclusion: any candidate present here is skipped,
-    /// regardless of age. Keyed by the canonical container path string so the
-    /// pruner's directory enumeration and the build wiring agree on identity.
-    pub active_spawn_worktrees: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
-    /// Per-spawn-container **mutual exclusion** for materialize-then-build.
-    ///
-    /// `prepare_worktree` REUSES a container by `git checkout --force` +
-    /// `git reset --hard`. Doing that while another spawn is mid-`cargo build`
-    /// in the same container yanks source files out from under the compiler —
-    /// producing failures that look exactly like code errors. Before
-    /// 2026-07-22 this could only happen when two callers passed the SAME
-    /// explicit `git_ref`; now that `origin/main` is the spawn-test default,
-    /// every default spawn targets one shared `.spawn-origin_main` container,
-    /// so it would be the common case rather than a rare collision.
-    ///
-    /// The guard is held across BOTH the materialization and the build, so a
-    /// container is never reset while a build reads it. Scope is per container
-    /// path: spawns of DIFFERENT refs never contend. Concurrent spawns of the
-    /// SAME ref serialize — an accepted trade, since they would otherwise
-    /// compile byte-identical source twice in parallel for no benefit.
-    ///
-    /// `std::sync::Mutex` guards only the map (never held across an await);
-    /// the per-container `tokio::sync::Mutex` is the async lock actually held
-    /// across the build. Entries are never evicted — one empty mutex per
-    /// distinct ref ever spawned is negligible, and evicting a lock another
-    /// task is queued on is the classic way to reintroduce the race.
-    pub spawn_container_locks:
-        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    /// The per-container locks that are the one signal that a spawn-worktree
+    /// container (`<workspace_root>/.spawn-<ref>/`) is in use — see
+    /// [`crate::spawn_worktree::SpawnContainerLocks`]. A builder takes its
+    /// container's through [`SupervisorState::take_spawn_container_lock`] and
+    /// holds it from before `prepare_worktree` until it last reads the tree; every
+    /// spawn-worktree sweep (at startup, after a spawn-test build, and
+    /// `DELETE /spawn-worktrees`) is handed the whole set, only tries each
+    /// lock, and keeps a container whose lock is held.
+    pub spawn_container_locks: crate::spawn_worktree::SpawnContainerLocks,
     /// Cached build-artifact footprint snapshot (plan
     /// `2026-06-05-supervisor-build-artifact-footprint`). Walking the GB-scale
     /// `target-pool/slot-*` + `.spawn-*` trees is minutes-slow, so the snapshot
@@ -867,7 +861,15 @@ pub struct RunnerState {
     /// Never render this alone as "gone"; use [`Self::liveness`].
     pub running: bool,
     pub started_at: Option<DateTime<Utc>>,
+    /// A restart is in flight. Kept equal to `restart_latches > 0` by
+    /// [`Self::latch_restart`] / [`Self::unlatch_restart`]; tests may set it
+    /// directly to simulate a latch.
     pub restart_requested: bool,
+    /// How many restarts currently hold the latch. A bool alone let the first
+    /// of two concurrent restarts to finish clear the flag while the other was
+    /// still rebuilding, and could not say whether any restart remained to own
+    /// a `test-*` runner's kept per-instance state.
+    pub restart_latches: u32,
     /// A stop was requested for the current process. Latched by
     /// [`Self::latch_stop_request`] before any kill, cleared only by the next
     /// start ([`Self::clear_stop_request`]), so the exit monitor reads the
@@ -884,6 +886,20 @@ pub struct RunnerState {
     /// monitor copies it onto the exited spawn's ring entry when it is dated
     /// at or before the exit ([`SpawnMarker::stop_requested_at`]).
     pub stop_requested_at: Option<DateTime<Utc>>,
+    /// The [`Self::stop_requested_at`] a restart's own stop set
+    /// ([`Self::latch_restart_stop_request`]), cleared with it by the next
+    /// start. `None` when the restart's stop found an earlier stop latched. A
+    /// primary rebuild reads it to tell a stop another restart made, which that
+    /// restart answers itself, from one asked for since the rebuild began.
+    pub restart_stop_at: Option<DateTime<Utc>>,
+    /// How many stops anything but a restart has asked of this runner since
+    /// the supervisor started tracking it: counted when the stop is asked,
+    /// before its readiness probe and its wait for the lifecycle lock, and
+    /// never decreased (a refused stop still counts). A primary rebuild
+    /// compares it with the count it read when it began, because
+    /// [`Self::stop_requested_at`] dates a stop only
+    /// once it latches, seconds after it was asked.
+    pub stop_asks: u64,
     pub pid: Option<u32>,
     /// When the API was last observed responding.
     ///
@@ -993,6 +1009,19 @@ pub fn answered_since(
 }
 
 impl RunnerState {
+    /// Take one hold on the restart latch: a restart is now in flight.
+    pub fn latch_restart(&mut self) {
+        self.restart_latches = self.restart_latches.saturating_add(1);
+        self.restart_requested = true;
+    }
+
+    /// Release one hold on the restart latch. The flag comes down only when no
+    /// other restart still holds it.
+    pub fn unlatch_restart(&mut self) {
+        self.restart_latches = self.restart_latches.saturating_sub(1);
+        self.restart_requested = self.restart_latches > 0;
+    }
+
     /// Whether the runner's HTTP API has answered during its current boot.
     ///
     /// `last_seen_responding_at` is never cleared, so it answers for the
@@ -1088,6 +1117,16 @@ pub struct WatchdogState {
     /// sent)`, so the alert repeats on its own cadence and starts over for a
     /// new spawn. Alert bookkeeping only: nothing restarts on it.
     pub last_prebind_alert: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    /// The `started_at` of the spawn a never-answered alert has already gone out
+    /// for on passing the first-healthy budget, so that alert fires once there and
+    /// then keeps the escalation loop's slower cadence. Alert bookkeeping only.
+    pub never_answered_alerted_spawn: Option<DateTime<Utc>>,
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right now,
+    /// set when `watch_first_healthy` starts and cleared on every way out of it, a
+    /// panic included, by `FirstHealthyTracking`'s `Drop`. A sync mutex behind an
+    /// `Arc` so that `Drop` can clear it without awaiting this struct's lock. Read
+    /// with [`Self::first_healthy_tracks`]. Alert and restart bookkeeping only.
+    pub first_healthy_tracked_spawn: std::sync::Arc<std::sync::Mutex<Option<DateTime<Utc>>>>,
 }
 
 pub struct BuildState {
@@ -1684,8 +1723,7 @@ fn default_boot_id_path() -> PathBuf {
 /// will simply generate a new one. The returned string is always a
 /// well-formed UUID.
 ///
-/// This is the testable variant of [`load_or_create_boot_id`]. The public
-/// function calls this with [`default_boot_id_path()`].
+/// [`resolve_boot_id`] calls this with [`default_boot_id_path`] in production.
 pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
     if let Ok(contents) = std::fs::read_to_string(path) {
         let trimmed = contents.trim();
@@ -1718,12 +1756,19 @@ pub fn load_or_create_boot_id_at(path: &std::path::Path) -> String {
     fresh
 }
 
-/// Resolve the persistent `boot_id` for this supervisor installation.
-/// Reads the persisted UUID from the platform-default path if present,
-/// otherwise generates and persists a fresh one. See
+/// The `boot_id` a state starts with: the persisted one, at `default_path` or the
+/// config's own file, generated and persisted if absent, or under
+/// [`crate::config::AmbientBootId::Ignore`] a fresh one that touches no file. See
 /// [`SupervisorState::boot_id`] for semantics.
-pub fn load_or_create_boot_id() -> String {
-    load_or_create_boot_id_at(&default_boot_id_path())
+fn resolve_boot_id(
+    access: &crate::config::AmbientBootId,
+    default_path: &std::path::Path,
+) -> String {
+    match access {
+        crate::config::AmbientBootId::Read => load_or_create_boot_id_at(default_path),
+        crate::config::AmbientBootId::At(path) => load_or_create_boot_id_at(path),
+        crate::config::AmbientBootId::Ignore => uuid::Uuid::new_v4().to_string(),
+    }
 }
 
 /// Identity of a spawn-test build for single-flight purposes: **who** asked,
@@ -1916,6 +1961,7 @@ impl SupervisorState {
         let watchdog_enabled = config.watchdog_enabled_at_start;
         let auto_debug = config.auto_debug;
         let expo_port = config.expo_port;
+        let supervisor_port = config.port;
         let (health_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = broadcast::channel(1);
         // Capacity 8 with `broadcast` semantics: lagging receivers see Lagged,
@@ -1950,6 +1996,7 @@ impl SupervisorState {
         }
 
         let build_pool = BuildPool::new(&config);
+        let boot_id = resolve_boot_id(&config.ambient_boot_id, &default_boot_id_path());
 
         // Create the kill-on-exit JobObject. On Windows this enforces that
         // every supervisor-spawned *temp* runner dies when the supervisor
@@ -2011,7 +2058,7 @@ impl SupervisorState {
             evaluation: RwLock::new(EvaluationState::new()),
             velocity_tests: RwLock::new(VelocityTestState::new()),
             velocity_improvement: RwLock::new(VelocityImprovementState::new()),
-            command_relay: CommandRelay::new(),
+            command_relay: CommandRelay::new(supervisor_port),
             logs: LogState::new(),
             health_tx,
             shutdown_tx,
@@ -2024,7 +2071,7 @@ impl SupervisorState {
             runner_api_port: crate::config::RUNNER_API_PORT,
             test_auto_login: RwLock::new(None),
             stopped_runners: Arc::new(RwLock::new(HashMap::new())),
-            boot_id: load_or_create_boot_id(),
+            boot_id,
             build_id: compute_build_id(),
             ephemeral_job,
             runner_isolation_probe: RwLock::new(None),
@@ -2036,8 +2083,7 @@ impl SupervisorState {
             ci_runner_state: RwLock::new(CiRunnerState::default()),
             fix_and_rebuild_inflight: RwLock::new(None),
             spawn_test_inflight: RwLock::new(HashMap::new()),
-            active_spawn_worktrees: std::sync::Mutex::new(std::collections::HashSet::new()),
-            spawn_container_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            spawn_container_locks: crate::spawn_worktree::SpawnContainerLocks::default(),
             footprint: RwLock::new(None),
             origin_drift: RwLock::new(None),
         }
@@ -2124,22 +2170,74 @@ impl SupervisorState {
         let _ = self.health_tx.send(());
     }
 
-    /// Get (creating on first use) the mutual-exclusion lock for a spawn
-    /// container. See [`SupervisorState::spawn_container_locks`] for why this
-    /// exists — in short, `prepare_worktree` hard-resets a reused container and
-    /// must never do so while a build is reading it.
+    /// Take the lock on a spawn container, which a builder holds from before
+    /// `prepare_worktree` until it last reads the tree. See
+    /// [`crate::spawn_worktree::SpawnContainerLocks`] — in short,
+    /// `prepare_worktree` hard-resets a reused container and a sweep deletes
+    /// one, and neither may happen while a build is reading it.
     ///
-    /// Returns an `Arc` so the caller can `lock_owned()` and hold the guard
-    /// across the whole materialize+build sequence. The map mutex is released
-    /// before the caller ever awaits, so this never blocks the runtime.
-    pub fn spawn_container_lock(&self, container: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self
-            .spawn_container_locks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.entry(container.to_path_buf())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+    /// When another build holds it, the caller waits until that build is done
+    /// with the tree, and the log says so first, naming `taker` and the build
+    /// it waits for: the wait can last that build's whole run (a primary
+    /// rebuild takes its container before it stops the primary, so it waits
+    /// with the primary still serving). The map mutex is released before any
+    /// await, so this never blocks the runtime.
+    pub async fn take_spawn_container_lock(
+        &self,
+        container: &std::path::Path,
+        taker: &str,
+    ) -> crate::spawn_worktree::SpawnContainerGuard {
+        let locks = &self.spawn_container_locks;
+        match locks.try_take(container, taker) {
+            Ok(guard) => guard,
+            Err(held) => {
+                self.logs
+                    .emit(
+                        LogSource::Supervisor,
+                        LogLevel::Info,
+                        format!(
+                            "{taker}: waiting for spawn container {container:?}, {held}; this \
+                             build goes on once that one is done with the tree"
+                        ),
+                    )
+                    .await;
+                locks.take(container, taker).await
+            }
+        }
+    }
+
+    /// Sweep stale `.spawn-*` containers
+    /// ([`crate::spawn_worktree::prune_spawn_worktrees_with_window`]) on a task of
+    /// its own, and wait for it. The one door every sweep goes through: at
+    /// startup, after a spawn-test build, and `DELETE /spawn-worktrees`.
+    ///
+    /// The sweep holds a container's lock until that container's removal is
+    /// done, and the removal outlives a dropped future (a `git worktree
+    /// remove` child, a blocking `remove_dir_all`). Run inline, a caller that
+    /// went away midway (an HTTP client hanging up) would release the lock
+    /// while the deleting went on, and a builder waiting on it would
+    /// materialize into a half-removed tree. On its own task, such a caller
+    /// drops only its wait.
+    pub async fn sweep_spawn_worktrees(
+        self: &Arc<Self>,
+        window_hours_override: Option<u64>,
+    ) -> crate::spawn_worktree::PruneReport {
+        let state = self.clone();
+        let sweep = tokio::spawn(async move {
+            crate::spawn_worktree::prune_spawn_worktrees_with_window(
+                &state.config.project_dir,
+                &state.spawn_container_locks,
+                std::time::SystemTime::now(),
+                window_hours_override,
+            )
+            .await
+        });
+        match sweep.await {
+            Ok(report) => report,
+            // Nothing aborts the sweep's task, so a join error is its panic:
+            // carry it on, as if the sweep had run inline.
+            Err(failed) => std::panic::resume_unwind(failed.into_panic()),
+        }
     }
 
     /// Future that completes when a shutdown is signaled on `shutdown_tx`.
@@ -2221,8 +2319,11 @@ impl RunnerState {
             running: false,
             started_at: None,
             restart_requested: false,
+            restart_latches: 0,
             stop_requested: false,
             stop_requested_at: None,
+            restart_stop_at: None,
+            stop_asks: 0,
             pid: None,
             last_seen_responding_at: None,
         }
@@ -2244,10 +2345,27 @@ impl RunnerState {
     /// adoption, which is the supervisor taking a live runner on) does this:
     /// clearing it when a stop completes would race the exit monitor's read.
     /// A start's clear can race that read too, when the monitor of an earlier
-    /// spawn wakes after the start (see [`SpawnMarker::stop_requested_at`]).
+    /// spawn wakes after the start, so a start first carries the request onto
+    /// that spawn's ring entry ([`SpawnRing::carry_stop_request`]).
     pub fn clear_stop_request(&mut self) {
         self.stop_requested = false;
         self.stop_requested_at = None;
+        self.restart_stop_at = None;
+    }
+
+    /// Latch a restart's own stop request ([`Self::latch_stop_request`]), and
+    /// record its time as the restart's ([`Self::restart_stop_at`]) only when
+    /// this request is the one that set it. A stop already latched keeps its
+    /// time and is not the restart's: an operator's stop latched before the
+    /// restart's would otherwise be marked as the restart's, and a primary
+    /// rebuild queued on the spawn container would read it as a stop the
+    /// restart answers, and go on to start a runner the operator stopped.
+    pub fn latch_restart_stop_request(&mut self, now: DateTime<Utc>) {
+        let sets_the_time = self.stop_requested_at.is_none();
+        self.latch_stop_request(now);
+        if sets_the_time {
+            self.restart_stop_at = self.stop_requested_at;
+        }
     }
 }
 
@@ -2265,7 +2383,25 @@ impl WatchdogState {
             serving_disabled_reason: None,
             serving_restart_in_flight: false,
             last_prebind_alert: None,
+            never_answered_alerted_spawn: None,
+            first_healthy_tracked_spawn: Default::default(),
         }
+    }
+
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right
+    /// now, or `None` when none is. What `GET /health` and `GET /runners` serve.
+    pub fn first_healthy_tracked_spawn_at(&self) -> Option<DateTime<Utc>> {
+        *self
+            .first_healthy_tracked_spawn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Whether a first-healthy watchdog is tracking the spawn that started at
+    /// `started_at`. False for no recorded start, and for a marker naming another
+    /// spawn.
+    pub fn first_healthy_tracks(&self, started_at: Option<DateTime<Utc>>) -> bool {
+        started_at.is_some() && self.first_healthy_tracked_spawn_at() == started_at
     }
 
     /// Clear BOTH arms' counters and disarm reasons — what
@@ -2432,6 +2568,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
         }
     }
 
@@ -2609,6 +2746,65 @@ mod tests {
         let config = make_test_config();
         let state = SupervisorState::new(config);
         assert_eq!(state.config.port, DEFAULT_SUPERVISOR_PORT);
+    }
+
+    /// A builder whose spawn container another build holds waits until that
+    /// build lets go, and says so in the log before it waits: the wait can last
+    /// a whole build. An uncontended take logs nothing.
+    #[tokio::test]
+    async fn take_spawn_container_lock_waits_for_the_holder_and_logs_the_wait() {
+        async fn logged(state: &SupervisorState, taker: &str) -> bool {
+            let wanted = format!("{taker}: waiting for spawn container");
+            state
+                .logs
+                .history()
+                .await
+                .iter()
+                .any(|entry| entry.message.contains(&wanted))
+        }
+        let state = Arc::new(SupervisorState::new(make_test_config()));
+        let container = PathBuf::from("/tmp/test/.spawn-origin_main");
+
+        let held = state.take_spawn_container_lock(&container, "first").await;
+        assert!(
+            !logged(&state, "first").await,
+            "an uncontended take has nothing to wait for"
+        );
+
+        let waiter = tokio::spawn({
+            let (state, container) = (state.clone(), container.clone());
+            async move {
+                let _guard = state.take_spawn_container_lock(&container, "second").await;
+            }
+        });
+        let budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + budget;
+        while !logged(&state, "second").await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the contended take logged no wait within {budget:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !waiter.is_finished(),
+            "the second build took a lock the first still holds"
+        );
+        assert!(
+            state
+                .logs
+                .history()
+                .await
+                .iter()
+                .any(|entry| entry.message.contains("held by first")),
+            "the wait must name the build it waits for"
+        );
+
+        drop(held);
+        tokio::time::timeout(budget, waiter)
+            .await
+            .expect("the second build goes on once the first lets go")
+            .expect("the waiting task ran to its end");
     }
 
     #[tokio::test]
@@ -2951,6 +3147,63 @@ mod tests {
     }
 
     // --- boot_id persistence tests ---
+
+    /// `Ignore` neither creates the file nor reads one that is there, and `Read`
+    /// over the same path returns what the file holds.
+    #[test]
+    fn ignoring_the_ambient_boot_id_touches_no_file() {
+        use crate::config::AmbientBootId;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("boot.id");
+
+        let first = resolve_boot_id(&AmbientBootId::Ignore, &path);
+        assert!(uuid::Uuid::parse_str(&first).is_ok(), "{first}");
+        assert!(!path.exists(), "Ignore created the file");
+        assert!(
+            !dir.path().join("nested").exists(),
+            "Ignore created its dir"
+        );
+        assert_ne!(first, resolve_boot_id(&AmbientBootId::Ignore, &path));
+
+        let persisted = resolve_boot_id(&AmbientBootId::Read, &path);
+        assert!(path.exists(), "Read must persist the id");
+        assert_ne!(resolve_boot_id(&AmbientBootId::Ignore, &path), persisted);
+        assert_eq!(resolve_boot_id(&AmbientBootId::Read, &path), persisted);
+        let elsewhere = dir.path().join("elsewhere").join("boot.id");
+        assert_ne!(
+            resolve_boot_id(&AmbientBootId::At(elsewhere), &path),
+            persisted
+        );
+    }
+
+    /// `SupervisorState::new` follows the config, both ways: two states over one
+    /// file carry its id, and two states ignoring it would carry one id if they read
+    /// any file.
+    #[tokio::test]
+    async fn a_state_takes_its_boot_id_from_the_configured_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boot.id");
+        let config = || {
+            let mut config = make_test_config();
+            config.ambient_boot_id = crate::config::AmbientBootId::At(path.clone());
+            config
+        };
+        let (first, second) = (
+            SupervisorState::new(config()),
+            SupervisorState::new(config()),
+        );
+        assert_eq!(first.boot_id, second.boot_id);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), first.boot_id);
+    }
+
+    #[tokio::test]
+    async fn a_test_state_takes_no_boot_id_from_the_real_file() {
+        let (first, second) = (
+            SupervisorState::new(make_test_config()),
+            SupervisorState::new(make_test_config()),
+        );
+        assert_ne!(first.boot_id, second.boot_id);
+    }
 
     #[test]
     fn test_load_or_create_boot_id_at_persists_across_calls() {

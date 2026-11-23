@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 //! Test-only: a loopback port that is guaranteed to refuse connections.
 //!
 //! Binding a listener and DROPPING it frees the port, and a concurrently

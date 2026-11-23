@@ -224,6 +224,13 @@ pub struct WatchdogHealth {
     /// supervisor's lifetime.
     pub last_prebind_alert_at: Option<String>,
     pub last_prebind_alert_spawn_started_at: Option<String>,
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right
+    /// now, RFC3339, or `null` when none is. Live, not historical: while it names
+    /// the runner's current `started_at` and that spawn has not answered, the
+    /// serving watchdog holds its restart
+    /// (`ServingRestartDecision::SkipInsideFirstHealthyBudget`). Read from
+    /// `WatchdogState::first_healthy_tracked_spawn`.
+    pub first_healthy_tracked_spawn_started_at: Option<String>,
 }
 
 impl WatchdogHealth {
@@ -258,6 +265,9 @@ impl WatchdogHealth {
             last_prebind_alert_spawn_started_at: wd
                 .last_prebind_alert
                 .map(|(spawn, _)| spawn.to_rfc3339()),
+            first_healthy_tracked_spawn_started_at: wd
+                .first_healthy_tracked_spawn_at()
+                .map(|spawn| spawn.to_rfc3339()),
         }
     }
 
@@ -278,6 +288,7 @@ impl WatchdogHealth {
             serving_disabled_reason: None,
             last_prebind_alert_at: None,
             last_prebind_alert_spawn_started_at: None,
+            first_healthy_tracked_spawn_started_at: None,
         }
     }
 }
@@ -442,6 +453,11 @@ pub struct SupervisorInfo {
     /// reader has to know. A missing key is UNKNOWN: builds from
     /// qontinui-supervisor#270 and #272 stamp epoch 2 and predate this field.
     pub attribution_epoch: u32,
+    /// Delivery counters of this process's dev-action snapshot ingest
+    /// ([`crate::dev_action::ingest::ingest_counters`]): delivered, retried,
+    /// refused, the two drop counts, and what is in delivery now. Process
+    /// lifetime only; a missing key is a build that predates the buffer.
+    pub dev_action_ingest: crate::dev_action::ingest::IngestCounters,
 }
 
 impl SupervisorInfo {
@@ -455,6 +471,7 @@ impl SupervisorInfo {
             built_from_sha: crate::self_provenance::built_from_sha().map(str::to_string),
             built_from_dirty: crate::self_provenance::built_from_dirty(),
             attribution_epoch: crate::dev_action::ingest::ATTRIBUTION_EPOCH,
+            dev_action_ingest: crate::dev_action::ingest::ingest_counters(),
         }
     }
 }
@@ -1381,6 +1398,7 @@ mod tests {
             temp_runner_display: None,
             ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
             ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
         };
         let state: SharedState = std::sync::Arc::new(crate::state::SupervisorState::new(config));
         let primary = state
@@ -1412,6 +1430,9 @@ mod tests {
     /// follows the cached footprint (UNKNOWN → 30, then derived).
     #[tokio::test]
     async fn health_build_pool_reports_size_jobs_and_disk_floor() {
+        // The served floor reads the disk-floor env override; a test driving a
+        // real build switches it off while holding this lock.
+        let _env = crate::test_env::BUILD_GUARD_ENV.lock().await;
         const GIB: u64 = 1024 * 1024 * 1024;
         let dir = tempfile::tempdir().unwrap();
         let state = state_with_placeholder_primary(dir.path()).await;
@@ -1569,6 +1590,7 @@ mod tests {
                 serving_disabled_reason: None,
                 last_prebind_alert_at: None,
                 last_prebind_alert_spawn_started_at: None,
+                first_healthy_tracked_spawn_started_at: None,
             },
             build: BuildHealth {
                 in_progress: false,
@@ -1675,6 +1697,23 @@ mod tests {
 
     /// `/health` serves the same epoch every snapshot of this binary is stamped
     /// with, so a box's stamp can be read without a snapshot having been posted.
+    #[test]
+    fn test_supervisor_block_serves_the_dev_action_ingest_counters() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        let block = &value["supervisor"]["dev_action_ingest"];
+        for key in [
+            "delivered",
+            "retried",
+            "refused",
+            "dropped_retries_exhausted",
+            "dropped_buffer_full",
+            "pending",
+        ] {
+            assert!(block[key].is_u64(), "{key} must be a count, got {block}");
+        }
+    }
+
     #[test]
     fn test_supervisor_block_serves_the_attribution_epoch() {
         let value = serde_json::to_value(build_minimal_health_response())
@@ -1887,6 +1926,32 @@ mod tests {
             .as_object()
             .unwrap()
             .contains_key("last_prebind_alert_spawn_started_at"));
+    }
+
+    /// The first-healthy marker is served live: the spawn it names while set,
+    /// `null` (key present) once cleared.
+    #[test]
+    fn the_first_healthy_tracked_spawn_is_reported_while_set() {
+        let spawn = chrono::DateTime::parse_from_rfc3339("2026-11-09T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let wd = crate::state::WatchdogState::new(true);
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = Some(spawn);
+
+        let h = WatchdogHealth::from_state_with_arms(&wd, true, true);
+        assert_eq!(
+            h.first_healthy_tracked_spawn_started_at,
+            Some(spawn.to_rfc3339())
+        );
+
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = None;
+        let json =
+            serde_json::to_value(WatchdogHealth::from_state_with_arms(&wd, true, true)).unwrap();
+        assert!(json["first_healthy_tracked_spawn_started_at"].is_null());
+        assert!(json
+            .as_object()
+            .unwrap()
+            .contains_key("first_healthy_tracked_spawn_started_at"));
     }
 
     /// The serving arm is independent of the crash arm on every axis, and the

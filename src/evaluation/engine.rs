@@ -193,7 +193,7 @@ async fn generate_workflow_for_eval(
     http_client: &reqwest::Client,
     prompt: &str,
 ) -> anyhow::Result<(String, String, String)> {
-    let runner_url = format!("http://127.0.0.1:{}", RUNNER_API_PORT);
+    let runner_url = crate::loopback::runner_loopback_base(RUNNER_API_PORT);
 
     // Start async generation — runner expects both "prompt" and "description" fields
     let resp = http_client

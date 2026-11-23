@@ -73,6 +73,9 @@ pub struct CommandRelay {
     /// Read by `bridge_health` to surface live identity rather than the
     /// build-time defaults that used to be hardcoded into the response.
     metadata: RwLock<HashMap<String, BridgeMetadata>>,
+    /// The port this supervisor bound (`--port`), so the no-tab-connected
+    /// hint names the dashboard a caller can actually open.
+    supervisor_port: u16,
 }
 
 struct PendingCommand {
@@ -88,12 +91,13 @@ struct CommandResult {
 }
 
 impl CommandRelay {
-    pub fn new() -> Arc<Self> {
+    pub fn new(supervisor_port: u16) -> Arc<Self> {
         let relay = Arc::new(Self {
             pending: RwLock::new(HashMap::new()),
             subscribers: RwLock::new(HashMap::new()),
             heartbeats: RwLock::new(HashMap::new()),
             metadata: RwLock::new(HashMap::new()),
+            supervisor_port,
         });
 
         // Spawn a background task to reap stale pending commands (30s TTL)
@@ -151,7 +155,10 @@ impl CommandRelay {
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": "No browser tab connected to supervisor dashboard. Open http://localhost:9875/ in a browser.",
+                    "error": format!(
+                        "No browser tab connected to supervisor dashboard. Open {}/ in a browser.",
+                        crate::loopback::loopback_base(self.supervisor_port)
+                    ),
                     "timestamp": chrono::Utc::now().timestamp_millis(),
                 })),
             ));

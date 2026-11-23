@@ -4,7 +4,6 @@ import {
   api,
   DetachedBuildResponse,
   HealthResponse,
-  DevStartResponse,
   ExpoStatus,
   RecentCrashSummary,
   RecentPanicSummary,
@@ -197,23 +196,16 @@ function LogViewer() {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SERVICE_LOG_MAP: Record<string, string> = {
-  Runner: 'runner-tauri',
-  Backend: 'backend-err',
-  Frontend: 'frontend-err',
-};
-
 // Actions that require user confirmation before executing
-const DESTRUCTIVE_ACTIONS = new Set([
-  'Stop All',
-  'Fresh',
-  'Clean',
-  'backend-stop',
-  'frontend-stop',
-  'runner-stop',
-  'expo-stop',
-  'Stop Docker',
-]);
+const DESTRUCTIVE_ACTIONS = new Set(['expo-stop']);
+
+/// What an action endpoint may answer: `status: 'error' | 'timeout'` marks a
+/// failed action. Expo's start/stop are the remaining callers.
+interface ActionResponse {
+  status?: string;
+  stdout?: string;
+  stderr?: string;
+}
 
 interface ServiceError {
   service: string;
@@ -226,7 +218,6 @@ type ActionState = string | null;
 
 interface StatusData {
   health: HealthResponse | null;
-  services: { name: string; port: number; available: boolean }[];
   expo: ExpoStatus | null;
 }
 
@@ -1495,7 +1486,6 @@ function RunnerInstancesPanel() {
 function DashboardInner() {
   const [data, setData] = useState<StatusData>({
     health: null,
-    services: [],
     expo: null,
   });
   const [busy, setBusy] = useState<ActionState>(null);
@@ -1504,26 +1494,20 @@ function DashboardInner() {
   const mountedRef = useRef(true);
   const actionGuardRef = useRef(false);
 
-  const refreshPorts = useCallback(async () => {
-    const [devStatus, expo] = await Promise.allSettled([api.devStartStatus(), api.expoStatus()]);
+  const refreshExpo = useCallback(async () => {
+    const expo = (await Promise.allSettled([api.expoStatus()]))[0];
     if (!mountedRef.current) return;
     setData((prev) => ({
       ...prev,
-      services: devStatus.status === 'fulfilled' ? (devStatus.value.services ?? []) : prev.services,
       expo: expo.status === 'fulfilled' ? expo.value : prev.expo,
     }));
   }, []);
 
   const refresh = useCallback(async () => {
-    const [health, devStatus, expo] = await Promise.allSettled([
-      api.health(),
-      api.devStartStatus(),
-      api.expoStatus(),
-    ]);
+    const [health, expo] = await Promise.allSettled([api.health(), api.expoStatus()]);
     if (!mountedRef.current) return;
     setData({
       health: health.status === 'fulfilled' ? health.value : null,
-      services: devStatus.status === 'fulfilled' ? (devStatus.value.services ?? []) : [],
       expo: expo.status === 'fulfilled' ? expo.value : null,
     });
     setLastRefresh(new Date());
@@ -1563,7 +1547,7 @@ function DashboardInner() {
         setBusy(key);
         try {
           const result = await fn();
-          const resp = result as DevStartResponse | undefined;
+          const resp = result as ActionResponse | undefined;
           if (
             resp &&
             typeof resp.status === 'string' &&
@@ -1604,10 +1588,10 @@ function DashboardInner() {
         }
         setBusy(null);
         actionGuardRef.current = false;
-        setTimeout(refreshPorts, 1500);
+        setTimeout(refreshExpo, 1500);
       };
     },
-    [refreshPorts],
+    [refreshExpo],
   );
 
   const h = data.health;
@@ -1790,113 +1774,42 @@ function DashboardInner() {
       {/* Runner Instances — primary user action */}
       <RunnerInstancesPanel />
 
-      {/* Service health table */}
-      {data.services.length > 0 && (
+      {/* Action failures (Expo start/stop) */}
+      {errors.size > 0 && (
         <div className="card" style={{ marginBottom: '1rem' }}>
           <div className="card-header" style={{ marginBottom: '0.5rem' }}>
-            <span className="card-title">Services</span>
+            <span className="card-title">Action failures</span>
           </div>
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Service</th>
-                  <th style={{ width: 60 }}>Port</th>
-                  <th style={{ width: 70 }}>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.services.map((svc) => (
-                  <tr key={svc.name}>
-                    <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{svc.name}</td>
-                    <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>
-                      {svc.port}
-                    </td>
-                    <td>
-                      <StatusDot up={svc.available} />
-                      <span
-                        className={svc.available ? 'text-success' : 'text-danger'}
-                        style={{ fontSize: '0.7rem' }}
-                      >
-                        {svc.available ? 'UP' : 'DOWN'}
-                      </span>
-                    </td>
-                    <td>
-                      <div className="flex gap-2">
-                        {SERVICE_LOG_MAP[svc.name] && (
-                          <SmallBtn
-                            label="Logs"
-                            activeLabel="Loading..."
-                            onClick={async () => {
-                              try {
-                                const log = await api.logFile(SERVICE_LOG_MAP[svc.name], 100);
-                                addToast(`${svc.name}: ${log.lines} lines`, 'info');
-                              } catch {
-                                addToast(`${svc.name}: failed to fetch logs`, 'error');
-                              }
-                            }}
-                            busy={null}
-                          />
-                        )}
-                        <SmallBtn
-                          label="Start"
-                          activeLabel="Starting..."
-                          onClick={doAction(`${svc.name.toLowerCase()}-start`, svc.name, () =>
-                            api.devStartAction(`${svc.name.toLowerCase()}-start`),
-                          )}
-                          busy={busy}
-                          busyKey={`${svc.name.toLowerCase()}-start`}
-                        />
-                        <SmallBtn
-                          label="Stop"
-                          activeLabel="Stopping..."
-                          onClick={doAction(`${svc.name.toLowerCase()}-stop`, svc.name, () =>
-                            api.devStartAction(`${svc.name.toLowerCase()}-stop`),
-                          )}
-                          busy={busy}
-                          busyKey={`${svc.name.toLowerCase()}-stop`}
-                          variant="danger"
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div style={{ marginTop: '0.5rem' }}>
+            {Array.from(errors.values()).map((err) => (
+              <div
+                key={err.service}
+                style={{
+                  padding: '0.4rem 0.6rem',
+                  fontSize: '0.75rem',
+                  background: 'rgba(239,68,68,0.08)',
+                  borderRadius: 4,
+                  marginBottom: '0.25rem',
+                }}
+              >
+                <strong className="text-danger">
+                  {err.service} — {err.action} failed
+                </strong>
+                {err.stderr && (
+                  <pre
+                    style={{
+                      margin: '0.25rem 0 0',
+                      fontSize: '0.7rem',
+                      whiteSpace: 'pre-wrap',
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    {err.stderr}
+                  </pre>
+                )}
+              </div>
+            ))}
           </div>
-          {errors.size > 0 && (
-            <div style={{ marginTop: '0.5rem' }}>
-              {Array.from(errors.values()).map((err) => (
-                <div
-                  key={err.service}
-                  style={{
-                    padding: '0.4rem 0.6rem',
-                    fontSize: '0.75rem',
-                    background: 'rgba(239,68,68,0.08)',
-                    borderRadius: 4,
-                    marginBottom: '0.25rem',
-                  }}
-                >
-                  <strong className="text-danger">
-                    {err.service} — {err.action} failed
-                  </strong>
-                  {err.stderr && (
-                    <pre
-                      style={{
-                        margin: '0.25rem 0 0',
-                        fontSize: '0.7rem',
-                        whiteSpace: 'pre-wrap',
-                        color: 'var(--text-muted)',
-                      }}
-                    >
-                      {err.stderr}
-                    </pre>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       )}
 

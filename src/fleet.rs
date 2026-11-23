@@ -42,7 +42,7 @@
 //! | `role` | supervisor | it is the only writer of `'build'`, which coord's `build_dispatcher::select_build_machine` requires (`WHERE role = 'build'`) — omitting it would silently disable remote build dispatch |
 //! | `disk_reserved_gb` | either (hardware, not process, state) | both publishers send the same figure; omitting it on both sides would only NULL a real column |
 //! | `hostname` | either (coord already `COALESCE`s it) | read from `machine.json`, identical on both sides |
-//! | `max_concurrent_agents` | **runner** | omitted here |
+//! | `max_concurrent_agents` | **coord** (derived from the runner's `memory_gb`/`cpu_cores`, with its `ci_reserved_gib`; a non-zero runner-sent value is advisory, an explicit `0` is stored verbatim) | omitted here |
 //!
 //! **The CI-runner columns are NOT on this route.** This module used to send
 //! `ci_runner_labels` / `ci_runner_status` in the budget payload. Coord's
@@ -60,9 +60,17 @@
 //! same box and reporting the same number are not in conflict, and dropping
 //! such a field from both sides loses real data for no benefit.
 //!
-//! This omission contract requires coord to declare `max_concurrent_agents`
-//! `Option` and write it `SET col = COALESCE($n, col)` — see the ordering
-//! note on `BudgetPayload`.
+//! This omission contract relies on coord declaring `max_concurrent_agents`
+//! `Option` and writing it `SET col = COALESCE($n, col)`, which the SQL of
+//! coord's `upsert_budget` does (`crates/coord/src/fleet.rs`) — see the note
+//! on `BudgetPayload`. What coord stores is decided by its
+//! `stored_max_concurrent_agents`: its own derivation when the publish
+//! carries a non-zero `max_concurrent_agents` together with non-zero
+//! `memory_gb`/`cpu_cores` and a `ci_reserved_gib`; an explicit `0`
+//! verbatim; otherwise (an omitted key included) nothing, so the column
+//! keeps its last stored value.
+//! In no case is it a number the supervisor could contribute, so it omits
+//! the key.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -177,10 +185,14 @@ pub fn load_machine_file() -> Option<MachineFile> {
 /// then unrepresentable-if-wrong rather than one edit away from sending a
 /// zero again.
 ///
-/// **Ordering dependency.** Coord must declare `max_concurrent_agents`
-/// `Option` and write it `SET col = COALESCE($n, col)` before this payload
-/// is deployed — until then `BudgetPublishRequest` declares it mandatory
-/// and a publish that omits it is rejected outright.
+/// **Coord owns the column.** Coord's `BudgetPublishRequest` declares
+/// `max_concurrent_agents` `Option` and `upsert_budget` writes it
+/// `SET col = COALESCE($n, col)`, so an omitted key leaves the column alone.
+/// What coord stores there is decided by its `stored_max_concurrent_agents`
+/// (the module docs give the exact rule): a non-zero value a runner sends is
+/// replaced by coord's derivation or dropped, and an explicit `0` is stored
+/// verbatim — which is why the supervisor must omit the key rather than
+/// send a placeholder.
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
     role: &'static str,
@@ -340,9 +352,8 @@ impl DeviceSources {
         Self {
             machine: load_machine_file,
             read_seeded: true,
-            mint_base: Some(format!(
-                "http://127.0.0.1:{}",
-                crate::config::RUNNER_API_PORT
+            mint_base: Some(crate::loopback::runner_loopback_base(
+                crate::config::RUNNER_API_PORT,
             )),
         }
     }
@@ -600,6 +611,120 @@ pub(crate) async fn resolve_device_bearer_for(
     match resolve_device_bearer(sources).await {
         Some((token, source)) => (Some(token), source),
         None => (None, SOURCE_NONE),
+    }
+}
+
+/// What [`resolve_device_bearer_cached_for`] last learned for one set of
+/// sources: a token (with its source label), or that none resolved.
+#[derive(Debug, Clone)]
+enum CachedBearer {
+    Hit {
+        token: String,
+        source: &'static str,
+    },
+    /// No usable token resolved; do not ask again before `until` (unix secs).
+    Miss {
+        until: i64,
+    },
+}
+
+/// The sources a cache entry was resolved from: whether the seeded rungs were
+/// read, and the runner the mint asked.
+type BearerCacheKey = (bool, Option<String>);
+
+/// One slot, process-global. A test that reaches it with sources that read an
+/// identity (`DeviceSources::fixture`) over an https or loopback base must
+/// hold `tests::BEARER_CACHE_TESTS`, or it races the cache tests.
+static BEARER_CACHE: std::sync::Mutex<Option<(BearerCacheKey, CachedBearer)>> =
+    std::sync::Mutex::new(None);
+
+/// How long a failed lookup is remembered, so a box with no usable token (a
+/// signed-out, unpaired or wedged runner and nothing seeded) does not pay the
+/// cascade, a runner mint included, on every dev action and every ingest
+/// attempt. A seeded token or a newly paired runner is picked up within this.
+const NEGATIVE_BEARER_CACHE_SECS: i64 = 60;
+
+/// [`resolve_device_bearer_for`], remembering what it learned for the same
+/// `sources`: a token is reused while its `exp` is more than
+/// [`EXPIRY_SKEW_SECS`] away (a token with no readable `exp` is used once and
+/// not cached), and a miss for [`NEGATIVE_BEARER_CACHE_SECS`].
+///
+/// For the per-action callers (the dev-action expectations fetch and snapshot
+/// ingest). The transport guard still runs first on every call, so a cached
+/// token never goes to a cleartext non-loopback base. Sources that read no
+/// identity (`DeviceSources::for_access` under `At` / `Ignore`) never read or
+/// fill the cache.
+pub(crate) async fn resolve_device_bearer_cached_for(
+    base: &str,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
+    resolve_device_bearer_cached_at(base, sources, chrono::Utc::now().timestamp()).await
+}
+
+async fn resolve_device_bearer_cached_at(
+    base: &str,
+    sources: &DeviceSources,
+    now: i64,
+) -> ResolvedBearer {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    let key: BearerCacheKey = (sources.read_seeded, sources.mint_base.clone());
+    if key == (false, None) {
+        return (None, SOURCE_NONE);
+    }
+    let fresh = |token: &str| jwt_exp(token).is_some_and(|exp| exp > now + EXPIRY_SKEW_SECS);
+    if let Ok(guard) = BEARER_CACHE.lock() {
+        match guard.as_ref() {
+            Some((cached_key, CachedBearer::Hit { token, source }))
+                if *cached_key == key && fresh(token) =>
+            {
+                return (Some(token.clone()), source);
+            }
+            Some((cached_key, CachedBearer::Miss { until }))
+                if *cached_key == key && now < *until =>
+            {
+                return (None, SOURCE_NONE);
+            }
+            _ => {}
+        }
+    }
+    let resolved = resolve_device_bearer(sources).await;
+    let entry = match &resolved {
+        Some((token, source)) if fresh(token) => Some(CachedBearer::Hit {
+            token: token.clone(),
+            source,
+        }),
+        Some(_) => None,
+        None => Some(CachedBearer::Miss {
+            until: now + NEGATIVE_BEARER_CACHE_SECS,
+        }),
+    };
+    if let (Some(entry), Ok(mut guard)) = (entry, BEARER_CACHE.lock()) {
+        *guard = Some((key, entry));
+    }
+    match resolved {
+        Some((token, source)) => (Some(token), source),
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// [`attach_resolved_bearer`] for a per-request caller: the attach and the
+/// absence are logged at `debug!`, so a request made on every action does not
+/// push real events out of the supervisor's log buffer. Never logs the token.
+pub(crate) fn attach_bearer_quietly(
+    rb: reqwest::RequestBuilder,
+    resolved: ResolvedBearer,
+) -> reqwest::RequestBuilder {
+    match resolved {
+        (Some(token), source) => {
+            debug!("fleet: attaching coord device JWT (source: {source})");
+            rb.header("Authorization", format!("Bearer {token}"))
+        }
+        (None, reason) => {
+            debug!("fleet: no coord device JWT attached: {reason}");
+            rb
+        }
     }
 }
 
@@ -904,9 +1029,10 @@ pub(crate) async fn publish_budget(
     };
     // The supervisor owns the build-side columns and OMITS the agent cap it
     // does not own — see the module docs. Omission is the only way to say
-    // "leave this column alone": coord writes each budget column with a
-    // straight `SET`, so a placeholder value is a write, not an abstention.
-    // Sending `max_concurrent_agents: 0` used to FLAP the runner's real cap
+    // "leave this column alone": coord writes each budget column as
+    // `COALESCE($n, col)`, so an omitted key leaves it alone but a
+    // placeholder value is a write, not an abstention.
+    // Sending `max_concurrent_agents: 0` used to FLAP the device's real cap
     // to zero on every supervisor publish until the runner's 10-minute
     // republisher re-asserted it. That flap is exactly the 2026-07-28
     // outage's mechanism — a writer emitting a default over another writer's
@@ -988,8 +1114,10 @@ pub async fn publish_on_startup(access: &AmbientCoord) {
 // closed set {publish, force_push, delete, rotate, other}, `artifact` is
 // required, `reversible` ∈ {no, roll-forward, restore} is optional, `checks`
 // is free text, and `repo` / `pr_number` are for PR-shaped events only. The
-// kind is hard-coded server-side to `agent_took_irreversible_action`, which
-// is exact for `RestartTaken` and stretched for the rest — so `checks` opens
+// kind is hard-coded server-side to `agent_took_sensitive_action` (renamed from
+// `agent_took_irreversible_action`; qontinui-coord
+// `crates/coord/src/notifications.rs`), which fits `RestartTaken` and
+// `FirstHealthyKill` and is stretched for the rest — so `checks` opens
 // with `serving_watchdog:<event>` and carries the true class until coord
 // grows a dedicated kind (a Follow-up in the plan).
 //
@@ -1043,7 +1171,7 @@ pub struct ServingWatchdogNotice {
     pub port: u16,
     /// The silence at decision time, as on the diagnostics event: `None`
     /// where nothing was measured, which the artifact line says rather than
-    /// printing 0.
+    /// printing 0. The budget for `FirstHealthyKill`.
     pub silent_for_secs: Option<u64>,
     /// The census / readiness verdict that backed the decision, verbatim.
     pub census_json: Option<serde_json::Value>,
@@ -1066,7 +1194,8 @@ pub enum NotifyOutcome {
     /// Coord's per-tenant notification window is exhausted (429). Nothing was
     /// retried and nothing else was posted: the diagnostics ring on this box
     /// already holds the event, and the next re-escalation interval will try
-    /// again on its own cadence.
+    /// again on its own cadence. A `FirstHealthyKill` has no later interval: the
+    /// port has closed, so for that event this is the ring's record alone.
     RateLimited { retry_after_secs: Option<u64> },
 }
 
@@ -1101,7 +1230,7 @@ fn artifact_line(notice: &ServingWatchdogNotice) -> String {
 }
 
 /// The `checks` field: the TRUE event class first (coord's kind is hard-coded
-/// to `agent_took_irreversible_action` for every class), then the detail,
+/// to `agent_took_sensitive_action` for every class), then the detail,
 /// then the census/verdict JSON — so a truncation, if one happens, eats the
 /// tail of the census and never the class.
 fn checks_string(notice: &ServingWatchdogNotice) -> String {
@@ -1128,9 +1257,10 @@ fn checks_string(notice: &ServingWatchdogNotice) -> String {
 /// — no IO — so the golden test pins the wire shape against the real
 /// construction path.
 ///
-/// The key set is `{action, artifact, checks}` plus `reversible` for
-/// `RestartTaken` ONLY. The door is `deny_unknown_fields`, so one extra key is
-/// a 400 that surfaces nowhere an operator looks; and `reversible` is omitted
+/// The key set is `{action, artifact, checks}` plus `reversible` for an
+/// irreversible event ONLY ([`ServingEvent::is_irreversible`]). The door is
+/// `deny_unknown_fields`, so one extra key is a 400 that surfaces nowhere an
+/// operator looks; and `reversible` is omitted
 /// rather than sent for the non-restart classes because coord renders an
 /// absent value as "unrecorded" — the honest answer for a threshold or a
 /// refusal, which reversed nothing — whereas any present value would be a
@@ -1143,7 +1273,7 @@ pub fn build_agent_notification_body(notice: &ServingWatchdogNotice) -> serde_js
         "artifact".to_string(),
         serde_json::Value::from(artifact_line(notice)),
     );
-    if notice.event == ServingEvent::RestartTaken {
+    if notice.event.is_irreversible() {
         body.insert("reversible".to_string(), serde_json::Value::from("no"));
     }
     body.insert(
@@ -1399,18 +1529,22 @@ mod tests {
         .expect("payload serializes")
     }
 
-    /// The live defect this module was changed to fix: coord writes every
-    /// budget column with a straight `SET`, so a `max_concurrent_agents: 0`
-    /// here flapped the runner's real cap to zero on every publish. The
-    /// supervisor does not own that column, and the ONLY way to say so on
-    /// the wire is to omit the key.
+    /// The live defect this module was changed to fix: under coord's earlier
+    /// straight `SET`, a `max_concurrent_agents: 0` here flapped the
+    /// device's real cap to zero on every publish. Coord now COALESCEs each
+    /// budget column, so an omitted key leaves it alone, but an explicit `0` is
+    /// still a write (stored verbatim); a non-zero value is replaced or
+    /// dropped by coord's derivation. Coord owns that column
+    /// (its own derivation from the runner's publish; an explicit `0` is
+    /// still stored verbatim), and the ONLY way for the supervisor to stay
+    /// out of it on the wire is to omit the key.
     #[test]
     fn budget_payload_omits_the_agent_cap_the_supervisor_does_not_own() {
         let v = serialized();
         let obj = v.as_object().expect("payload is a JSON object");
         assert!(
             !obj.contains_key("max_concurrent_agents"),
-            "max_concurrent_agents is the RUNNER's column — sending any value overwrites it: {v}"
+            "max_concurrent_agents is COORD's column (derived from the runner's memory_gb/cpu_cores) — sending a value from the supervisor can overwrite it: {v}"
         );
     }
 
@@ -1603,12 +1737,13 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
 
-    const ALL_EVENTS: [ServingEvent; 8] = [
+    const ALL_EVENTS: [ServingEvent; 9] = [
         ServingEvent::Threshold,
         ServingEvent::NeverAnsweredSinceAdoption,
         ServingEvent::NeverAnsweredSinceSpawn,
         ServingEvent::NeverBoundSinceSpawn,
         ServingEvent::RestartTaken,
+        ServingEvent::FirstHealthyKill,
         ServingEvent::RestartRefusedSessionsLive,
         ServingEvent::RestartFailed,
         ServingEvent::Disarmed,
@@ -1739,21 +1874,21 @@ mod tests {
     /// GOLDEN: coord's `AgentNotificationBody` is `deny_unknown_fields`, so
     /// one extra key is a 400 that no operator ever sees. Pin the exact key
     /// set for every event class: `{action, artifact, checks}`, plus
-    /// `reversible` for `RestartTaken` ONLY — absent renders as "unrecorded"
+    /// `reversible` for an irreversible event ONLY — absent renders as "unrecorded"
     /// on coord, and a threshold or refusal reversed nothing. Never `repo`,
     /// `pr_number`, `kind` or `actor`.
     #[test]
     fn notification_body_carries_exactly_the_keys_coord_accepts() {
         for event in ALL_EVENTS {
             let body = build_agent_notification_body(&sample_notice(event));
-            let expected: Vec<&str> = if event == ServingEvent::RestartTaken {
+            let expected: Vec<&str> = if event.is_irreversible() {
                 vec!["action", "artifact", "checks", "reversible"]
             } else {
                 vec!["action", "artifact", "checks"]
             };
             assert_eq!(keys(&body), expected, "event {event}: {body}");
             assert_eq!(body["action"], "other", "event {event}");
-            if event == ServingEvent::RestartTaken {
+            if event.is_irreversible() {
                 assert_eq!(body["reversible"], "no");
             }
             let checks = body["checks"].as_str().unwrap();
@@ -2324,6 +2459,95 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://127.0.0.1:{}", addr.port()), inv, eval)
+    }
+
+    /// The bearer cache is process-global, so its tests run one at a time and
+    /// start from an empty cache.
+    static BEARER_CACHE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_bearer_cache() {
+        *BEARER_CACHE.lock().unwrap() = None;
+    }
+
+    /// A minted token with a live `exp` is reused: two lookups, one mint.
+    /// Sources that read no identity never touch the cache, and a cleartext
+    /// remote base never gets the cached token.
+    #[tokio::test]
+    async fn the_bearer_cache_reuses_a_fresh_token_and_guards_its_transport() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let token = jwt_with(serde_json::json!({"exp": chrono::Utc::now().timestamp() + 3600}));
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": token})).await;
+        let sources = DeviceSources::fixture(&mint);
+        for _ in 0..2 {
+            let (got, source) =
+                resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+            assert_eq!(got.as_deref(), Some(token.as_str()));
+            assert_eq!(source, SOURCE_RUNNER_MINT);
+        }
+        assert_eq!(
+            *inv.lock().unwrap(),
+            1,
+            "the second lookup is served from the cache"
+        );
+
+        let (got, source) =
+            resolve_device_bearer_cached_for("http://coord.example.com", &sources).await;
+        assert!(got.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
+
+        let none = DeviceSources::for_access(&AmbientCoord::Ignore);
+        let (got, source) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &none).await;
+        assert!(got.is_none(), "identity-less sources never read the cache");
+        assert_eq!(source, SOURCE_NONE);
+        // ...nor write it: the cached token is still served without a mint.
+        let (got, _) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+        assert_eq!(got.as_deref(), Some(token.as_str()));
+        assert_eq!(*inv.lock().unwrap(), 1);
+
+        // Past the token's exp less the skew, the cache asks again.
+        let later = chrono::Utc::now().timestamp() + 3600 - EXPIRY_SKEW_SECS;
+        let _ = resolve_device_bearer_cached_at("https://coord.example.com", &sources, later).await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "a token near its exp is not served from the cache"
+        );
+        clear_bearer_cache();
+    }
+
+    /// A lookup that finds no token is remembered for the negative window, so
+    /// an unpaired runner is asked once per window, not once per action.
+    #[tokio::test]
+    async fn the_bearer_cache_remembers_a_miss_for_its_window() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": null})).await;
+        let sources = DeviceSources::fixture(&mint);
+        let now = chrono::Utc::now().timestamp();
+        for at in [now, now + NEGATIVE_BEARER_CACHE_SECS - 1] {
+            let (got, source) =
+                resolve_device_bearer_cached_at("https://coord.example.com", &sources, at).await;
+            assert!(got.is_none());
+            assert_eq!(source, SOURCE_NONE);
+        }
+        assert_eq!(*inv.lock().unwrap(), 1, "the miss is remembered");
+        let _ = resolve_device_bearer_cached_at(
+            "https://coord.example.com",
+            &sources,
+            now + NEGATIVE_BEARER_CACHE_SECS,
+        )
+        .await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "past the window the runner is asked again"
+        );
+        clear_bearer_cache();
     }
 
     #[tokio::test]

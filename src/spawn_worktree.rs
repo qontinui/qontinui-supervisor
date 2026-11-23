@@ -38,7 +38,7 @@
 //! <workspace_root>/.spawn-<ref>/
 //!   qontinui-runner/             ← detached worktree at the requested ref
 //!     src-tauri/Cargo.toml       ← path = "../../qontinui-schemas/rust"
-//!   qontinui-schemas/            ← detached worktree pinned to origin/main
+//!   qontinui-schemas/            ← detached worktree at the runner's declared pin
 //!     rust/ rust-vision-core/
 //! ```
 //!
@@ -46,10 +46,29 @@
 //! now resolves to `<container>/qontinui-schemas/rust` — the pinned worktree,
 //! fully isolated from whatever branch the shared schemas checkout is on.
 //! The schemas worktree is created from the SHARED `qontinui-schemas` repo
-//! (which has the git object history) but checked out detached at
-//! `origin/main`, and re-pinned on every reuse.
+//! (which has the git object history) and checked out detached, re-pinned on
+//! every reuse.
+//!
+//! ## Which schemas commit
+//!
+//! The commit the runner tree at the requested ref DECLARES in
+//! `.github/sibling-pins.conf` (the `qontinui/qontinui-schemas <sha>` line):
+//! the pin that ref's own CI builds against, except where a coord dep-edge
+//! label pairs the ref with a schemas PR (CI then checks out the partner
+//! PR's head, which no spawn of the bare ref reproduces). Only a tree that
+//! declares no schemas pin falls back to `origin/main`. Pinning `origin/main`
+//! unconditionally broke every temp-runner and primary build of runner main
+//! whenever schemas had landed a change runner main had not yet adapted to
+//! (a schemas-leads window): 2026-11-11, schemas 6.2.0 removed four
+//! `verification` types that runner main still imported, and `spawn-test`
+//! for runner `bb421e28c` failed with four `E0425`s while the runner's own
+//! pin (`9f4f7b60`, 6.1.0) built clean. A malformed declared pin is an error,
+//! never a silent fall back to `origin/main`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::process::Command;
 
 use crate::error::SupervisorError;
@@ -101,6 +120,18 @@ pub fn find_repo_root(project_dir: &Path) -> Result<PathBuf, SupervisorError> {
 /// nested checkouts (e.g. worktree shells under `D:/qontinui-root.wt/<wt>/`)
 /// without devolving into "search the whole filesystem".
 const WORKSPACE_ROOT_WALK_CAP: usize = 6;
+
+/// Test-only: a directory under `base` nested deeper than
+/// [`WORKSPACE_ROOT_WALK_CAP`], so a walk from it (or from anything below it)
+/// never leaves `base`. A test that expects the walk to FAIL must start below
+/// this: otherwise the walk reaches the tempdir's own ancestors, and a host
+/// whose temp root sits beside real `qontinui-runner/` and `qontinui-schemas/`
+/// checkouts (a self-hosted CI runner's `_work/`, whose `TMPDIR` is
+/// `_work/_temp/tmp`) satisfies it there.
+#[cfg(test)]
+pub(crate) fn beyond_walk_cap(base: &Path) -> PathBuf {
+    (0..=WORKSPACE_ROOT_WALK_CAP).fold(base.to_path_buf(), |p, i| p.join(format!("pad{i}")))
+}
 
 /// Returns the workspace root: the directory that contains BOTH `qontinui-runner`
 /// AND `qontinui-schemas` (siblings under the same parent). Walks up from
@@ -235,7 +266,8 @@ pub fn classify_drift(error: &str, container: &Path) -> Option<String> {
 ///
 /// Materializes the nested-container layout described in the module docs:
 /// a runner worktree at the requested ref plus a pinned `qontinui-schemas`
-/// worktree at `origin/main`, both under `<workspace_root>/.spawn-<ref>/`.
+/// worktree at the runner tree's declared schemas pin (else `origin/main`),
+/// both under `<workspace_root>/.spawn-<ref>/`.
 pub struct PreparedWorktree {
     /// Per-ref container dir (`<workspace_root>/.spawn-<ref>/`). Parent of
     /// both the runner and schemas worktrees. This is what cleanup removes
@@ -253,6 +285,33 @@ pub struct PreparedWorktree {
     pub requested_ref: String,
     /// `git rev-parse HEAD` of the prepared runner worktree.
     pub resolved_sha: String,
+    /// The ref the schemas worktree was pinned to: the runner tree's declared
+    /// sha, or [`SCHEMAS_PIN_REF`] when it declares none.
+    pub schemas_pin_ref: String,
+    /// True when `schemas_pin_ref` came from the runner tree's
+    /// `.github/sibling-pins.conf`; false for the `origin/main` fallback.
+    pub schemas_pin_declared: bool,
+    /// `git rev-parse HEAD` of the prepared schemas worktree.
+    pub schemas_resolved_sha: String,
+}
+
+impl PreparedWorktree {
+    /// One line naming the schemas commit this worktree builds against and
+    /// where its pin came from, e.g. `schemas_sha=<sha> pinned to <ref>
+    /// (declared in .github/sibling-pins.conf)`. Shared by the spawn-test and
+    /// primary-rebuild log lines and the primary rebuild's build error, so all
+    /// three word it the same way.
+    pub fn schemas_pin_summary(&self) -> String {
+        let source = if self.schemas_pin_declared {
+            format!("declared in {SIBLING_PINS_CONF}")
+        } else {
+            "no declared pin; origin/main fallback".to_string()
+        };
+        format!(
+            "schemas_sha={} pinned to {} ({})",
+            self.schemas_resolved_sha, self.schemas_pin_ref, source
+        )
+    }
 }
 
 /// A validated, caller-owned worktree the supervisor will build *as-is*.
@@ -497,9 +556,90 @@ pub async fn cleanup_fresh_worktree(
     }
 }
 
-/// Ref the pinned schemas worktree is always checked out at. Centralized so
-/// the fresh-add, reuse, and tests agree.
+/// Ref the schemas worktree is checked out at when the runner tree declares
+/// no schemas pin of its own. Centralized so the fresh-add, reuse, and tests
+/// agree.
 const SCHEMAS_PIN_REF: &str = "origin/main";
+
+/// The runner repo's sibling-pin file, relative to its root. Written by the
+/// runner's `sibling-pin-bump.yml` / `schemas-pair-follow.yml`; read by its CI.
+const SIBLING_PINS_CONF: &str = ".github/sibling-pins.conf";
+
+/// The pin-file key naming the schemas sibling.
+const SCHEMAS_PIN_KEY: &str = "qontinui/qontinui-schemas";
+
+/// Parse the `qontinui-schemas` sha out of a `sibling-pins.conf` body: one
+/// `<owner>/<repo> <sha>` pair per line, `#` starts a comment.
+///
+/// The file's header requires every parser to agree field for field, so this
+/// follows the runner's `lookup_pin` (`src-tauri/src/ci_node/sibling.rs`) and
+/// the two awks: fields split on space and tab ONLY (not NBSP or other Unicode
+/// separators), the sha must be 40 LOWERCASE hex, and a repo listed twice is
+/// ambiguous.
+///
+/// `Ok(None)`: no schemas line (the caller falls back to [`SCHEMAS_PIN_REF`]).
+/// `Err`: a schemas line CI would refuse. That is never treated as absent,
+/// because falling back to `origin/main` there would rebuild against the very
+/// commit the pin exists to avoid.
+pub fn parse_declared_schemas_pin(contents: &str) -> Result<Option<String>, String> {
+    let mut matches: Vec<(usize, Vec<&str>)> = Vec::new();
+    for (idx, raw) in contents.lines().enumerate() {
+        let line = raw.trim_end_matches('\r');
+        let code = line.split_once('#').map_or(line, |(before, _)| before);
+        let fields: Vec<&str> = code.split([' ', '\t']).filter(|f| !f.is_empty()).collect();
+        if fields.first().copied() == Some(SCHEMAS_PIN_KEY) {
+            matches.push((idx + 1, fields));
+        }
+    }
+    let (lineno, fields) = match matches.as_slice() {
+        [] => return Ok(None),
+        [one] => one,
+        many => {
+            let lines: Vec<String> = many.iter().map(|(n, _)| n.to_string()).collect();
+            return Err(format!(
+                "lists {} {} times (lines {}); exactly one schemas commit can be pinned",
+                SCHEMAS_PIN_KEY,
+                many.len(),
+                lines.join(", ")
+            ));
+        }
+    };
+    match fields.as_slice() {
+        [_, sha]
+            if sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            Ok(Some((*sha).to_string()))
+        }
+        _ => Err(format!(
+            "line {} pins {} as {:?}: expected exactly `{} <40-character lowercase hex sha>` \
+             (trailing text must be a `#` comment)",
+            lineno,
+            SCHEMAS_PIN_KEY,
+            fields[1..].join(" "),
+            SCHEMAS_PIN_KEY
+        )),
+    }
+}
+
+/// Read the schemas pin the runner worktree declares (see
+/// [`parse_declared_schemas_pin`]). An absent pin file is `Ok(None)`.
+async fn declared_schemas_pin(runner_wt: &Path) -> Result<Option<String>, SupervisorError> {
+    let conf = runner_wt.join(SIBLING_PINS_CONF);
+    // Bytes, not `read_to_string`: the awks and `lookup_pin` accept a non-UTF-8
+    // byte in a `#` comment, and lossy decoding cannot manufacture a 40-hex sha.
+    match tokio::fs::read(&conf).await {
+        Ok(bytes) => parse_declared_schemas_pin(&String::from_utf8_lossy(&bytes))
+            .map_err(|e| SupervisorError::Process(format!("{:?}: {}", conf, e))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(SupervisorError::Process(format!(
+            "failed to read the runner's sibling-pin file {:?}: {}",
+            conf, e
+        ))),
+    }
+}
 
 /// Detect a stale FLAT-layout spawn dir from before the nested-container
 /// migration. The old layout put the runner worktree's `src-tauri` directly
@@ -542,22 +682,45 @@ pub fn runner_worktree_path_for_ref(
     Ok(container_path_for_ref(project_dir, git_ref)?.join("qontinui-runner"))
 }
 
+/// Whether `runner_root` is the runner worktree of a managed spawn container:
+/// `<workspace_root>/.spawn-<ref>/qontinui-runner`, directly under the
+/// workspace root `project_dir` derives, which is where [`prepare_worktree`]
+/// puts it and where the pruner looks. Decided from the path alone, so it also
+/// answers for a container that has since been deleted.
+///
+/// Such a tree is a linked worktree of the runner repo ([`find_repo_root`]): it
+/// shares that repo's object store and refs, so the sha it was built at, and
+/// `origin/main`, resolve in the runner repo as well, which outlives the
+/// container.
+pub fn is_managed_runner_worktree(project_dir: &Path, runner_root: &Path) -> bool {
+    let Some(container) = runner_root.parent() else {
+        return false;
+    };
+    runner_root.file_name() == Some(std::ffi::OsStr::new("qontinui-runner"))
+        && container
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(SPAWN_DIR_PREFIX))
+        && derive_workspace_root(project_dir)
+            .is_ok_and(|workspace_root| container.parent() == Some(workspace_root.as_path()))
+}
+
 /// Ensure a managed, *isolated* detached worktree set for `git_ref` exists.
 /// Idempotent: a subsequent call for the same ref reuses the existing
 /// container, force-resets the runner worktree to the ref, and re-pins the
-/// schemas worktree to `origin/main`.
+/// schemas worktree to the runner tree's declared pin (else `origin/main`).
 ///
 /// Layout (see module docs for the rationale):
 ///
 /// ```text
 /// <workspace_root>/.spawn-<sanitized_ref>/   ← container
 ///   qontinui-runner/                         ← detached worktree at git_ref
-///   qontinui-schemas/                        ← detached worktree at origin/main
+///   qontinui-schemas/                        ← detached worktree at the declared pin
 /// ```
 ///
 /// The runner worktree is created from the runner repo (`repo_root`); the
 /// schemas worktree from the SHARED `<workspace_root>/qontinui-schemas` repo,
-/// pinned to `origin/main`, so the runner crate's `../../qontinui-schemas/...`
+/// pinned to the declared sha, so the runner crate's `../../qontinui-schemas/...`
 /// path-deps resolve INSIDE the container and never touch the shared
 /// checkout's working-tree branch.
 ///
@@ -566,6 +729,19 @@ pub fn runner_worktree_path_for_ref(
 /// On the *reuse* path the container is left in place on a later failure (the
 /// caller may have ongoing state there) — but an OLD FLAT-layout container is
 /// always torn down and rebuilt first.
+///
+/// On success it stamps the container's mtime with the current time
+/// ([`set_dir_mtime`]), so the pruner's retention counts from the container's
+/// LAST USE rather than from its creation. When both nested worktrees already
+/// exist, the reuse path writes only inside them (a missing schemas worktree is
+/// re-created inside the container, which does touch it), so a container
+/// reused every day used to read as old as its creation and was pruned between
+/// uses. A failed preparation stamps nothing, so it never extends a
+/// container's life.
+///
+/// Callers hold the container's lock ([`SpawnContainerLocks`]) across this call
+/// and everything that reads the tree afterwards: this function resets a reused
+/// tree, which must never happen under a build that is reading it.
 pub async fn prepare_worktree(
     project_dir: &Path,
     git_ref: &str,
@@ -616,8 +792,8 @@ pub async fn prepare_worktree(
 
     let was_fresh = !container.exists();
     if was_fresh {
-        // Fresh add: create the runner worktree at the ref and the schemas
-        // worktree pinned to origin/main. `git worktree add --detach <path>
+        // Fresh add: create the runner worktree at the ref (the schemas
+        // worktree is pinned below). `git worktree add --detach <path>
         // <ref>` creates the intermediate `<container>/` dir as needed.
         let runner_wt_str = runner_wt.to_string_lossy().to_string();
         git(
@@ -639,49 +815,71 @@ pub async fn prepare_worktree(
     }
 
     // Prepare (or re-pin) the schemas worktree. Done for BOTH fresh and reuse
-    // paths: on reuse the shared schemas checkout may have advanced, so we
-    // always fetch + force-pin the worktree to origin/main. Wrapped so a
-    // failure on the fresh path triggers full cleanup below.
+    // paths: on reuse the requested ref (and so its declared pin) or the
+    // shared schemas checkout may have moved, so we always fetch + force-pin.
+    // The pin is the schemas sha the runner tree at this ref declares in
+    // `.github/sibling-pins.conf`, else `origin/main` (module doc, "Which
+    // schemas commit"). Wrapped so a failure on the fresh path triggers full
+    // cleanup below.
     let prepare_schemas = async {
-        // Best-effort fetch on the shared schemas repo so origin/main is current.
+        let declared = declared_schemas_pin(&runner_wt).await?;
+        let pin_ref: String = declared
+            .clone()
+            .unwrap_or_else(|| SCHEMAS_PIN_REF.to_string());
+        // Best-effort fetches on the shared schemas repo (worktrees share its
+        // object store): origin/main for the fallback, and the declared sha
+        // itself, which need not be on main and may postdate the last fetch.
+        // Offline is tolerated; the checkout below fails loudly if the commit
+        // is still absent.
         git(
             &["fetch", "--quiet", "origin", "main"],
             &schemas_repo_root,
             true,
         )
         .await?;
+        if let Some(sha) = &declared {
+            git(
+                &["fetch", "--quiet", "origin", sha],
+                &schemas_repo_root,
+                true,
+            )
+            .await?;
+        }
         if !schemas_wt.exists() {
             let schemas_wt_str = schemas_wt.to_string_lossy().to_string();
             git(
-                &[
-                    "worktree",
-                    "add",
-                    "--detach",
-                    &schemas_wt_str,
-                    SCHEMAS_PIN_REF,
-                ],
+                &["worktree", "add", "--detach", &schemas_wt_str, &pin_ref],
                 &schemas_repo_root,
                 false,
             )
             .await?;
         } else {
-            // Re-pin an existing schemas worktree to origin/main.
-            git(&["fetch", "--quiet", "origin", "main"], &schemas_wt, true).await?;
             git(
-                &["checkout", "--detach", "--force", SCHEMAS_PIN_REF],
+                &["checkout", "--detach", "--force", &pin_ref],
                 &schemas_wt,
                 false,
             )
             .await?;
-            git(&["reset", "--hard", SCHEMAS_PIN_REF], &schemas_wt, false).await?;
+            git(&["reset", "--hard", &pin_ref], &schemas_wt, false).await?;
         }
-        Ok::<(), SupervisorError>(())
+        let schemas_sha = git(&["rev-parse", "HEAD"], &schemas_wt, false).await?;
+        tracing::info!(
+            "spawn-worktree: schemas sibling pinned to {} ({}) at {}",
+            pin_ref,
+            if declared.is_some() {
+                SIBLING_PINS_CONF
+            } else {
+                "no declared pin; origin/main fallback"
+            },
+            schemas_sha
+        );
+        Ok::<(String, bool, String), SupervisorError>((pin_ref, declared.is_some(), schemas_sha))
     };
 
     // Run schemas prep + post-add validation in an inner async block so a
     // single match arm can wire cleanup-on-error for the fresh-add path.
     let finalize = async {
-        prepare_schemas.await?;
+        let (schemas_pin_ref, schemas_pin_declared, schemas_resolved_sha) = prepare_schemas.await?;
 
         let resolved_sha = git(&["rev-parse", "HEAD"], &runner_wt, false).await?;
         let src_tauri = runner_wt.join("src-tauri");
@@ -709,11 +907,27 @@ pub async fn prepare_worktree(
             schemas_path: schemas_wt.clone(),
             requested_ref: git_ref.to_string(),
             resolved_sha,
+            schemas_pin_ref,
+            schemas_pin_declared,
+            schemas_resolved_sha,
         })
     };
 
     match finalize.await {
-        Ok(prepared) => Ok(prepared),
+        Ok(prepared) => {
+            // Age is last use (see the doc comment). Best-effort: a container
+            // whose stamp fails ages from an earlier use instead, and while it is
+            // in use its builder's lock keeps it from every sweep regardless.
+            if let Err(e) = set_dir_mtime(&prepared.container_path, SystemTime::now()) {
+                tracing::warn!(
+                    "spawn-worktree: could not stamp {:?} as used now (setting its mtime \
+                     failed: {}); the pruner will age it from an earlier use",
+                    prepared.container_path,
+                    e
+                );
+            }
+            Ok(prepared)
+        }
         Err(e) => {
             if was_fresh {
                 cleanup_fresh_worktree(
@@ -741,22 +955,195 @@ pub async fn prepare_worktree(
 //
 // Safety is the whole point — getting it wrong deletes a checkout. The
 // predicate is intentionally conservative and layered (see
-// [`prune_spawn_worktrees`]). The three never-touch invariants are enforced
+// [`prune_spawn_worktrees_with_window`]). The three never-touch invariants are enforced
 // structurally, not by comment:
 //
 //   1. Only directories whose name starts with the supervisor's own
 //      `SPAWN_DIR_PREFIX`, and only directly under the derived workspace root
 //      where the supervisor itself creates them. A caller-owned `worktree_path`
 //      tree lives elsewhere and never matches this prefix-under-root filter.
-//   2. Never a container that is the build tree of a currently-active build
-//      (the caller passes the active set).
-//   3. A container younger than the retention window is kept; a container that
-//      is a *dirty* registered worktree is kept until DOUBLE the window (a peer
-//      may have adopted the scratch tree and made edits).
+//   2. Never a container that is IN USE: one whose lock
+//      ([`SpawnContainerLocks`]) a builder holds. The pruner only ever TRIES
+//      the lock, and holds the one it gets until the container is gone.
+//   3. A container used within the retention window is kept (age is the time
+//      since its last use, which `prepare_worktree` stamps on the container's
+//      mtime); a container that is a *dirty* registered worktree is kept until
+//      DOUBLE the window (a peer may have adopted the scratch tree and made
+//      edits).
 
 /// Directory-name prefix of every supervisor-created scratch worktree
 /// container. Centralized so [`prepare_worktree`] and the pruner agree.
 pub const SPAWN_DIR_PREFIX: &str = ".spawn-";
+
+/// The per-container locks that are the ONE signal that a `.spawn-*` container
+/// is in use.
+///
+/// [`prepare_worktree`] REUSES a container by `git checkout --force` + `git
+/// reset --hard`, and the pruner deletes one outright. Either, done while
+/// another build is reading the container, pulls its source out from under the
+/// compiler, or its `dist/` out from under the frontend check that follows the
+/// build: failures that look exactly like code errors, or a frontend check
+/// that finds no dist/ in a tree that was built (plan
+/// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+/// Every default spawn-test and the primary's origin/main rebuild share one
+/// `.spawn-origin_main` container, so that is the common case, not a rare
+/// collision.
+///
+/// So every BUILDER holds its container's lock from before `prepare_worktree`
+/// until it last reads the tree: spawn-test through its frontend verdict, the
+/// primary's origin/main rebuild through its build. Builds of the same ref
+/// serialize, an accepted trade since they would otherwise compile
+/// byte-identical source twice in parallel, and builds of different refs never
+/// contend. The PRUNER only ever TRIES the lock: a held lock means "in use,
+/// keep", a sweep never waits behind a build that can run for most of an hour,
+/// and it holds the lock it took until the container is gone, so a builder
+/// that arrives meanwhile waits and then materializes a fresh one.
+///
+/// This replaced a hand-maintained set of "active" containers, a snapshot copy
+/// of what the lock already meant. A builder that started after a sweep took
+/// its snapshot was unprotected, the primary's rebuild was never in the set,
+/// and spawn-test took its own container out of it, then swept, before its
+/// frontend check had read the tree.
+///
+/// A held lock carries its holder's label ([`SpawnContainerGuard`]), so a
+/// caller that will not wait, or stops waiting, can say which build it is
+/// waiting for.
+///
+/// Keyed by the container path, lowercased ([`lock_key`]).
+/// [`container_path_for_ref`] and the pruner's listing of the workspace root
+/// both spell it `<derive_workspace_root(project_dir)>/.spawn-<sanitized ref>`,
+/// from the same `project_dir`, so only the case of the ref part can differ
+/// between two spellings of one directory: on a case-insensitive filesystem
+/// refs that differ only in case share one container. The map's `std::sync::Mutex` is
+/// never held across an await; the per-container `tokio::sync::Mutex` is what
+/// a build holds. Entries are never evicted: one empty mutex per container ever
+/// seen is negligible, and evicting a lock another task is queued on is the
+/// classic way to reintroduce the race.
+#[derive(Default)]
+pub struct SpawnContainerLocks {
+    locks: std::sync::Mutex<HashMap<PathBuf, Arc<ContainerLock>>>,
+}
+
+/// One spawn container's lock, and the label of whoever holds it.
+struct ContainerLock {
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    /// Set right after the lock is taken and cleared just before it is
+    /// released, so `None` means free, or held for the instant before its new
+    /// holder labels it.
+    holder: std::sync::Mutex<Option<String>>,
+}
+
+impl ContainerLock {
+    fn holder(&self) -> Option<String> {
+        self.holder
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// A held spawn container lock. Dropping it lets the container go: it clears
+/// the holder's label, then releases the lock.
+pub struct SpawnContainerGuard {
+    lock: Arc<ContainerLock>,
+    // Dropped after `Drop::drop` has cleared the label, so a new holder's
+    // label is never cleared by the old one.
+    _held: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SpawnContainerGuard {
+    fn labelled(
+        lock: Arc<ContainerLock>,
+        held: tokio::sync::OwnedMutexGuard<()>,
+        taker: &str,
+    ) -> Self {
+        *lock.holder.lock().unwrap_or_else(|e| e.into_inner()) = Some(taker.to_string());
+        SpawnContainerGuard { lock, _held: held }
+    }
+}
+
+impl Drop for SpawnContainerGuard {
+    fn drop(&mut self) {
+        *self.lock.holder.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+/// A container another build holds: [`SpawnContainerLocks::try_take`]'s
+/// refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerHeld {
+    /// The holder's label, `None` for the instant before a new holder labels
+    /// the lock it has just taken.
+    pub holder: Option<String>,
+}
+
+impl std::fmt::Display for ContainerHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.holder {
+            Some(holder) => write!(f, "held by {holder}"),
+            None => f.write_str("held by another build"),
+        }
+    }
+}
+
+/// The lock map's key for `container`: its path, lowercased on every
+/// platform. Whether case matters is a property of the filesystem, not of the
+/// OS: a Linux or WSL workspace can sit on a case-insensitive mount (`/mnt/c`
+/// over drvfs, an ext4 casefold directory), where refs that differ only in
+/// case name one directory, and two locks on it would let two builds reset one
+/// tree. Folding where case does matter costs only that such refs serialize.
+fn lock_key(container: &Path) -> PathBuf {
+    PathBuf::from(container.to_string_lossy().to_lowercase())
+}
+
+impl SpawnContainerLocks {
+    /// The lock for `container`, created on first use.
+    fn lock_for(&self, container: &Path) -> Arc<ContainerLock> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(lock_key(container))
+            .or_insert_with(|| {
+                Arc::new(ContainerLock {
+                    mutex: Arc::new(tokio::sync::Mutex::new(())),
+                    holder: std::sync::Mutex::new(None),
+                })
+            })
+            .clone()
+    }
+
+    /// Take `container`'s lock for `taker` if it is free, without waiting.
+    pub fn try_take(
+        &self,
+        container: &Path,
+        taker: &str,
+    ) -> Result<SpawnContainerGuard, ContainerHeld> {
+        let lock = self.lock_for(container);
+        match lock.mutex.clone().try_lock_owned() {
+            Ok(held) => Ok(SpawnContainerGuard::labelled(lock, held, taker)),
+            Err(_) => Err(ContainerHeld {
+                holder: lock.holder(),
+            }),
+        }
+    }
+
+    /// Take `container`'s lock for `taker`, waiting while another build holds
+    /// it.
+    pub async fn take(&self, container: &Path, taker: &str) -> SpawnContainerGuard {
+        let lock = self.lock_for(container);
+        let held = lock.mutex.clone().lock_owned().await;
+        SpawnContainerGuard::labelled(lock, held, taker)
+    }
+
+    /// Who holds `container`'s lock now, read without touching the lock:
+    /// `None` when it is free, or in the instant before a new holder labels it.
+    pub fn holder(&self, container: &Path) -> Option<String> {
+        self.lock_for(container).holder()
+    }
+}
+
+/// The label the spawn-worktree sweep holds a container under while it
+/// decides on it and removes it.
+pub const SPAWN_SWEEP_TAKER: &str = "the spawn-worktree sweep";
 
 /// Env var overriding the idle-retention window, in hours. Default
 /// [`DEFAULT_SPAWN_RETENTION_HOURS`]. `0` prunes every idle container
@@ -788,8 +1175,8 @@ fn retention_hours() -> u64 {
 pub struct PruneReport {
     /// Container dirs successfully removed.
     pub removed: Vec<PathBuf>,
-    /// Container dirs inspected but kept (with a short reason), e.g. too young,
-    /// active build, dirty-and-not-double-aged.
+    /// Container dirs inspected but kept (with a short reason), e.g. in use,
+    /// used too recently, dirty-and-not-double-aged.
     pub kept: Vec<(PathBuf, String)>,
     /// Container dirs we attempted to remove but failed (logged + skipped).
     pub failed: Vec<(PathBuf, String)>,
@@ -800,10 +1187,39 @@ pub struct PruneReport {
 /// is in the future relative to `now` (clock skew) — both treated by the caller
 /// as "unknown/zero age ⇒ do not prune", the safe default. `now` is injected so
 /// tests can advance the clock deterministically without touching mtimes.
-fn dir_age(path: &Path, now: std::time::SystemTime) -> Option<std::time::Duration> {
+///
+/// For a `.spawn-*` container this is the time since its LAST USE:
+/// [`prepare_worktree`] stamps the container's mtime on every successful
+/// preparation ([`set_dir_mtime`]).
+fn dir_age(path: &Path, now: SystemTime) -> Option<std::time::Duration> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok()?;
     now.duration_since(mtime).ok()
+}
+
+/// Set the modification time of the directory `dir` to `when`.
+///
+/// Built on std's `File::set_modified`, the repo's way of setting an mtime
+/// (see the `lkg_coverage` tests); the `filetime` crate is not a dependency.
+/// It needs a handle to the directory itself. On Unix a plain read-only open
+/// gives one, and setting an explicit time needs ownership, not write access.
+/// On Windows `CreateFileW` opens a directory only with
+/// `FILE_FLAG_BACKUP_SEMANTICS`, and `SetFileTime` needs a handle with write
+/// access.
+fn set_dir_mtime(dir: &Path, when: SystemTime) -> std::io::Result<()> {
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // `FILE_FLAG_BACKUP_SEMANTICS` (winbase.h).
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+    };
+    #[cfg(not(windows))]
+    let handle = std::fs::File::open(dir)?;
+    handle.set_modified(when)
 }
 
 /// True if `dir` is registered as a git worktree of `repo_root` AND has
@@ -876,46 +1292,39 @@ async fn remove_spawn_container(
 /// `project_dir` is the supervisor's configured runner `src-tauri` (used to
 /// derive the workspace root and the owning repos — the SAME derivation
 /// `prepare_worktree` uses, so the pruner looks exactly where the supervisor
-/// creates these dirs). `active_containers` is the set of container paths a
-/// build is currently using (the active-build exclusion). `now` is injected so
-/// tests can pin time; production passes `SystemTime::now()`.
+/// creates these dirs). `locks` are the supervisor's container locks: a
+/// container whose lock is held is in use and kept ([`SpawnContainerLocks`]).
+/// `now` is injected so tests can pin time; production passes
+/// `SystemTime::now()`. `window_hours_override`:
+/// - `None` ⇒ resolve the window from [`SPAWN_RETENTION_ENV`] / the default
+///   (the startup sweep and spawn-test's sweep after its build);
+/// - `Some(h)` ⇒ use `h` hours as the single retention window (and `2*h` as the
+///   dirty-worktree double-retention window), so
+///   `DELETE /spawn-worktrees?older_than_hours=<h>` can pass an
+///   operator-chosen window without changing the background default.
+///   `Some(0)` prunes every idle container immediately, and still keeps a
+///   container whose lock is held.
 ///
 /// Retention:
-/// - A container is "idle" (no active build) AND its mtime is older than the
+/// - A container that is not in use AND was last used longer ago than the
 ///   single window ⇒ prunable, unless it is a dirty registered worktree.
 /// - A dirty registered worktree requires DOUBLE the window before it is
 ///   prunable (a peer may have adopted the scratch tree).
 ///
+/// It holds a container's lock until that container's removal is done, so it
+/// must not be dropped midway: a `git worktree remove` child and a blocking
+/// `remove_dir_all` would go on deleting with the lock already released, and a
+/// builder waiting on it would materialize into a half-removed tree. Run it
+/// through `SupervisorState::sweep_spawn_worktrees`, which runs it on a task
+/// of its own.
+///
 /// Best-effort throughout: a failure to derive roots, stat a dir, or remove a
 /// dir is logged and skipped — this never returns an error and never fails the
 /// caller. Returns a [`PruneReport`] for logging/tests.
-pub async fn prune_spawn_worktrees(
-    project_dir: &Path,
-    active_containers: &std::collections::HashSet<PathBuf>,
-    now: std::time::SystemTime,
-) -> PruneReport {
-    // Delegate to the window-parameterized inner fn with no override, so the
-    // engine resolves the retention window from env exactly as before. Existing
-    // callers (startup sweep, opportunistic sweep) are unchanged.
-    prune_spawn_worktrees_with_window(project_dir, active_containers, now, None).await
-}
-
-/// Same as [`prune_spawn_worktrees`] but with an explicit retention-window
-/// override (in hours). `window_hours_override`:
-/// - `None` ⇒ resolve the window from [`SPAWN_RETENTION_ENV`] / the default
-///   (the behavior of [`prune_spawn_worktrees`]);
-/// - `Some(h)` ⇒ use `h` hours as the single retention window (and `2*h` as the
-///   dirty-worktree double-retention window). `Some(0)` prunes every idle
-///   container immediately, subject to the dirty double-retention rule.
-///
-/// Exists so the `DELETE /spawn-worktrees?older_than_hours=<h>` endpoint can
-/// pass an operator-chosen window WITHOUT changing the env-derived default for
-/// the background sweeps. All selection/safety invariants are identical — only
-/// the window source differs.
 pub async fn prune_spawn_worktrees_with_window(
     project_dir: &Path,
-    active_containers: &std::collections::HashSet<PathBuf>,
-    now: std::time::SystemTime,
+    locks: &SpawnContainerLocks,
+    now: SystemTime,
     window_hours_override: Option<u64>,
 ) -> PruneReport {
     let mut report = PruneReport::default();
@@ -1002,11 +1411,19 @@ pub async fn prune_spawn_worktrees_with_window(
             continue;
         }
 
-        // Invariant 2: never prune a container with an active build.
-        if active_containers.contains(&path) {
-            report.kept.push((path.clone(), "active build".to_string()));
-            continue;
-        }
+        // Invariant 2: never prune a container in use. A builder holds its
+        // container's lock from before `prepare_worktree` until its last read
+        // of the tree, so a held lock IS "in use". Only TRIED here: a sweep
+        // must never wait behind a build. The guard is held through the checks
+        // below and the removal, so a builder that arrives meanwhile waits for
+        // the removal to finish and then materializes a fresh container.
+        let _held = match locks.try_take(&path, SPAWN_SWEEP_TAKER) {
+            Ok(guard) => guard,
+            Err(held) => {
+                report.kept.push((path.clone(), format!("in use: {held}")));
+                continue;
+            }
+        };
 
         // Age check (invariant 3, part A). Unknown age ⇒ keep (safe default).
         let age = match dir_age(&path, now) {
@@ -1021,7 +1438,10 @@ pub async fn prune_spawn_worktrees_with_window(
         if age < retention {
             report.kept.push((
                 path.clone(),
-                format!("younger than retention ({}h)", retention.as_secs() / 3600),
+                format!(
+                    "used within the retention window ({}h)",
+                    retention.as_secs() / 3600
+                ),
             ));
             continue;
         }
@@ -1043,7 +1463,7 @@ pub async fn prune_spawn_worktrees_with_window(
         match remove_spawn_container(&path, &repo_root, schemas_repo_root.as_deref()).await {
             Ok(()) => {
                 tracing::info!(
-                    "spawn-prune: removed stale scratch worktree {:?} (age {}h, retention {}h)",
+                    "spawn-prune: removed stale scratch worktree {:?} (unused for {}h, retention {}h)",
                     path,
                     age.as_secs() / 3600,
                     retention.as_secs() / 3600
@@ -1263,7 +1683,9 @@ mod tests {
     fn derive_workspace_root_errors_on_malformed_layout() {
         // Only one of the two required siblings present — schemas missing.
         let tmp = tempfile::TempDir::new().expect("tempdir");
-        let runner_src_tauri = tmp.path().join("qontinui-runner").join("src-tauri");
+        let runner_src_tauri = beyond_walk_cap(tmp.path())
+            .join("qontinui-runner")
+            .join("src-tauri");
         std::fs::create_dir_all(&runner_src_tauri).expect("mkdir");
         let res = derive_workspace_root(&runner_src_tauri);
         let err = res.expect_err("must error when qontinui-schemas is missing");
@@ -1347,6 +1769,176 @@ mod tests {
             Some(&prepared.schemas_path),
         )
         .await;
+    }
+
+    // ---------- declared schemas pin (`.github/sibling-pins.conf`) ----------
+
+    const PIN_A: &str = "9f4f7b6001f2028c2824bd591ed2ef452c140ab7";
+
+    #[test]
+    fn parse_declared_schemas_pin_reads_the_schemas_line() {
+        let conf = format!(
+            "# pins\r\nqontinui/ui-bridge      7f766ae656ea460cf848e4cae29d697062e956ee\n\n\
+             qontinui/qontinui-schemas\t{PIN_A}   # bumped by sibling-pin-bump.yml\r\n"
+        );
+        assert_eq!(
+            parse_declared_schemas_pin(&conf),
+            Ok(Some(PIN_A.to_string())),
+            "tab-separated, CRLF line ends and a trailing comment all parse"
+        );
+    }
+
+    #[test]
+    fn parse_declared_schemas_pin_absent_is_none() {
+        assert_eq!(parse_declared_schemas_pin(""), Ok(None));
+        assert_eq!(
+            parse_declared_schemas_pin(
+                "# qontinui/qontinui-schemas deadbeef\nqontinui/qontinui-web 4f5ea9f01fd103b37e6edec1f877afe641017bad\n"
+            ),
+            Ok(None),
+            "a commented-out schemas line and other repos' pins are not a schemas pin"
+        );
+        // NBSP is not a field separator (awk's FS is space/tab), so this is ONE
+        // unlisted token to CI, which floats; parity means no pin here either.
+        assert_eq!(
+            parse_declared_schemas_pin(
+                "qontinui/qontinui-schemas\u{a0}9f4f7b6001f2028c2824bd591ed2ef452c140ab7\n"
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn parse_declared_schemas_pin_refuses_a_malformed_schemas_line() {
+        for bad in [
+            "qontinui/qontinui-schemas 9f4f7b60",
+            "qontinui/qontinui-schemas main",
+            "qontinui/qontinui-schemas",
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140ab7 extra",
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140abz",
+            // Uppercase hex: git takes it, but CI's `[0-9a-f]` globs refuse it.
+            "qontinui/qontinui-schemas 9F4F7B6001F2028C2824BD591ED2EF452C140AB7",
+            // Listed twice: ambiguous.
+            "qontinui/qontinui-schemas 9f4f7b6001f2028c2824bd591ed2ef452c140ab7\n\
+             qontinui/qontinui-schemas 38258049aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            let err = parse_declared_schemas_pin(bad).expect_err(bad);
+            assert!(err.contains("qontinui/qontinui-schemas"), "{bad}: {err}");
+        }
+    }
+
+    /// Advance the fixture's schemas `main` by one commit (and its self-origin),
+    /// returning `(old_sha, new_sha)`, so a declared pin and `origin/main` differ.
+    fn advance_schemas_main(root: &Path) -> (String, String) {
+        let schemas = root.join("qontinui-schemas");
+        let old = rev_parse_sync(&schemas, "HEAD");
+        std::fs::write(schemas.join("rust").join("lib.rs"), "pub struct Newer;\n")
+            .expect("write schemas lib.rs");
+        git_in(&schemas, &["commit", "-q", "-am", "schemas leads"]);
+        git_in(&schemas, &["fetch", "-q", "origin"]);
+        (old, rev_parse_sync(&schemas, "HEAD"))
+    }
+
+    fn rev_parse_sync(dir: &Path, rev: &str) -> String {
+        let out = StdCommand::new("git")
+            .args(["rev-parse", rev])
+            .current_dir(dir)
+            .output()
+            .expect("spawn git");
+        assert!(out.status.success(), "rev-parse {rev} in {dir:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// Commit a `.github/sibling-pins.conf` with `body` into the runner repo.
+    fn commit_runner_pin_file(root: &Path, body: &str) {
+        let runner = root.join("qontinui-runner");
+        std::fs::create_dir_all(runner.join(".github")).expect("mkdir .github");
+        std::fs::write(runner.join(SIBLING_PINS_CONF), body).expect("write pin file");
+        git_in(&runner, &["add", "-A"]);
+        git_in(&runner, &["commit", "-q", "-m", "declare sibling pins"]);
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_pins_schemas_to_the_runners_declared_sha() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let (declared, main_tip) = advance_schemas_main(&root);
+        assert_ne!(declared, main_tip);
+        commit_runner_pin_file(&root, &format!("qontinui/qontinui-schemas {declared}\n"));
+
+        let prepared = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare_worktree HEAD");
+        assert!(prepared.schemas_pin_declared);
+        assert_eq!(prepared.schemas_pin_ref, declared);
+        assert_eq!(
+            prepared.schemas_resolved_sha, declared,
+            "the schemas worktree must sit at the runner's declared pin, not origin/main ({main_tip})"
+        );
+        assert_eq!(rev_parse_sync(&prepared.schemas_path, "HEAD"), declared);
+
+        // Reuse re-pins to the declared sha too, even after the worktree moved.
+        git_in(
+            &prepared.schemas_path,
+            &["checkout", "-q", "--detach", &main_tip],
+        );
+        let again = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("second prepare (reuse)");
+        assert_eq!(again.schemas_resolved_sha, declared);
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &again.container_path,
+            &again.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&again.schemas_path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_without_a_declared_pin_falls_back_to_origin_main() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let (_old, main_tip) = advance_schemas_main(&root);
+
+        let prepared = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare_worktree HEAD");
+        assert!(!prepared.schemas_pin_declared);
+        assert_eq!(prepared.schemas_pin_ref, SCHEMAS_PIN_REF);
+        assert_eq!(prepared.schemas_resolved_sha, main_tip);
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &prepared.container_path,
+            &prepared.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&prepared.schemas_path),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_worktree_refuses_a_malformed_declared_pin_and_cleans_up() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        commit_runner_pin_file(&root, "qontinui/qontinui-schemas main\n");
+
+        let err = match prepare_worktree(&src_tauri, "HEAD").await {
+            Ok(_) => panic!("a malformed declared pin must not fall back to origin/main"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("sibling-pins.conf"),
+            "error names the file: {err}"
+        );
+        let container = root.join(format!(".spawn-{}", sanitize_ref("HEAD")));
+        assert!(
+            !container.exists(),
+            "the fresh container must be cleaned up on the refusal"
+        );
     }
 
     #[tokio::test]
@@ -1619,16 +2211,15 @@ mod tests {
         );
     }
 
-    // ---------- prune_spawn_worktrees (Phase 4) ----------
+    // ---------- prune_spawn_worktrees_with_window (Phase 4) ----------
     //
     // These build a real workspace fixture, materialize one or more genuine
     // `.spawn-*` containers via `prepare_worktree`, and drive the pruner with
     // an injected `now` so retention boundaries are deterministic without
     // touching mtimes.
 
-    use std::collections::HashSet;
     use std::sync::OnceLock;
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
 
     /// Serializes tests that read or mutate the process-wide retention env var
     /// so a `set_var("0")` in one test can't bleed into another's
@@ -1656,10 +2247,11 @@ mod tests {
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
         assert!(prepared.container_path.exists());
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 24h old, default 48h window → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(24)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(24), None).await;
         assert!(
             prepared.container_path.exists(),
             "container younger than retention must be kept"
@@ -1668,7 +2260,8 @@ mod tests {
         assert_eq!(r.kept.len(), 1);
 
         // 49h old, default 48h window → removed (clean worktree, single window).
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(49)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(49), None).await;
         assert!(
             !prepared.container_path.exists(),
             "container older than retention must be removed; still present: {:?}",
@@ -1681,6 +2274,62 @@ mod tests {
         );
     }
 
+    /// Age is LAST USE, not creation (plan
+    /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+    /// D2). The reuse path writes only inside the nested worktrees, so without
+    /// the stamp a container reused that very day read as old as its creation,
+    /// and a sweep pruned it between uses.
+    #[tokio::test]
+    async fn a_reused_container_ages_from_its_last_use_not_its_creation() {
+        let _g = retention_env_guard().lock().await;
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let (root, src_tauri) = build_workspace_fixture(tmp.path());
+        let created = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+
+        // Created 200h ago and not used since: past even the dirty window (96h).
+        set_dir_mtime(
+            &created.container_path,
+            SystemTime::now() - Duration::from_secs(200 * 3600),
+        )
+        .expect("backdate the container");
+        let idle = dir_age(&created.container_path, SystemTime::now()).expect("an age");
+        assert!(
+            idle >= Duration::from_secs(199 * 3600),
+            "fixture: the backdate must take, read {idle:?}"
+        );
+
+        let reused = prepare_worktree(&src_tauri, "HEAD")
+            .await
+            .expect("prepare again (reuse)");
+        let age = dir_age(&reused.container_path, SystemTime::now()).expect("an age");
+        assert!(
+            age < Duration::from_secs(60),
+            "a container prepare_worktree just reused must read as just used, not {age:?} old"
+        );
+
+        // So the default-window sweep keeps it.
+        let r = prune_spawn_worktrees_with_window(
+            &src_tauri,
+            &SpawnContainerLocks::default(),
+            SystemTime::now(),
+            None,
+        )
+        .await;
+        assert!(
+            reused.container_path.exists() && r.removed.is_empty(),
+            "a container used moments ago was pruned: {r:?}"
+        );
+
+        cleanup_fresh_worktree(
+            &find_repo_root(&src_tauri).unwrap(),
+            &reused.container_path,
+            &reused.worktree_path,
+            Some(&root.join("qontinui-schemas")),
+            Some(&reused.schemas_path),
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn prune_window_override_maps_to_age_window() {
         let _g = retention_env_guard().lock().await;
@@ -1690,10 +2339,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 12h old, override 24h → kept (younger than the override window).
-        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(24))
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(12), Some(24))
             .await;
         assert!(
             prepared.container_path.exists(),
@@ -1702,7 +2351,7 @@ mod tests {
         assert!(r.removed.is_empty());
 
         // 12h old, override 6h → removed (older than the override window).
-        let r = prune_spawn_worktrees_with_window(&src_tauri, &empty, now_plus_hours(12), Some(6))
+        let r = prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(12), Some(6))
             .await;
         assert!(
             !prepared.container_path.exists(),
@@ -1711,43 +2360,141 @@ mod tests {
         assert_eq!(r.removed.len(), 1);
     }
 
+    /// A container whose lock is held is in use, and no window prunes it: not
+    /// even `0`, which is what `DELETE /spawn-worktrees?older_than_hours=0`
+    /// passes (plan
+    /// `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`,
+    /// D1). The lock is the one "in use" signal, so a builder is protected
+    /// whenever it started, with no set of active containers to keep current.
     #[tokio::test]
-    async fn prune_excludes_active_build_container() {
+    async fn prune_keeps_a_container_whose_lock_is_held_even_at_window_zero() {
         let _g = retention_env_guard().lock().await;
-        // An aged container that is in the active-build set is KEPT regardless
-        // of age.
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
+        let locks = SpawnContainerLocks::default();
 
-        let mut active: HashSet<PathBuf> = HashSet::new();
-        active.insert(prepared.container_path.clone());
-
-        // 999h old but active → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &active, now_plus_hours(999)).await;
+        // A builder holds it, as one does from before its prepare until its
+        // last read of the tree.
+        let held = locks.take(&prepared.container_path, "a test build").await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), Some(0)).await;
         assert!(
-            prepared.container_path.exists(),
-            "active-build container must never be pruned"
+            prepared.container_path.exists() && r.removed.is_empty(),
+            "a container whose lock is held was pruned: {r:?}"
         );
-        assert!(r.removed.is_empty());
         assert!(
-            r.kept
-                .iter()
-                .any(|(p, why)| p == &prepared.container_path && why.contains("active build")),
-            "kept reason must cite the active build; got {:?}",
+            r.kept.iter().any(|(p, why)| p == &prepared.container_path
+                && why.contains("in use")
+                && why.contains("a test build")),
+            "the kept reason must say it is in use, and by whom; got {:?}",
             r.kept
         );
 
-        // cleanup
-        let schemas_repo = _root.join("qontinui-schemas");
-        cleanup_fresh_worktree(
-            &find_repo_root(&src_tauri).unwrap(),
-            &prepared.container_path,
-            &prepared.worktree_path,
-            Some(&schemas_repo),
-            Some(&prepared.schemas_path),
-        )
-        .await;
+        // Released, the same sweep removes it: the lock was all that kept it.
+        drop(held);
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), Some(0)).await;
+        assert!(
+            !prepared.container_path.exists(),
+            "fixture: with its lock free, a window of 0 must prune it: {r:?}"
+        );
+        assert_eq!(r.removed, vec![prepared.container_path.clone()]);
+        assert!(
+            locks.try_take(&prepared.container_path, "a probe").is_ok(),
+            "the sweep must let go of the lock it held while removing the container"
+        );
+    }
+
+    /// The managed runner worktree is recognised by where it sits, so it is
+    /// still recognised once a sweep has deleted it.
+    #[test]
+    fn a_managed_runner_worktree_is_recognised_by_its_place_alone() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let src_tauri = root.join("qontinui-runner").join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).expect("mkdir runner/src-tauri");
+        std::fs::create_dir_all(root.join("qontinui-schemas")).expect("mkdir schemas");
+
+        let managed = runner_worktree_path_for_ref(&src_tauri, "origin/main").expect("a path");
+        assert!(!managed.exists(), "fixture: never materialized");
+        assert!(is_managed_runner_worktree(&src_tauri, &managed));
+
+        for not_managed in [
+            root.join("qontinui-runner"),
+            root.join(".spawn-origin_main").join("qontinui-schemas"),
+            root.join(".spawning").join("qontinui-runner"),
+            root.join("elsewhere")
+                .join(".spawn-origin_main")
+                .join("qontinui-runner"),
+        ] {
+            assert!(
+                !is_managed_runner_worktree(&src_tauri, &not_managed),
+                "{not_managed:?} is not a managed container's runner worktree"
+            );
+        }
+    }
+
+    /// Two spellings of one container share one lock on every platform: a
+    /// Linux or WSL workspace can sit on a case-insensitive mount too, where
+    /// refs differing only in case name one directory. A different ref still
+    /// gets a lock of its own.
+    #[test]
+    fn lock_keys_fold_case_on_every_platform() {
+        let upper = Path::new("/W/.spawn-Origin_Main");
+        let lower = Path::new("/w/.spawn-origin_main");
+        assert_eq!(lock_key(upper), lock_key(lower));
+        assert_eq!(lock_key(lower), lower);
+
+        let locks = SpawnContainerLocks::default();
+        let _held = locks.try_take(upper, "first").expect("free");
+        let refused = locks
+            .try_take(lower, "second")
+            .err()
+            .expect("the other spelling finds the same lock");
+        assert_eq!(refused.holder.as_deref(), Some("first"));
+        assert_eq!(locks.holder(lower).as_deref(), Some("first"));
+        locks
+            .try_take(Path::new("/w/.spawn-feature_x"), "third")
+            .expect("another ref's container has a lock of its own");
+    }
+
+    /// A held container names its holder to whoever is refused it, until that
+    /// holder lets go.
+    #[test]
+    fn a_held_container_names_its_holder_until_it_is_released() {
+        let locks = SpawnContainerLocks::default();
+        let container = Path::new("/ws/.spawn-origin_main");
+        assert_eq!(locks.holder(container), None);
+        let held = locks
+            .try_take(container, "spawn-test test-1")
+            .expect("free");
+        assert_eq!(
+            locks.holder(container).as_deref(),
+            Some("spawn-test test-1")
+        );
+        let refused = locks
+            .try_take(container, "primary rebuild")
+            .err()
+            .expect("held");
+        assert_eq!(refused.holder.as_deref(), Some("spawn-test test-1"));
+        assert_eq!(refused.to_string(), "held by spawn-test test-1");
+        drop(held);
+        assert_eq!(
+            locks.holder(container),
+            None,
+            "a released lock names nobody"
+        );
+        let retaken = locks
+            .try_take(container, "primary rebuild")
+            .expect("free once its holder let go");
+        let refused = locks.try_take(container, "a probe").err().expect("held");
+        assert_eq!(
+            refused.holder.as_deref(),
+            Some("primary rebuild"),
+            "the new holder's label, not a stale one"
+        );
+        drop(retaken);
     }
 
     #[tokio::test]
@@ -1766,8 +2513,9 @@ mod tests {
         let near_miss = root.join(".spawning");
         std::fs::create_dir_all(&near_miss).expect("mkdir near miss");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
-        let _ = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+        let locks = SpawnContainerLocks::default();
+        let _ =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(999), None).await;
 
         assert!(decoy.exists(), "non-spawn dir must be untouched");
         assert!(
@@ -1799,10 +2547,11 @@ mod tests {
         )
         .expect("write dirty file");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // 50h old: past single 48h window but a dirty tree needs 96h → kept.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(50)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(50), None).await;
         assert!(
             prepared.container_path.exists(),
             "dirty container past single window but under double must be kept"
@@ -1816,7 +2565,8 @@ mod tests {
         );
 
         // 97h old: past double 96h window → removed even though dirty.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(97)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(97), None).await;
         assert!(
             !prepared.container_path.exists(),
             "dirty container past double window must be removed"
@@ -1844,10 +2594,11 @@ mod tests {
         std::fs::write(broken.join("qontinui-runner").join("marker"), "x").expect("write marker");
         assert!(broken.exists());
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
         // Aged well past retention → the `git worktree remove` no-ops (not a
         // registered worktree) and the dir delete fallback removes it.
-        let r = prune_spawn_worktrees(&src_tauri, &empty, now_plus_hours(999)).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, now_plus_hours(999), None).await;
         assert!(
             !broken.exists(),
             "broken/unregistered spawn container must be removed via dir-delete fallback"
@@ -1870,11 +2621,12 @@ mod tests {
         let (_root, src_tauri) = build_workspace_fixture(tmp.path());
         let prepared = prepare_worktree(&src_tauri, "HEAD").await.expect("prepare");
 
-        let empty: HashSet<PathBuf> = HashSet::new();
+        let locks = SpawnContainerLocks::default();
 
         // With a 0h window, a brand-new (age ~0) clean container is prunable.
         std::env::set_var(SPAWN_RETENTION_ENV, "0");
-        let r = prune_spawn_worktrees(&src_tauri, &empty, SystemTime::now()).await;
+        let r =
+            prune_spawn_worktrees_with_window(&src_tauri, &locks, SystemTime::now(), None).await;
         std::env::remove_var(SPAWN_RETENTION_ENV);
 
         assert!(

@@ -747,6 +747,7 @@ async fn adopt_pid_into_registry(managed: &ManagedRunner, pid: u32) -> bool {
     }
     runner.clear_stop_request();
     runner.restart_requested = false;
+    runner.restart_latches = 0;
     true
 }
 

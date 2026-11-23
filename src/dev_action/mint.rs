@@ -155,8 +155,17 @@ pub async fn prepare_action(
     let states_active: Vec<&'static str> =
         record.states_active.iter().map(|s| s.as_str()).collect();
 
-    let coord = coord_base(&state.config.ambient_coord);
-    let fetched = fetch_expectations(coord.as_deref(), kind.as_str(), &states_active).await;
+    let access = &state.config.ambient_coord;
+    let coord = coord_base(access);
+    // The device bearer (Phase 5): resolved under its own short budget, so the
+    // ACK path waits no longer than it did when the fetch was anonymous, plus
+    // that budget at most. Under `At(<stub>)` / `Ignore` no identity is read.
+    let bearer = crate::dev_action::expectations::resolve_expectations_bearer(
+        coord.as_deref(),
+        &crate::fleet::DeviceSources::for_access(access),
+    )
+    .await;
+    let fetched = fetch_expectations(coord.as_deref(), bearer, kind.as_str(), &states_active).await;
     // The `route_lkg` shadow (S3) reads the same uncut rows the live risk does,
     // for a restart coord answered (a basis, or rows from a coord that predates
     // the basis field). With no answer there is nothing to score.
@@ -168,6 +177,10 @@ pub async fn prepare_action(
     }
     record.expectations_basis = fetched.basis;
     let (predicted, risk) = assess_then_cut(fetched.rows, &states_active);
+    record.served = Some(crate::dev_action::record::ServedAtMint {
+        predicted: predicted.clone(),
+        route_lkg: risk.route_lkg,
+    });
 
     PreparedAction {
         record,

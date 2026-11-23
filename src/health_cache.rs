@@ -481,7 +481,7 @@ fn truncate_reason(s: &str, max_chars: usize) -> String {
 /// endpoint is unreachable, the body fails to parse, or the request times
 /// out — callers treat that as "no signal" and fall back to port-level state.
 async fn fetch_runner_health_body(port: u16) -> Option<RunnerHealthBody> {
-    let url = format!("http://127.0.0.1:{}/health", port);
+    let url = format!("{}/health", crate::loopback::runner_loopback_base(port));
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(3))
         .build()
@@ -826,7 +826,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // make the effective threshold floor 330 s whatever the
                     // operator configured, so the 60 s clamp floor would be
                     // unreachable. The ALERT keeps `should_escalate`'s slower
-                    // cadence, which is passed in rather than recomputed.
+                    // cadence, which is passed in rather than recomputed, with the
+                    // one exception `maybe_serving_restart` names.
                     let serving_decision = if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
                         crate::process::manager::maybe_serving_restart(
                             &state,

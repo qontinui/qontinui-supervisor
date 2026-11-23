@@ -138,6 +138,18 @@ impl Serialize for ActionKindCell {
     }
 }
 
+/// What a mint served the initiator ([`ActionRecord::served`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServedAtMint {
+    /// The ACK's `predicted` array, as served (at most
+    /// [`crate::dev_action::expectations::ACK_PREDICTED_TOP_K`] rows).
+    pub predicted: Vec<crate::dev_action::expectations::PredictedSignature>,
+    /// The live rule's `route_lkg` advice
+    /// ([`crate::dev_action::policy::ActionRisk::route_lkg`]). Advice only: which
+    /// exe a restart actually ran is `use_lkg`, read off the kind at the stamp.
+    pub route_lkg: bool,
+}
+
 /// The recorded outcome of an action, folded in by the attribution watcher
 /// after the per-kind window elapses. `None` on an [`ActionRecord`] means the
 /// window is still open (or the watcher has not run yet).
@@ -249,6 +261,15 @@ pub struct ActionRecord {
     /// no answer, which the shadow could not score).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_lkg_shadow: Option<crate::dev_action::policy::RouteLkgShadow>,
+    /// What the mint SERVED to the initiator: the ACK's `predicted` rows and
+    /// the live `route_lkg` verdict, stamped into the snapshot's
+    /// `metadata.served` beside `use_lkg` (plan
+    /// `2026-10-27-bayesian-consequence-model-for-the-dev-twin` Phase 5, S2).
+    /// Set by [`crate::dev_action::prepare_action`]; `None` for a record made
+    /// any other way, which then stamps no `served` block. Not part of this
+    /// record's own wire form (the ACK already carries both).
+    #[serde(skip)]
+    pub served: Option<ServedAtMint>,
     /// The dev-states evaluated `True` at action time. Stored as the typed
     /// shared [`DevState`] enum (Phase 2b) but serialized by canonical id via
     /// [`serialize_states_as_ids`] so the wire form stays an array of canonical
@@ -373,6 +394,7 @@ impl ActionRecord {
             params_digest,
             expectations_basis: None,
             route_lkg_shadow: None,
+            served: None,
             states_active,
             states_unknown,
             started_at: Utc::now(),

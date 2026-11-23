@@ -10,7 +10,7 @@ import json
 import urllib.request
 
 
-RUNNER = "http://localhost:9876"
+RUNNER = "http://127.0.0.1:9876"
 
 
 def api_put(url, data):

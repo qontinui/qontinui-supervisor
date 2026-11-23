@@ -37,6 +37,10 @@ pub struct SlotFootprint {
 pub struct SpawnContainersFootprint {
     pub count: usize,
     pub bytes: u64,
+    /// When the LEAST RECENTLY USED container was last used: a container's
+    /// mtime is stamped by `spawn_worktree::prepare_worktree` on every
+    /// successful use, so this is not the oldest container's creation time.
+    /// It is the age the pruner's retention reads.
     pub oldest_mtime: Option<String>,
 }
 
@@ -350,9 +354,10 @@ fn exe_copies_footprint(npm_dir: &Path) -> ExeCopiesFootprint {
 }
 
 /// Enumerate `.spawn-*` containers directly under `workspace_root`, summing
-/// their sizes and tracking the oldest mtime. Mirrors the prune engine's
-/// prefix-under-root filter ([`crate::spawn_worktree::SPAWN_DIR_PREFIX`]) so
-/// the two views agree on which dirs are scratch containers.
+/// their sizes and tracking the oldest mtime, i.e. the least recent use.
+/// Mirrors the prune engine's prefix-under-root filter
+/// ([`crate::spawn_worktree::SPAWN_DIR_PREFIX`]) so the two views agree on
+/// which dirs are scratch containers.
 fn spawn_containers_footprint(workspace_root: &Path) -> SpawnContainersFootprint {
     use crate::spawn_worktree::SPAWN_DIR_PREFIX;
     let mut out = SpawnContainersFootprint::default();
