@@ -101,7 +101,8 @@ pub fn unhealthy_after_start_reason(
 /// [`SupervisorError::ShuttingDown`] (a start arrived after the shutdown latched),
 /// [`SupervisorError::SelfRestartRefused`] (a self-restart that would die with its unit),
 /// [`SupervisorError::RebuildAbandoned`] (a primary rebuild a stop overtook while it
-/// waited for its spawn container),
+/// waited for its spawn container; one abandoned after its stop or build ran is
+/// marked [`SupervisorError::AfterAct`] and reads `Errored`),
 /// [`SupervisorError::UnverifiedExe`] (the exe a start resolved has no identity),
 /// [`SupervisorError::NoDisplay`] (a Linux start has no display),
 /// [`SupervisorError::PortHeldByLiveRunner`] (a live runner holds the port),

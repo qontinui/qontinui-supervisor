@@ -6651,6 +6651,69 @@ async fn a_restarts_stop_yields_to_a_stop_requested_since_its_wait() {
     assert_eq!(runner.stop_requested_at, None);
 }
 
+/// A stop asked while the restart's own stop is past its pre-probe check and
+/// waiting for the lifecycle lock is caught by the check under that lock,
+/// before anything is latched: the one window only that check closes.
+#[tokio::test]
+async fn a_restarts_stop_yields_under_its_lock_to_a_stop_asked_while_it_waited() {
+    let (state, _root) = restart_test_state();
+    let id = "named-restart-yields-under-lock";
+    let managed = register_dead_named_runner(&state, id).await;
+    let waited_from = StopsSince::of(&*managed.runner.read().await);
+
+    let holder = managed.lifecycle.lock().await;
+    let stop = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            stop_runner_as(
+                &state,
+                id,
+                true,
+                CloseIntent::Kill,
+                StopCause::Restart {
+                    yields_to: Some(waited_from),
+                },
+            )
+            .await
+        })
+    };
+    // Single-threaded: the stop runs only when this task yields, through its
+    // pre-probe check and its (exempt, I/O-free) readiness gate, to the lock.
+    for _ in 0..1000 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!stop.is_finished(), "the stop waits for the lifecycle lock");
+    managed.runner.write().await.stop_asks += 1;
+    drop(holder);
+
+    let refused = stop.await.expect("the stop task");
+    assert!(
+        matches!(refused, Err(SupervisorError::RebuildAbandoned(_))),
+        "{refused:?}"
+    );
+    let runner = managed.runner.read().await;
+    assert!(!runner.stop_requested, "nothing latched");
+    assert_eq!(runner.restart_stop_at, None, "nothing marked");
+}
+
+/// A waited rebuild abandoned after its build has stopped the runner and built:
+/// marked as acting, it records `Errored`, not `Refused` (nothing ran), so the
+/// attribution window is not closed on the stop unobserved. Abandoned before it
+/// acted, it records `Refused`.
+#[test]
+fn a_rebuild_abandoned_after_it_acted_records_errored() {
+    use crate::dev_action::record::ActionRunResult;
+    use crate::dev_action::run_result::run_result_for;
+    assert!(matches!(
+        run_result_for(&rebuild_abandoned_error()),
+        ActionRunResult::Refused { .. }
+    ));
+    assert!(matches!(
+        run_result_for(&SupervisorError::after_act(rebuild_abandoned_error())),
+        ActionRunResult::Errored { .. }
+    ));
+}
+
 /// `rebuild_and_restart_by_id` cannot run in a unit test, since it builds. Its start
 /// must be told, as the other restart's is, what its own stop removed, read right
 /// after that stop and before the rebuild, which can take most of an hour.

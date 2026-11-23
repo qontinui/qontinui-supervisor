@@ -8118,6 +8118,10 @@ fn rebuild_abandoned_error() -> SupervisorError {
 /// an earlier stop is still latched, or one asked during the build, is seen
 /// there by its ask.
 ///
+/// It errs toward the stop: one asked just BEFORE the rebuild read its
+/// [`StopsSince`], and still in its readiness probe then, latches during the
+/// wait, moves the time, and abandons the rebuild although it was asked first.
+///
 /// [`RunnerState::restart_stop_at`]: crate::state::RunnerState::restart_stop_at
 /// [`RunnerState::latch_stop_request`]: crate::state::RunnerState::latch_stop_request
 /// [`RunnerState::latch_restart_stop_request`]: crate::state::RunnerState::latch_restart_stop_request
