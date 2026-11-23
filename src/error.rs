@@ -37,6 +37,12 @@ pub enum SupervisorError {
     #[error("{0}")]
     SelfRestartRefused(String),
 
+    /// A primary rebuild that waited for its spawn container gave up because
+    /// the runner was asked to stop during the wait. A conflict with a newer
+    /// request, not a malformed one.
+    #[error("{0}")]
+    RebuildAbandoned(String),
+
     /// Legacy variant — retained for call sites in `process/manager.rs` and
     /// `routes/runner.rs` that report "build currently in progress". With the
     /// parallel build pool, this is derived from "any slot busy".
@@ -353,6 +359,7 @@ impl SupervisorError {
             SupervisorError::StartSuperseded(_) => StatusCode::CONFLICT,
             SupervisorError::ShuttingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::SelfRestartRefused(_) => StatusCode::CONFLICT,
+            SupervisorError::RebuildAbandoned(_) => StatusCode::CONFLICT,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::SpawnContainerBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
