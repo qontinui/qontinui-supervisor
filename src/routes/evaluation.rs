@@ -357,7 +357,7 @@ async fn set_ground_truth_handler(
     Path(prompt_id): Path<String>,
     Json(req): Json<SetGroundTruthRequest>,
 ) -> Json<MessageResponse> {
-    let runner_url = format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT);
+    let runner_url = crate::loopback::runner_loopback_base(crate::config::RUNNER_API_PORT);
 
     // Fetch the workflow from the runner
     let http_client = state.supervisor.http_client.clone();

@@ -483,4 +483,43 @@ mod tests {
         let _signatures: Vec<String> = outcome.signatures.clone();
         assert_eq!(outcome.evidence_basis.as_str(), "exact");
     }
+
+    /// An LKG-routed restart is its own kind in the replay as in the ledger:
+    /// `restart_lkg` fixtures never answer a `restart` query, nor `restart`
+    /// fixtures a `restart_lkg` one, so the treatment's clean boots cannot
+    /// dilute the fresh exe's white-screen rate (the performativity the kind
+    /// exists to prevent). Fails if the matcher ever pools the two kinds.
+    #[test]
+    fn restart_lkg_replays_apart_from_restart() {
+        let incident_states = &[SLOTS_EMPTY, LEGACY_EXE_FALLBACK];
+        let mut fixtures = incident_fixtures();
+        for _ in 0..20 {
+            fixtures.push(SnapshotFixture::new(
+                ActionKind::RestartLkg,
+                incident_states,
+                D3Category::Confirmed,
+                &[],
+            ));
+        }
+        let mut exec = MockActionExecutor::new(fixtures, SEED);
+        // The fresh restart still replays its 3/5 rate, and still routes.
+        assert!(recommend_lkg_route(
+            &mut exec,
+            ActionKind::Restart,
+            &incident_query(),
+            200
+        ));
+        // The LKG restarts replay only their own clean record.
+        for _ in 0..50 {
+            let outcome = exec
+                .sample(ActionKind::RestartLkg, &incident_query())
+                .expect("restart_lkg fixtures match");
+            assert_eq!(outcome.category, D3Category::Confirmed);
+        }
+        // With no restart_lkg history, a restart_lkg query has none.
+        let mut fresh_only = MockActionExecutor::new(incident_fixtures(), SEED);
+        assert!(fresh_only
+            .sample(ActionKind::RestartLkg, &incident_query())
+            .is_none());
+    }
 }

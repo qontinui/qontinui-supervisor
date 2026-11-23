@@ -65,44 +65,6 @@ describe('api.health()', () => {
   });
 });
 
-describe('api.devStartAction()', () => {
-  it('sends POST to /dev-start/{action}', async () => {
-    const responseData = {
-      status: 'ok',
-      flag: 'backend',
-      stdout: 'Started',
-      stderr: '',
-      exit_code: 0,
-    };
-
-    mockFetchOk(responseData);
-
-    const result = await api.devStartAction('backend');
-
-    expect(globalThis.fetch).toHaveBeenCalledWith('/dev-start/backend', {
-      method: 'POST',
-    });
-    expect(result.status).toBe('ok');
-    expect(result.flag).toBe('backend');
-  });
-
-  it('sends POST to /dev-start/frontend/stop for stop actions', async () => {
-    mockFetchOk({
-      status: 'ok',
-      flag: 'frontend/stop',
-      stdout: '',
-      stderr: '',
-      exit_code: 0,
-    });
-
-    await api.devStartAction('frontend/stop');
-
-    expect(globalThis.fetch).toHaveBeenCalledWith('/dev-start/frontend/stop', {
-      method: 'POST',
-    });
-  });
-});
-
 describe('api error handling', () => {
   it('throws when response is not ok', async () => {
     mockFetchError(500, 'Internal Server Error');
@@ -113,7 +75,7 @@ describe('api error handling', () => {
   it('throws on 404 responses', async () => {
     mockFetchError(404, 'Not Found');
 
-    await expect(api.devStartStatus()).rejects.toThrow('404 Not Found');
+    await expect(api.builds()).rejects.toThrow('404 Not Found');
   });
 });
 
@@ -152,26 +114,6 @@ describe('api.runnerStop()', () => {
     expect(globalThis.fetch).toHaveBeenCalledWith('/runner/stop', {
       method: 'POST',
     });
-  });
-});
-
-describe('api.devStartStatus()', () => {
-  it('calls GET /dev-start/status and returns services', async () => {
-    const statusData = {
-      services: [
-        { name: 'backend', port: 8000, available: true },
-        { name: 'frontend', port: 3001, available: false },
-      ],
-    };
-
-    mockFetchOk(statusData);
-
-    const result = await api.devStartStatus();
-
-    expect(globalThis.fetch).toHaveBeenCalledWith('/dev-start/status', undefined);
-    expect(result.services).toHaveLength(2);
-    expect(result.services[0].name).toBe('backend');
-    expect(result.services[0].available).toBe(true);
   });
 });
 

@@ -4,7 +4,6 @@ import {
   api,
   DetachedBuildResponse,
   HealthResponse,
-  DevStartResponse,
   ExpoStatus,
   RecentCrashSummary,
   RecentPanicSummary,
@@ -181,7 +180,10 @@ function LogViewer() {
             </div>
           )}
           {filtered.map((l, i) => (
-            <div key={`${l.timestamp}-${l.source}-${i}`} className={`log-line ${levelClass(l.level)}`}>
+            <div
+              key={`${l.timestamp}-${l.source}-${i}`}
+              className={`log-line ${levelClass(l.level)}`}
+            >
               <span className="text-muted">{new Date(l.timestamp).toLocaleTimeString()} </span>[
               {l.source}] {l.message}
             </div>
@@ -194,23 +196,16 @@ function LogViewer() {
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-const SERVICE_LOG_MAP: Record<string, string> = {
-  Runner: 'runner-tauri',
-  Backend: 'backend-err',
-  Frontend: 'frontend-err',
-};
-
 // Actions that require user confirmation before executing
-const DESTRUCTIVE_ACTIONS = new Set([
-  'Stop All',
-  'Fresh',
-  'Clean',
-  'backend-stop',
-  'frontend-stop',
-  'runner-stop',
-  'expo-stop',
-  'Stop Docker',
-]);
+const DESTRUCTIVE_ACTIONS = new Set(['expo-stop']);
+
+/// What an action endpoint may answer: `status: 'error' | 'timeout'` marks a
+/// failed action. Expo's start/stop are the remaining callers.
+interface ActionResponse {
+  status?: string;
+  stdout?: string;
+  stderr?: string;
+}
 
 interface ServiceError {
   service: string;
@@ -223,7 +218,6 @@ type ActionState = string | null;
 
 interface StatusData {
   health: HealthResponse | null;
-  services: { name: string; port: number; available: boolean }[];
   expo: ExpoStatus | null;
 }
 
@@ -237,6 +231,10 @@ interface RunnerInstance {
   protected: boolean;
   running: boolean;
   pid: number | null;
+  /// The current spawn's start (RFC3339). Optional: absent on an older
+  /// supervisor, `null` for a runner never started. Read by `PrebindHangBadge`
+  /// to tell whether the last pre-bind alert is about THIS spawn.
+  started_at?: string | null;
   api_responding: boolean;
   // Phase 3J.3: supervisor-derived status + runner-reported ui_error.
   // Post-3J follow-up adds `recent_crash` for Rust panics the React boundary
@@ -270,6 +268,9 @@ interface RunnerInstance {
   liveness?: RunnerLivenessWire;
   last_seen_responding_at?: string | null;
   port_open?: boolean;
+  // The newest spawn is alive while the port is free and the API silent: a
+  // runner that has not bound its listener. Optional for older supervisors.
+  spawn_up?: boolean;
 }
 
 // ─── Per-runner watchdog badge (#111/#113 per-runner completion) ────────────
@@ -311,8 +312,7 @@ export function RunnerWatchdogBadge({
 }) {
   if (!watchdog) return null;
 
-  const crashLoopDisarmed =
-    !!watchdog.disabled_reason && watchdog.crash_restart_armed !== false;
+  const crashLoopDisarmed = !!watchdog.disabled_reason && watchdog.crash_restart_armed !== false;
   if (crashLoopDisarmed) {
     const crashes = watchdog.crash_count ?? 0;
     const attempts = watchdog.restart_attempts ?? 0;
@@ -375,10 +375,7 @@ export function RunnerWatchdogBadge({
   }
 
   const armedButGlobalOff =
-    !isPrimary &&
-    running &&
-    watchdog.enabled === true &&
-    watchdog.crash_restart_armed === false;
+    !isPrimary && running && watchdog.enabled === true && watchdog.crash_restart_armed === false;
   if (armedButGlobalOff) {
     return (
       <span
@@ -406,10 +403,7 @@ export function RunnerWatchdogBadge({
   // twin, and `=== false` (not falsy) so a supervisor that predates the
   // serving arm — which reports `undefined` — never false-alarms.
   const servingArmOff =
-    !isPrimary &&
-    running &&
-    watchdog.enabled === true &&
-    watchdog.serving_restart_armed === false;
+    !isPrimary && running && watchdog.enabled === true && watchdog.serving_restart_armed === false;
   if (servingArmOff) {
     return (
       <span
@@ -436,6 +430,63 @@ export function RunnerWatchdogBadge({
   return null;
 }
 
+// ─── Pre-bind hang badge (post-merge completion of #283/#286) ───────────────
+// `manager::maybe_alert_prebind_hang` alerts a runner whose newest spawn is
+// alive, has not answered, and does not hold its port past the first-healthy
+// budget (`never_bound_since_spawn`). That shape reads `liveness: unknown` with
+// `pid: null`, so the status badge shows nothing alarming; `/runners[].watchdog`
+// serves the last alert as `last_prebind_alert_at` +
+// `last_prebind_alert_spawn_started_at`. The value is HISTORICAL, so this badge
+// renders only when the alert names the runner's CURRENT spawn and the runner
+// has not been seen answering since that spawn started. Amber, not red: a slow
+// cold boot looks the same, which is why the supervisor only alerts.
+function sameInstant(a: string, b: string): boolean {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  return !Number.isNaN(ta) && ta === tb;
+}
+
+export function PrebindHangBadge({
+  watchdog,
+  startedAt,
+  lastSeenRespondingAt,
+}: {
+  watchdog?: WatchdogHealthWire | null;
+  startedAt?: string | null;
+  lastSeenRespondingAt?: string | null;
+}) {
+  const alertAt = watchdog?.last_prebind_alert_at;
+  const alertSpawn = watchdog?.last_prebind_alert_spawn_started_at;
+  if (!alertAt || !alertSpawn || !startedAt) return null;
+  if (!sameInstant(alertSpawn, startedAt)) return null;
+  if (lastSeenRespondingAt) {
+    const seen = Date.parse(lastSeenRespondingAt);
+    const spawn = Date.parse(startedAt);
+    // Answered during this spawn → the alert no longer describes it.
+    if (!Number.isNaN(seen) && !Number.isNaN(spawn) && seen >= spawn) return null;
+  }
+  return (
+    <span
+      title={`Pre-bind hang alerted at ${alertAt}: this runner's spawn (started ${startedAt}) is alive but has never answered its HTTP API and does not hold its port, past the first-healthy budget. It may be hung before its listener binds, or only slow to boot. No watchdog restarts a runner that does not hold its port.`}
+      aria-label={`Never bound: the spawn started ${startedAt} has not answered or bound its port past the first-healthy budget. Alerted, not restarted.`}
+      data-testid="runner-prebind-hang-badge"
+      style={{
+        fontSize: '0.65rem',
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: '0.03em',
+        color: 'var(--warning, #eab308)',
+        border: '1px solid var(--warning, #eab308)',
+        borderRadius: '4px',
+        padding: '0.05rem 0.35rem',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      ⚠ never bound
+    </span>
+  );
+}
+
 // ─── Startup-panic badge + modal (Phase 2b) ─────────────────────────────
 // Surfaces `recent_panic` on a runner row as a red "Panic" pill. Clicking
 // the pill opens a modal with the full panic payload + backtrace preview.
@@ -448,9 +499,10 @@ export function RunnerWatchdogBadge({
 
 function PanicBadge({ panic, runnerName }: { panic: RecentPanicSummary; runnerName: string }) {
   const [modalOpen, setModalOpen] = useState(false);
-  const tooltipPreview = `${panic.payload}${
-    panic.location ? `\n@ ${panic.location}` : ''
-  }`.slice(0, 500);
+  const tooltipPreview = `${panic.payload}${panic.location ? `\n@ ${panic.location}` : ''}`.slice(
+    0,
+    500,
+  );
 
   return (
     <>
@@ -480,7 +532,9 @@ function PanicBadge({ panic, runnerName }: { panic: RecentPanicSummary; runnerNa
       >
         Panic
       </button>
-      {modalOpen && <PanicModal panic={panic} runnerName={runnerName} onClose={() => setModalOpen(false)} />}
+      {modalOpen && (
+        <PanicModal panic={panic} runnerName={runnerName} onClose={() => setModalOpen(false)} />
+      )}
     </>
   );
 }
@@ -545,9 +599,7 @@ function PanicModal({
           }}
         >
           <div>
-            <div style={{ fontWeight: 600, fontSize: '1rem' }}>
-              Startup panic — {runnerName}
-            </div>
+            <div style={{ fontWeight: 600, fontSize: '1rem' }}>Startup panic — {runnerName}</div>
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
               {new Date(panic.timestamp).toLocaleString()}
               {panic.pid != null && ` · PID ${panic.pid}`}
@@ -769,7 +821,11 @@ function RunnerRow({
   // the probe, so the same wedge rendered as down and offered Start for a
   // process that was already running.
   const isWedged = r.liveness?.state === 'wedged';
-  const isUp = r.running || r.api_responding || isWedged;
+  // A spawn alive with its port free (hung or slow before its listener binds)
+  // is up too: `running` is lowered from the failed probe for the primary, and
+  // a Start would be refused by `start_managed_runner` (RunnerAlreadyRunning).
+  // Only an explicit `true` counts; an older supervisor omits the field.
+  const isUp = r.running || r.api_responding || isWedged || r.spawn_up === true;
   const isPrimary = r.kind.type === 'primary';
   // A detached rebuild for this runner is in flight (driven off /build/:id/status
   // polling). While building, every action button stays disabled and the Rebuild
@@ -867,7 +923,12 @@ function RunnerRow({
       <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{r.port}</td>
       <td>
         <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-          <StatusDot up={isUp && !isWedged} error={isWedged} />
+          {/* A live spawn that has not answered is not "up": the dot stays grey
+              while `isUp` still gates Start/Stop. */}
+          <StatusDot
+            up={isUp && !isWedged && !(r.spawn_up === true && !r.api_responding)}
+            error={isWedged}
+          />
           <RunnerStatusBadge
             derivedStatus={r.derived_status}
             liveness={r.liveness}
@@ -895,6 +956,11 @@ function RunnerRow({
             />
           )}
           <RunnerWatchdogBadge watchdog={r.watchdog} running={r.running} isPrimary={isPrimary} />
+          <PrebindHangBadge
+            watchdog={r.watchdog}
+            startedAt={r.started_at}
+            lastSeenRespondingAt={r.last_seen_responding_at}
+          />
         </div>
       </td>
       <td>
@@ -1104,7 +1170,6 @@ function RunnerInstancesPanel() {
       // Safety cap so a stuck/evicted build can't pin the indicator forever
       // (build timeout is 30 min on the backend; cap a little above that).
       const deadline = Date.now() + 35 * 60 * 1000;
-      // eslint-disable-next-line no-constant-condition
       while (true) {
         await new Promise((res) => setTimeout(res, POLL_MS));
         let terminal = false;
@@ -1154,6 +1219,14 @@ function RunnerInstancesPanel() {
     try {
       const resp = await submit();
       const buildId = resp.build_id ?? resp.submission_id;
+      // Say which tree the rebuild selects before the 10-20 min build runs, so
+      // a misread escape hatch is caught now rather than after the wrong
+      // binary is under the runner. "Selects", not "will compile": the
+      // readiness gate can still refuse the restart after this 202.
+      if (resp.build_source) {
+        const tree = resp.build_source === 'origin_main' ? 'origin/main' : 'the live working tree';
+        addToast(`Rebuild ${runnerName} selects ${tree}`, 'info');
+      }
       if (buildId) {
         // Fire-and-forget: the poll loop owns the indicator from here.
         void pollBuild(runnerId, runnerName, buildId);
@@ -1211,7 +1284,15 @@ function RunnerInstancesPanel() {
 
   return (
     <div className="card" style={{ marginBottom: '1rem' }}>
-      <div className="card-header" style={{ marginBottom: '0.5rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+      <div
+        className="card-header"
+        style={{
+          marginBottom: '0.5rem',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}
+      >
         <span className="card-title">Runner Instances</span>
         <button
           className="btn"
@@ -1227,7 +1308,15 @@ function RunnerInstancesPanel() {
           the user hasn't clicked "+ New" yet, but the DOM nodes (and refs)
           are present so automation can target runner-spawn-submit without
           first toggling showAdd. */}
-      <div style={{ display: showAdd ? 'flex' : 'none', gap: '0.4rem', marginBottom: showAdd ? '0.5rem' : 0, alignItems: 'center', flexWrap: 'wrap' }}>
+      <div
+        style={{
+          display: showAdd ? 'flex' : 'none',
+          gap: '0.4rem',
+          marginBottom: showAdd ? '0.5rem' : 0,
+          alignItems: 'center',
+          flexWrap: 'wrap',
+        }}
+      >
         <input
           type="text"
           value={newName}
@@ -1258,7 +1347,15 @@ function RunnerInstancesPanel() {
             width: 80,
           }}
         />
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.2rem',
+            fontSize: '0.7rem',
+            cursor: 'pointer',
+          }}
+        >
           <input
             type="checkbox"
             checked={rebuild}
@@ -1267,7 +1364,15 @@ function RunnerInstancesPanel() {
           />
           Rebuild
         </label>
-        <label style={{ display: 'flex', alignItems: 'center', gap: '0.2rem', fontSize: '0.7rem', cursor: 'pointer' }}>
+        <label
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.2rem',
+            fontSize: '0.7rem',
+            cursor: 'pointer',
+          }}
+        >
           <input
             type="checkbox"
             checked={isProtected}
@@ -1363,9 +1468,7 @@ function RunnerInstancesPanel() {
                       })
                     }
                     onProtect={() =>
-                      doAction(`Protect ${r.name}`, () =>
-                        api.protectRunner(r.id, !r.protected),
-                      )
+                      doAction(`Protect ${r.name}`, () => api.protectRunner(r.id, !r.protected))
                     }
                   />
                 );
@@ -1383,7 +1486,6 @@ function RunnerInstancesPanel() {
 function DashboardInner() {
   const [data, setData] = useState<StatusData>({
     health: null,
-    services: [],
     expo: null,
   });
   const [busy, setBusy] = useState<ActionState>(null);
@@ -1392,26 +1494,20 @@ function DashboardInner() {
   const mountedRef = useRef(true);
   const actionGuardRef = useRef(false);
 
-  const refreshPorts = useCallback(async () => {
-    const [devStatus, expo] = await Promise.allSettled([api.devStartStatus(), api.expoStatus()]);
+  const refreshExpo = useCallback(async () => {
+    const expo = (await Promise.allSettled([api.expoStatus()]))[0];
     if (!mountedRef.current) return;
     setData((prev) => ({
       ...prev,
-      services: devStatus.status === 'fulfilled' ? (devStatus.value.services ?? []) : prev.services,
       expo: expo.status === 'fulfilled' ? expo.value : prev.expo,
     }));
   }, []);
 
   const refresh = useCallback(async () => {
-    const [health, devStatus, expo] = await Promise.allSettled([
-      api.health(),
-      api.devStartStatus(),
-      api.expoStatus(),
-    ]);
+    const [health, expo] = await Promise.allSettled([api.health(), api.expoStatus()]);
     if (!mountedRef.current) return;
     setData({
       health: health.status === 'fulfilled' ? health.value : null,
-      services: devStatus.status === 'fulfilled' ? (devStatus.value.services ?? []) : [],
       expo: expo.status === 'fulfilled' ? expo.value : null,
     });
     setLastRefresh(new Date());
@@ -1451,7 +1547,7 @@ function DashboardInner() {
         setBusy(key);
         try {
           const result = await fn();
-          const resp = result as DevStartResponse | undefined;
+          const resp = result as ActionResponse | undefined;
           if (
             resp &&
             typeof resp.status === 'string' &&
@@ -1492,10 +1588,10 @@ function DashboardInner() {
         }
         setBusy(null);
         actionGuardRef.current = false;
-        setTimeout(refreshPorts, 1500);
+        setTimeout(refreshExpo, 1500);
       };
     },
-    [refreshPorts],
+    [refreshExpo],
   );
 
   const h = data.health;
@@ -1534,6 +1630,15 @@ function DashboardInner() {
           <span style={{ fontWeight: 600, textTransform: 'capitalize', color: statusColor }}>
             {h.status}
           </span>
+          {h.status_reason && (
+            <span
+              data-testid="status-reason"
+              title={h.status_reason}
+              style={{ fontSize: '0.75rem', color: statusColor }}
+            >
+              {h.status_reason}
+            </span>
+          )}
           <span className="text-muted" style={{ fontSize: '0.75rem' }}>
             {/* The wedge is checked FIRST. This line used to read `running`
                 and then `api_responding`, so the primary that held :9876 for
@@ -1542,11 +1647,15 @@ function DashboardInner() {
             Runner:{' '}
             {h.runner.liveness?.state === 'wedged'
               ? 'WEDGED (alive, API silent)'
-              : h.runner.running
-                ? 'running'
-                : h.runner.api_responding
-                  ? 'external (not supervised)'
-                  : 'stopped'}
+              : h.runner.spawn_up === true && !h.runner.api_responding
+                ? 'starting (alive, port not bound)'
+                : h.runner.running
+                  ? 'running'
+                  : h.runner.api_responding
+                    ? 'external (not supervised)'
+                    : h.runner.liveness?.state === 'unknown'
+                      ? 'unknown'
+                      : 'stopped'}
             {h.runner.liveness?.state !== 'wedged' && h.runner.api_responding && h.runner.running
               ? ' (API ok)'
               : ''}
@@ -1665,113 +1774,42 @@ function DashboardInner() {
       {/* Runner Instances — primary user action */}
       <RunnerInstancesPanel />
 
-      {/* Service health table */}
-      {data.services.length > 0 && (
+      {/* Action failures (Expo start/stop) */}
+      {errors.size > 0 && (
         <div className="card" style={{ marginBottom: '1rem' }}>
           <div className="card-header" style={{ marginBottom: '0.5rem' }}>
-            <span className="card-title">Services</span>
+            <span className="card-title">Action failures</span>
           </div>
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Service</th>
-                  <th style={{ width: 60 }}>Port</th>
-                  <th style={{ width: 70 }}>Status</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.services.map((svc) => (
-                  <tr key={svc.name}>
-                    <td style={{ fontWeight: 500, fontSize: '0.8rem' }}>{svc.name}</td>
-                    <td style={{ fontSize: '0.75rem', fontFamily: 'var(--font-mono)' }}>{svc.port}</td>
-                    <td>
-                      <StatusDot up={svc.available} />
-                      <span
-                        className={svc.available ? 'text-success' : 'text-danger'}
-                        style={{ fontSize: '0.7rem' }}
-                      >
-                        {svc.available ? 'UP' : 'DOWN'}
-                      </span>
-                    </td>
-                    <td>
-                      <div className="flex gap-2">
-                        {SERVICE_LOG_MAP[svc.name] && (
-                          <SmallBtn
-                            label="Logs"
-                            activeLabel="Loading..."
-                            onClick={async () => {
-                              try {
-                                const log = await api.logFile(SERVICE_LOG_MAP[svc.name], 100);
-                                addToast(`${svc.name}: ${log.lines} lines`, 'info');
-                              } catch {
-                                addToast(`${svc.name}: failed to fetch logs`, 'error');
-                              }
-                            }}
-                            busy={null}
-                          />
-                        )}
-                        <SmallBtn
-                          label="Start"
-                          activeLabel="Starting..."
-                          onClick={doAction(
-                            `${svc.name.toLowerCase()}-start`,
-                            svc.name,
-                            () => api.devStartAction(`${svc.name.toLowerCase()}-start`),
-                          )}
-                          busy={busy}
-                          busyKey={`${svc.name.toLowerCase()}-start`}
-                        />
-                        <SmallBtn
-                          label="Stop"
-                          activeLabel="Stopping..."
-                          onClick={doAction(
-                            `${svc.name.toLowerCase()}-stop`,
-                            svc.name,
-                            () => api.devStartAction(`${svc.name.toLowerCase()}-stop`),
-                          )}
-                          busy={busy}
-                          busyKey={`${svc.name.toLowerCase()}-stop`}
-                          variant="danger"
-                        />
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div style={{ marginTop: '0.5rem' }}>
+            {Array.from(errors.values()).map((err) => (
+              <div
+                key={err.service}
+                style={{
+                  padding: '0.4rem 0.6rem',
+                  fontSize: '0.75rem',
+                  background: 'rgba(239,68,68,0.08)',
+                  borderRadius: 4,
+                  marginBottom: '0.25rem',
+                }}
+              >
+                <strong className="text-danger">
+                  {err.service} — {err.action} failed
+                </strong>
+                {err.stderr && (
+                  <pre
+                    style={{
+                      margin: '0.25rem 0 0',
+                      fontSize: '0.7rem',
+                      whiteSpace: 'pre-wrap',
+                      color: 'var(--text-muted)',
+                    }}
+                  >
+                    {err.stderr}
+                  </pre>
+                )}
+              </div>
+            ))}
           </div>
-          {errors.size > 0 && (
-            <div style={{ marginTop: '0.5rem' }}>
-              {Array.from(errors.values()).map((err) => (
-                <div
-                  key={err.service}
-                  style={{
-                    padding: '0.4rem 0.6rem',
-                    fontSize: '0.75rem',
-                    background: 'rgba(239,68,68,0.08)',
-                    borderRadius: 4,
-                    marginBottom: '0.25rem',
-                  }}
-                >
-                  <strong className="text-danger">{err.service} — {err.action} failed</strong>
-                  {err.stderr && (
-                    <pre
-                      style={{
-                        margin: '0.25rem 0 0',
-                        fontSize: '0.7rem',
-                        whiteSpace: 'pre-wrap',
-                        color: 'var(--text-muted)',
-                      }}
-                    >
-                      {err.stderr}
-                    </pre>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
         </div>
       )}
 
@@ -1781,7 +1819,9 @@ function DashboardInner() {
           <div className="card-header" style={{ marginBottom: '0.5rem' }}>
             <span className="card-title">Expo</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}>
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', fontSize: '0.8rem' }}
+          >
             <StatusDot up={data.expo.running} />
             <span>{data.expo.running ? 'Running' : 'Stopped'}</span>
             {data.expo.port > 0 && (

@@ -200,7 +200,9 @@ pub fn disk_guard_allows_for(
                 let free = other.unwrap_or(0);
                 Err(format!(
                     "Pre-permit disk guard: refusing build — {} GB free, need at least \
-                     {min_free_gb} GB (QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
+                     {min_free_gb} GB (the effective floor — GET /health \
+                     build.pool.disk_floor names its source and inputs; override \
+                     QONTINUI_SUPERVISOR_MIN_FREE_DISK_GB).",
                     free / (1024 * 1024 * 1024)
                 ))
             }
@@ -432,6 +434,82 @@ pub fn total_commit_bytes() -> Option<u64> {
     }
 }
 
+/// What the pre-permit memory gate decided, recorded on the build so that a
+/// build which proceeded *because the wait expired* is distinguishable
+/// afterwards from one that passed the gate.
+///
+/// Serialized snake_case (`passed`, `passed_after_wait`,
+/// `proceeded_after_wait`, `probe_unreadable`, `disabled`) on `GET /health`
+/// `build.last_mem_gate` and on `GET /builds` (`slots[].history.last_mem_gate`,
+/// and `mem_gate` on a slot/active build while it is building).
+///
+/// Five variants rather than the plan's three, each because collapsing it
+/// would make the record lie:
+/// - `PassedAfterWait` is split from `Passed` because a build that was
+///   deferred and then admitted on recovered headroom did spend time in the
+///   gate — folding it into `Passed` hides the deferral, folding it into
+///   `ProceededAfterWait` would claim a fail-open that never happened.
+/// - `Disabled` is reported when both floors are `0`: no gate ran, and saying
+///   `passed` would assert a check that was never made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemGateOutcome {
+    /// Both floors are `0` — the documented full disable. No probe was read.
+    Disabled,
+    /// Headroom was sufficient at the first probe.
+    Passed,
+    /// Headroom was short, the build was deferred, and headroom recovered
+    /// before `mem_wait_max_secs()` expired.
+    PassedAfterWait,
+    /// Still short when `mem_wait_max_secs()` expired — the gate FAILED OPEN
+    /// and the build ran anyway with OOM risk.
+    ProceededAfterWait,
+    /// Every ARMED pool's probe read `None`, so the gate let the build through
+    /// on the fail-open-on-unreadable-probe contract without measuring
+    /// anything. A pass in which at least one armed pool was read is `Passed`
+    /// (or `PassedAfterWait`) — that arm genuinely measured headroom.
+    ///
+    /// **Takes precedence over a prior deferral.** If the gate had already
+    /// warned and waited on a short reading and a LATER probe reads `None` on
+    /// every armed arm, the outcome is `ProbeUnreadable`, not
+    /// `PassedAfterWait`: the release itself was unmeasured, which is the more
+    /// important fact — `PassedAfterWait` would claim headroom recovered when
+    /// nothing observed it. The deferral is not lost: the "deferring build"
+    /// warning was already logged, and the `probe_unreadable` log line names
+    /// how long the gate had waited.
+    ProbeUnreadable,
+}
+
+impl MemGateOutcome {
+    /// The snake_case wire spelling, for log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemGateOutcome::Disabled => "disabled",
+            MemGateOutcome::Passed => "passed",
+            MemGateOutcome::PassedAfterWait => "passed_after_wait",
+            MemGateOutcome::ProceededAfterWait => "proceeded_after_wait",
+            MemGateOutcome::ProbeUnreadable => "probe_unreadable",
+        }
+    }
+}
+
+/// One reading of the two pools the gate checks: free commit and free
+/// physical, in bytes. `None` is an unreadable (or, for physical, disarmed)
+/// probe — see [`pool_allows`].
+pub type MemGateReading = (Option<u64>, Option<u64>);
+
+/// Read the real probes. The physical arm is not probed at all when it is
+/// disabled: an inert arm must not pay a syscall, and `None` is what the gate
+/// reads as "contributes nothing".
+fn read_mem_gate_probe(min_free_phys_gb: u64) -> MemGateReading {
+    let free_phys = if min_free_phys_gb > 0 {
+        available_phys_bytes()
+    } else {
+        None
+    };
+    (available_commit_bytes(), free_phys)
+}
+
 /// Pre-permit memory guard. Called BEFORE acquiring a build-pool permit/slot at
 /// every build-spawning site, so the wait never holds a slot hostage.
 ///
@@ -445,6 +523,9 @@ pub fn total_commit_bytes() -> Option<u64> {
 /// Fails open on an unreadable probe and after `mem_wait_max_secs()`, so a
 /// mis-measuring box can never deadlock the build lane — it degrades to exactly
 /// today's behavior (build anyway, accept the OOM risk) rather than wedging.
+/// WHICH of those happened is returned as a [`MemGateOutcome`], which the
+/// callers record on the build's status — the fail-open is otherwise
+/// indistinguishable afterwards from a pass.
 ///
 /// **Two floors, checked independently** (commit and physical — see
 /// [`ram_guard_allows`]), and every message names WHICH pool is short and
@@ -456,113 +537,212 @@ pub fn total_commit_bytes() -> Option<u64> {
 /// Free physical pins low under saturation and may never climb back over a
 /// threshold on its own, so a lane waiting on it alone could wait forever. The
 /// timer is the non-physical release path that makes this arm safe to add.
-pub async fn check_ram_guard(state: &SharedState) {
+pub async fn check_ram_guard(state: &SharedState) -> MemGateOutcome {
     let min_free_gb = crate::config::min_free_ram_gb();
     let min_free_phys_gb = crate::config::min_free_phys_gb();
+    let wait_max = Duration::from_secs(crate::config::mem_wait_max_secs());
+    run_mem_gate(
+        min_free_gb,
+        min_free_phys_gb,
+        wait_max,
+        Duration::from_secs(15),
+        || read_mem_gate_probe(min_free_phys_gb),
+        || (total_commit_bytes(), total_phys_bytes()),
+        |level, msg| {
+            let state = state.clone();
+            async move {
+                match level {
+                    LogLevel::Warn => warn!("{}", msg),
+                    _ => info!("{}", msg),
+                }
+                state.logs.emit(LogSource::Build, level, msg).await;
+            }
+        },
+    )
+    .await
+}
+
+/// The decision loop behind [`check_ram_guard`], with the probe, the sleep
+/// interval, the wait ceiling and the log sink injected so it can be driven
+/// without real memory readings or a 15 s sleep. `totals` (commit, physical)
+/// is read only when a message is rendered — the happy path pays no extra
+/// probe, exactly as before the loop was extracted.
+pub async fn run_mem_gate<P, T, E, Fut>(
+    min_free_gb: u64,
+    min_free_phys_gb: u64,
+    wait_max: Duration,
+    interval: Duration,
+    mut probe: P,
+    totals: T,
+    mut emit: E,
+) -> MemGateOutcome
+where
+    P: FnMut() -> MemGateReading,
+    T: Fn() -> MemGateReading,
+    E: FnMut(LogLevel, String) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
     // Both arms off is the documented full disable; one arm off leaves the
     // other enforcing, so this can only short-circuit when neither is armed.
     if min_free_gb == 0 && min_free_phys_gb == 0 {
-        return;
+        return MemGateOutcome::Disabled;
     }
-    let wait_max = crate::config::mem_wait_max_secs();
-    let interval = std::time::Duration::from_secs(15);
-    let mut waited: u64 = 0;
+    let mut waited = Duration::ZERO;
     let mut warned = false;
 
     loop {
-        let free = available_commit_bytes();
-        // Not probed at all when the arm is disabled: an inert arm must not pay
-        // a syscall, and `None` is what the rest of this function already reads
-        // as "contributes nothing".
-        let free_phys = if min_free_phys_gb > 0 {
-            available_phys_bytes()
-        } else {
-            None
-        };
+        let (free, free_phys) = probe();
 
         if ram_guard_allows(free, min_free_gb, free_phys, min_free_phys_gb) {
-            if warned {
-                let msg = format!(
-                    "Pre-permit memory guard: headroom recovered ({}, {}) — building",
-                    format_pool_reading("commit", free, total_commit_bytes()),
-                    format_pool_reading("physical", free_phys, total_phys_bytes()),
-                );
-                info!("{}", msg);
-                state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+            // Did any ARMED arm actually measure? If not, the allow came purely
+            // from the fail-open-on-`None` contract. This check deliberately
+            // precedes `warned`: an unmeasured release after a deferral is
+            // `ProbeUnreadable`, not `PassedAfterWait` (see the variant doc).
+            let commit_measured = min_free_gb > 0 && free.is_some();
+            let phys_measured = min_free_phys_gb > 0 && free_phys.is_some();
+            let outcome = if !commit_measured && !phys_measured {
+                MemGateOutcome::ProbeUnreadable
+            } else if warned {
+                MemGateOutcome::PassedAfterWait
+            } else {
+                MemGateOutcome::Passed
+            };
+            if outcome == MemGateOutcome::ProbeUnreadable {
+                emit(
+                    LogLevel::Warn,
+                    format!(
+                        "Pre-permit memory guard: no armed memory probe could be read \
+                         (commit {}, physical {}){} — building without a memory check; \
+                         mem_gate: {}",
+                        if min_free_gb > 0 {
+                            "unavailable"
+                        } else {
+                            "disarmed"
+                        },
+                        if min_free_phys_gb > 0 {
+                            "unavailable"
+                        } else {
+                            "disarmed"
+                        },
+                        if warned {
+                            format!(" after deferring {}s on a short reading", waited.as_secs())
+                        } else {
+                            String::new()
+                        },
+                        outcome.as_str(),
+                    ),
+                )
+                .await;
+            } else if warned {
+                let (total_commit, total_phys) = totals();
+                emit(
+                    LogLevel::Info,
+                    format!(
+                        "Pre-permit memory guard: headroom recovered ({}, {}) — building; \
+                         mem_gate: {}",
+                        format_pool_reading("commit", free, total_commit),
+                        format_pool_reading("physical", free_phys, total_phys),
+                        outcome.as_str(),
+                    ),
+                )
+                .await;
             }
-            return;
+            return outcome;
         }
 
         // Name every pool that is short, not just the first one — being short
         // on both is a different situation from being short on either.
+        let (total_commit, total_phys) = totals();
         let mut short: Vec<String> = Vec::new();
         if !pool_allows(free, min_free_gb) {
             short.push(format!(
                 "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_RAM_GB)",
-                format_pool_reading("commit", free, total_commit_bytes()),
+                format_pool_reading("commit", free, total_commit),
                 min_free_gb,
             ));
         }
         if !pool_allows(free_phys, min_free_phys_gb) {
             short.push(format!(
                 "{} < {} GB (QONTINUI_SUPERVISOR_MIN_FREE_PHYS_GB)",
-                format_pool_reading("physical", free_phys, total_phys_bytes()),
+                format_pool_reading("physical", free_phys, total_phys),
                 min_free_phys_gb,
             ));
         }
         let short = short.join("; ");
 
         if waited >= wait_max {
-            let msg = format!(
-                "Pre-permit memory guard: still short after {}s — {} — building anyway; \
-                 expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
-                 incremental cache).",
-                waited, short,
-            );
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
-            return;
+            let outcome = MemGateOutcome::ProceededAfterWait;
+            emit(
+                LogLevel::Warn,
+                format!(
+                    "Pre-permit memory guard: still short after {}s — {} — building anyway; \
+                     expect OOM risk (rustc aborts with 0xc0000409 and poisons the slot's \
+                     incremental cache). mem_gate: {}",
+                    waited.as_secs(),
+                    short,
+                    outcome.as_str(),
+                ),
+            )
+            .await;
+            return outcome;
         }
 
         if !warned {
-            let msg = format!(
-                "Pre-permit memory guard: low memory — {}; deferring build up to {}s for \
-                 headroom (no build slot is held while waiting).",
-                short, wait_max,
-            );
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+            emit(
+                LogLevel::Warn,
+                format!(
+                    "Pre-permit memory guard: low memory — {}; deferring build up to {}s for \
+                     headroom (no build slot is held while waiting).",
+                    short,
+                    wait_max.as_secs(),
+                ),
+            )
+            .await;
             warned = true;
         }
 
         tokio::time::sleep(interval).await;
-        waited = waited.saturating_add(interval.as_secs());
+        waited = waited.saturating_add(interval);
     }
 }
 
 /// The phase a `spawn-test` build future is in, tracked via a shared
-/// `Arc<AtomicU8>` so the route-level `tokio::time::timeout` wrapper can read
-/// the LIVE phase at the instant it fires and compose a phase-accurate timeout
-/// message. The single timeout wraps the WHOLE
-/// `run_cargo_build_with_dir_detailed` future, and the future is cancelled
-/// mid-flight on timeout (so no `BuildAttempt` is returned to the route) — the
-/// only way the route can tell which phase actually blocked is to observe this
-/// marker, which the build future advances monotonically as it progresses.
+/// `Arc<AtomicU8>` so the route's queue watcher can read the LIVE phase and
+/// compose a phase-accurate timeout message. The build future is cancelled
+/// mid-flight on a queue timeout (so no `BuildAttempt` is returned to the
+/// route) — the only way the route can tell which phase actually blocked is to
+/// observe this marker.
+///
+/// **The marker must tell the truth the moment the build stops queueing**,
+/// because the watcher fires on a queue phase however briefly it is read, and
+/// a zero `queue_timeout_secs` reads it once. So the build stores `SlotHeld`
+/// immediately after its permit is acquired, rather than leaving
+/// `AwaitingSlot` standing through the slot claim, the cleanup pass and the
+/// worktree frontend prebuild.
 ///
 /// Ordering (see `run_cargo_build_with_dir_detailed` / `run_build_inner`):
-/// `AwaitingSlot` (cargo permit acquire) → `AwaitingNpmLock` (frontend lock
-/// acquire) → `BuildingFrontend` (`pnpm run build`) → `Compiling` (cargo).
+/// `AwaitingSlot` (memory guard, cargo permit acquire) → `SlotHeld` → for a
+/// worktree build, the prebuild's own `AwaitingNpmLock` → `BuildingFrontend`
+/// (`pnpm install` / `pnpm run build`) → `AwaitingNpmLock` (the frontend lock
+/// again) → `BuildingFrontend` (`pnpm run build`) → `Compiling` (cargo). It is
+/// NOT monotonic: a worktree build re-enters `AwaitingNpmLock` after its
+/// prebuild, which is why the watcher only stops for good at `Compiling`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BuildPhase {
-    /// Waiting on `permits.acquire_owned()` — the genuine "build slot" wait.
+    /// Waiting on `permits.acquire_owned()` — the genuine "build slot" wait —
+    /// or, before it, deferred by the pre-permit memory guard.
     AwaitingSlot = 0,
     /// Slot held; waiting on `npm_lock.lock_owned()` (frontend serialization).
     AwaitingNpmLock = 1,
-    /// npm_lock held; running `pnpm run build`.
+    /// npm_lock held; running `pnpm install` / `pnpm run build`.
     BuildingFrontend = 2,
     /// Frontend done (or skipped); running `cargo build`.
     Compiling = 3,
+    /// Permit held; preparing the build (slot claim, cleanup pass, exe unlock,
+    /// the prebuild's freshness gate) before a frontend lock is asked for. Not
+    /// a queue wait, and not terminal: a frontend-lock wait follows.
+    SlotHeld = 4,
 }
 
 impl BuildPhase {
@@ -573,6 +753,7 @@ impl BuildPhase {
             1 => BuildPhase::AwaitingNpmLock,
             2 => BuildPhase::BuildingFrontend,
             3 => BuildPhase::Compiling,
+            4 => BuildPhase::SlotHeld,
             _ => BuildPhase::AwaitingSlot,
         }
     }
@@ -584,15 +765,22 @@ impl BuildPhase {
     /// Is this phase a QUEUE wait — the request blocked on a lock, doing no
     /// work of its own?
     ///
-    /// `queue_timeout_secs` bounds exactly these phases. Once the build starts
-    /// doing work (`BuildingFrontend` / `Compiling`) the clock stops: the
-    /// caller's slot is held, the compile is in flight, and a 504 there would
-    /// abandon a live build mid-compile — which is what the field's old
-    /// whole-future semantics did, despite being documented as a queue wait.
-    /// Killing a compiling build also throws away everything it had compiled,
-    /// so the bounded wait cost the caller far more than the wait it bounded.
+    /// `queue_timeout_secs` bounds exactly these phases. While the build is
+    /// doing work (`SlotHeld` / `BuildingFrontend` / `Compiling`) the clock
+    /// does not run: the caller's slot is held, and a 504 there would abandon
+    /// a live build — which is what the field's old whole-future semantics
+    /// did, despite being documented as a queue wait. Killing a compiling build
+    /// also throws away everything it had compiled, so the bounded wait cost
+    /// the caller far more than the wait it bounded.
     pub fn is_queue_wait(self) -> bool {
         matches!(self, BuildPhase::AwaitingSlot | BuildPhase::AwaitingNpmLock)
+    }
+
+    /// Is this phase final for the queue — no queue phase can follow it in the
+    /// same attempt? Only `Compiling`: the frontend lock is behind it for good.
+    /// Every other work phase can still be followed by a frontend-lock wait.
+    pub fn ends_the_queue(self) -> bool {
+        matches!(self, BuildPhase::Compiling)
     }
 
     /// Store this phase into the shared marker (Relaxed — the marker is a
@@ -628,6 +816,11 @@ impl BuildPhase {
                  already held — not a slot wait",
                 secs
             ),
+            BuildPhase::SlotHeld => format!(
+                "Build queue timeout: waited {}s while preparing the build; the slot was \
+                 already held — not a slot wait",
+                secs
+            ),
         }
     }
 }
@@ -645,7 +838,10 @@ impl BuildPhase {
 /// cached (may be `None` if no refresh has run yet — the caller still gets the
 /// numeric free/required bytes and the prune-endpoint hints).
 pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError> {
-    let min_free_gb = crate::config::min_free_disk_gb();
+    // The floor follows the machine (plan `2026-10-02-cargo-jobs-…` Phase 4):
+    // derived from the CACHED footprint's largest built slot and volume size —
+    // never a tree walk on the gate — UNKNOWN → 30, env override wins.
+    let min_free_gb = effective_disk_floor(state).await.gb;
     if min_free_gb == 0 {
         return Ok(());
     }
@@ -691,6 +887,21 @@ pub async fn check_disk_guard(state: &SharedState) -> Result<(), SupervisorError
         required_bytes,
         footprint: Box::new(footprint),
     })
+}
+
+/// The effective pre-permit disk floor for this supervisor: the env override
+/// when set, else [`crate::build_sizing::derived_disk_floor_gb`] over the pool
+/// size and the cached footprint snapshot — or, whenever that snapshot has
+/// measured no built slot, the estimate an earlier walk persisted (UNKNOWN →
+/// 30 when neither has).
+pub async fn effective_disk_floor(state: &SharedState) -> crate::build_sizing::DiskFloor {
+    let footprint = state.footprint.read().await;
+    crate::build_sizing::effective_disk_floor(
+        crate::config::min_free_disk_gb_override(),
+        state.config.build_pool.pool_size.min(u32::MAX as usize) as u32,
+        footprint.as_ref(),
+        state.config.build_pool.persisted_estimate.as_ref(),
+    )
 }
 
 /// RAII guard that clears a `BuildSlot::busy` field on drop AND reconciles
@@ -911,8 +1122,10 @@ pub async fn run_cargo_build_with_dir_detailed(
 
     // Pre-permit memory guard: defer (never reject) while the box lacks the
     // commit headroom a single rustc on the runner's bin crate needs. Runs
-    // before permit acquisition so waiting never holds a slot.
-    check_ram_guard(state).await;
+    // before permit acquisition so waiting never holds a slot. The outcome is
+    // recorded on the slot and on `/health` once a slot is claimed, so a build
+    // that ran because the wait expired stays distinguishable from a pass.
+    let mem_gate = check_ram_guard(state).await;
 
     // Acquire a permit from the build pool. Blocks until a slot is free.
     // Queue depth counter lets `GET /builds` report how many callers are waiting.
@@ -922,6 +1135,12 @@ pub async fn run_cargo_build_with_dir_detailed(
         .queue_depth
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let permit_result = state.build_pool.permits.clone().acquire_owned().await;
+    // The queue wait is over the instant the permit is held. Said BEFORE any
+    // further await, so a queue watcher that reads the marker at this build's
+    // next yield sees `SlotHeld`, not a slot wait that has already ended.
+    if permit_result.is_ok() {
+        BuildPhase::SlotHeld.store(&phase);
+    }
     state
         .build_pool
         .queue_depth
@@ -941,7 +1160,11 @@ pub async fn run_cargo_build_with_dir_detailed(
         started_at: chrono::Utc::now(),
         requester_id,
         rebuild_kind: "exe".to_string(),
+        mem_gate: Some(mem_gate),
     };
+    // `claim_idle_slot` records `mem_gate` on the slot's history under the
+    // same busy lock as the claim, so `GET /builds` never pairs this build
+    // with the previous build's `last_mem_gate`.
     let slot = state.build_pool.claim_idle_slot(info).await;
     // RAII guard: clears `slot.busy = None` AND reconciles the global
     // `build_in_progress` flag on every exit path (happy path, `?`, panic,
@@ -959,6 +1182,7 @@ pub async fn run_cargo_build_with_dir_detailed(
         build.build_error_detected = false;
         build.last_build_error = None;
         build.last_build_at = Some(chrono::Utc::now());
+        build.last_mem_gate = Some(mem_gate);
     }
 
     state.notify_health_change();
@@ -1275,7 +1499,7 @@ async fn run_build_inner(
                 src_tauri
             ))
         })?;
-        prebuild_worktree_frontend(state, slot, &wt_root, force_frontend_build).await?;
+        prebuild_worktree_frontend(state, slot, &wt_root, force_frontend_build, phase).await?;
     }
     // The frontend is embedded in the binary via tauri_build, so we must run
     // `pnpm run build` first to produce a fresh dist/ before cargo build.
@@ -1379,6 +1603,14 @@ async fn run_build_inner(
                     ),
                 )
                 .await;
+            // Never install through a link (plan
+            // `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot`,
+            // D2). `npm_dir` here is always the live tree (`runner_npm_dir()`,
+            // since this block is gated on `build_dir_override.is_none()`), whose
+            // `node_modules` is a real dir — so this is a no-op in practice.
+            // It stays so that NO `install` site in this file can run through
+            // a symlink/junction, whichever tree a future caller points it at.
+            unlink_node_modules_link_before_install(state, slot, &npm_dir).await?;
             let install_result = run_pnpm_command(&npm_dir, "install --frozen-lockfile").await;
             match install_result {
                 Ok(output) if output.status.success() => {
@@ -1564,10 +1796,12 @@ async fn run_build_inner(
     // dist/. Without it, `cfg(dev) = !custom_protocol` makes the binary load
     // from devUrl (localhost:1420), which isn't running.
     //
-    // NOTE: after this build succeeds, `build_shim_sidecar` runs a second,
-    // fail-open `cargo build --bin qontinui-shim` on the same warm target dir
-    // so the install-interception stub is produced in lockstep with the runner
-    // exe (see [`SHIM_EXE_FILENAME`] for the placement contract).
+    // NOTE: after this build succeeds, `build_sidecars` runs a second,
+    // fail-open `cargo build --keep-going` over the sidecar roster
+    // (`qontinui-shim`, `qontinui-pr`, `qontinui_profile` — see
+    // [`SIDECAR_BUILD_ARGS`]) on the same warm target dir, so the helper
+    // binaries are produced in lockstep with the runner exe (see
+    // [`SHIM_EXE_FILENAME`] for the placement contract).
     const CARGO_BUILD_ARGS: &[&str] = &[
         "build",
         "--bin",
@@ -1686,6 +1920,13 @@ async fn run_build_inner(
             // target dir is. Without this the watchdog would still kill the exact
             // build that motivated it.
             .progress_probe(artifact_progress_probe(&slot.target_dir));
+    // No QONTINUI_ALLOW_PLACEHOLDER_DIST here: this build produces the exe a
+    // runner starts from, so build.rs must be free to refuse a placeholder dist.
+    let guarded = with_invocation_env(
+        guarded,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::SlotBuild,
+    );
 
     let outcome = guarded.run().await;
     // Drop the GuardedOutcome's grip is implicit; the sender (line_tx) was
@@ -1836,11 +2077,12 @@ async fn run_build_inner(
             .await;
         info!("Build completed successfully");
 
-        // Lockstep sidecar: also produce `qontinui-shim.exe` in this slot's
-        // debug dir so the deploy/placement steps can carry it alongside the
-        // runner exe. Fail-open — a shim build failure logs one WARN and never
+        // Lockstep sidecars: also produce the roster (`qontinui-shim`,
+        // `qontinui-pr`, `qontinui_profile`) in this slot's debug dir so the
+        // LKG carry and the deploy steps can take them alongside the runner
+        // exe. Fail-open — a sidecar failure logs a WARN per sidecar and never
         // fails the (already successful) runner build.
-        build_shim_sidecar(state, slot, cargo_cwd).await;
+        build_sidecars(state, slot, cargo_cwd).await;
 
         info!(
             "GCMD: cargo step returned status=success, run_build_inner returning Ok (slot={})",
@@ -1964,19 +2206,42 @@ async fn persist_and_render_incomplete_build(
 
 /// Filename of the install-interception shadow-stub sidecar binary built
 /// alongside the runner (`[[bin]] name = "qontinui-shim"` in the runner's
-/// `src-tauri/Cargo.toml`).
+/// `src-tauri/Cargo.toml`). One entry of the sidecar roster,
+/// [`RUNNER_SIDECARS`].
 ///
-/// PLACEMENT CONTRACT: every runner resolves this stub via
-/// `current_exe().parent()` (`locate_stub_exe` in the runner's
-/// `shim_materializer.rs`) and materializes it into each terminal's identity
-/// shim dir. The stub must therefore be deployed IN LOCKSTEP with the runner
-/// exe:
-///   1. built into the same slot `debug/` dir right after the runner build
-///      ([`build_shim_sidecar`], called from `run_build_inner`);
+/// PLACEMENT CONTRACT — it covers EVERY entry of [`RUNNER_SIDECARS`]
+/// (`qontinui-shim`, `qontinui-pr`, `qontinui_profile`), not just this one.
+/// Each sidecar is produced and carried IN LOCKSTEP with the runner exe:
+///   1. built into the same slot `debug/` dir right after the runner build, in
+///      ONE `cargo build --keep-going` over the whole roster
+///      ([`build_sidecars`], called from `run_build_inner`), and then checked
+///      by name to exist AND be non-empty;
 ///   2. carried into `target-pool/lkg/` by [`update_lkg_after_success`];
-///   3. copied next to the per-runner exe copy in `target/debug/` by
-///      `process::manager::start_exe_mode_for_runner` (the single deploy
-///      funnel for primary, named, and temp runners).
+///   3. copied next to the per-runner exe copy by
+///      `process::manager::start_exe_mode_for_runner` (the single deploy funnel
+///      for primary, named, and temp runners) — for the entries the runner
+///      resolves via `current_exe().parent()`
+///      ([`RunnerSidecar::deployed_beside_runner`]).
+///
+/// What holds about a ZERO-LENGTH sidecar, precisely: step 1 reports it by
+/// name; step 2 never carries one into the LKG dir (it judges the bytes it
+/// actually copied) and removes one already there; step 3 never deploys one,
+/// and on every deploy outcome removes a zero-length copy already beside the
+/// runner exe. That is a guarantee AT DEPLOY (runner start) TIME, not for the
+/// runner's lifetime: the primary's copy directory is the runner's own cargo
+/// `target/debug/`, and tauri-build refills it with 0-byte placeholder copies
+/// on any non-pool build-script run (a `dev-start.ps1` rebuild, a manual
+/// `cargo build`) until the runner half of the plan (Phase 1a, `build.rs`
+/// hiding `externalBin` from tauri-build) lands. Temp and named runners each
+/// deploy into a directory of their own, which nothing else writes.
+///
+/// Why it matters: the runner's `build.rs` writes 0-byte
+/// `binaries/<name>-<triple>` placeholders, and tauri-build copies them over
+/// `<target>/<profile>/<name>` on every build-script run; a supervisor that
+/// never built `--bin qontinui-pr` left that 0-byte copy beside every runner
+/// it started, the runner put it on every terminal's PATH, and
+/// `qontinui-pr create` exited 0 having opened no PR
+/// (plan `2026-09-27-qontinui-pr-zero-byte-sidecar-placeholder-published-as-session-cli`).
 ///
 /// A runner deployed without a fresh sidecar materializes whatever stale stub
 /// happens to sit next to it — the 2026-07-03 incident where a 3-week-old
@@ -1987,102 +2252,473 @@ pub const SHIM_EXE_FILENAME: &str = "qontinui-shim.exe";
 #[cfg(not(windows))]
 pub const SHIM_EXE_FILENAME: &str = "qontinui-shim";
 
-/// Wall-clock budget for the fail-open `cargo build --bin qontinui-shim`
-/// sidecar step. It runs right after the main runner build succeeded on the
-/// SAME warm `CARGO_TARGET_DIR` with the SAME feature set, so every shared
-/// dependency is already compiled — the shim itself is a small,
-/// dependency-light bin that compiles + links in seconds. 10 minutes is a
-/// generous ceiling for a heavily contended machine.
-const SHIM_BUILD_TIMEOUT_SECS: u64 = 600;
+/// Filename of the `qontinui-pr` session CLI (`[[bin]] name = "qontinui-pr"`,
+/// `src/bin/qontinui_cli.rs` in the runner). The runner's identity-shim
+/// materializer copies it from `current_exe().parent()` onto every terminal's
+/// PATH, so it is deployed beside every runner exe. See [`SHIM_EXE_FILENAME`]
+/// for the placement contract.
+#[cfg(windows)]
+pub const SESSION_CLI_EXE_FILENAME: &str = "qontinui-pr.exe";
+#[cfg(not(windows))]
+pub const SESSION_CLI_EXE_FILENAME: &str = "qontinui-pr";
 
-/// Build the `qontinui-shim` sidecar into the slot's target dir, right after
-/// a successful runner build (see [`SHIM_EXE_FILENAME`] for the contract).
+/// Filename of the `qontinui_profile` device/profile CLI (auto-discovered
+/// `src/bin/qontinui_profile.rs` in the runner). The supervisor's
+/// `POST /runners/pair-with-token` shells out to it
+/// (`routes::runners_pair::resolve_qontinui_profile_path`), which reads it out
+/// of the build slots and the LKG dir. The runner itself never resolves it
+/// beside its own exe, so it is built and carried but not deployed. See
+/// [`SHIM_EXE_FILENAME`] for the placement contract.
+#[cfg(windows)]
+pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile.exe";
+#[cfg(not(windows))]
+pub const PROFILE_CLI_EXE_FILENAME: &str = "qontinui_profile";
+
+/// Filename of the per-pane PTY holder (`[[bin]] name = "qontinui-pty-holder"`
+/// of the runner workspace's `crates/pty-holder` package, NOT of the runner
+/// package). The runner spawns it from `current_exe().parent()`
+/// (`pty_holder::spawn::resolve_holder_exe`), so it is deployed beside every
+/// runner exe. Without it, `terminal.pty_holder` (default ON on Linux) falls
+/// back to an in-process PTY and the pane dies with the runner.
+#[cfg(windows)]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder.exe";
+#[cfg(not(windows))]
+pub const PTY_HOLDER_EXE_FILENAME: &str = "qontinui-pty-holder";
+
+/// One helper binary built from the runner workspace alongside the runner exe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunnerSidecar {
+    /// The cargo `--bin` name.
+    pub bin: &'static str,
+    /// The file cargo writes into `<target>/debug/` on this platform.
+    pub filename: &'static str,
+    /// What is lost while this sidecar is missing or zero-length — the tail of
+    /// every WARN that names it.
+    pub consequence: &'static str,
+    /// Whether the runner resolves this sidecar via `current_exe().parent()`,
+    /// so `start_exe_mode_for_runner` must deploy it beside every runner exe
+    /// copy. Checked against the runner source: `locate_stub_exe` /
+    /// `materialize_session_cli` in `shim_materializer.rs` read `qontinui-shim`
+    /// and `qontinui-pr`; nothing in the runner resolves `qontinui_profile`.
+    pub deployed_beside_runner: bool,
+}
+
+/// The sidecar roster, in build order. [`SIDECAR_BUILD_ARGS`] names exactly
+/// these bins (pinned by a test), and the LKG carry and the per-runner deploy
+/// both iterate this list, so adding a sidecar here reaches every step of the
+/// placement contract.
+pub const RUNNER_SIDECARS: [RunnerSidecar; 4] = [
+    RunnerSidecar {
+        bin: "qontinui-shim",
+        filename: SHIM_EXE_FILENAME,
+        consequence: "identity shims will be stale",
+        deployed_beside_runner: true,
+    },
+    RunnerSidecar {
+        bin: "qontinui-pr",
+        filename: SESSION_CLI_EXE_FILENAME,
+        consequence: "terminals get no working `qontinui-pr` session CLI (open PRs \
+                      through the runner's loopback door or `gh pr create`)",
+        deployed_beside_runner: true,
+    },
+    RunnerSidecar {
+        bin: "qontinui_profile",
+        filename: PROFILE_CLI_EXE_FILENAME,
+        consequence: "POST /runners/pair-with-token cannot use this build's qontinui_profile",
+        deployed_beside_runner: false,
+    },
+    RunnerSidecar {
+        bin: "qontinui-pty-holder",
+        filename: PTY_HOLDER_EXE_FILENAME,
+        consequence: "terminal panes fall back to an in-process PTY and will NOT survive a \
+                      runner exit",
+        deployed_beside_runner: true,
+    },
+];
+
+/// Args of the fail-open sidecar build. ONE invocation over the whole roster,
+/// with `--keep-going`, so a compile failure in one sidecar cannot cost the
+/// others — above all the shim, whose absence is the 2026-07-03 stale-stub
+/// class. The same feature set as the runner build (`CARGO_BUILD_ARGS` in
+/// `run_build_inner`) so cargo reuses the warm fingerprints instead of
+/// recompiling shared deps under a different feature resolution.
 ///
-/// FAIL-OPEN by design: the sidecar is a lockstep rider on the runner deploy,
-/// not a gate on it. Any failure (spawn error, timeout, non-zero exit, exe
-/// missing afterwards) logs a single actionable WARN and returns — it never
-/// fails the runner build/restart. The cost of a missing sidecar is stale
-/// identity shims; the cost of failing the build would be no runner at all.
-async fn build_shim_sidecar(
-    state: &SharedState,
-    slot: &Arc<BuildSlot>,
+/// These are the args for a runner tree that declares every roster bin. What
+/// is actually run is [`sidecar_build_args`] over the tree's own manifest:
+/// `--keep-going` does NOT cover an unknown `--bin` — cargo rejects the whole
+/// invocation at target selection, before compiling anything, so a runner ref
+/// predating one sidecar (`qontinui-pr` did not exist 2026-06-08..2026-07-10)
+/// would lose the shim along with it.
+pub(crate) const SIDECAR_BUILD_ARGS: &[&str] = &[
+    "build",
+    "--keep-going",
+    // `qontinui-pty-holder` lives in another workspace package, and from a
+    // member directory cargo selects THAT package only, so both are named.
+    "-p",
+    "qontinui-runner",
+    "-p",
+    "qontinui-pty-holder",
+    "--bin",
+    "qontinui-shim",
+    "--bin",
+    "qontinui-pr",
+    "--bin",
+    "qontinui_profile",
+    "--bin",
+    "qontinui-pty-holder",
+    "--features",
+    "custom-protocol",
+];
+
+/// The bin targets the package at `cargo_cwd/Cargo.toml` declares: every
+/// explicit `[[bin]] name`, plus — unless `package.autobins = false` — the
+/// ones cargo discovers itself, `src/bin/<stem>.rs` and `src/bin/<dir>/main.rs`.
+///
+/// `None` is UNKNOWN (no readable manifest, unparseable TOML, or a manifest
+/// with no `[package]`, i.e. a virtual workspace root): the caller then builds
+/// the whole roster and lets cargo say. Over-inclusion is harmless here — the
+/// set is only ever asked whether it contains a roster name — so a discovered
+/// file stem that an explicit `[[bin]]` claims under another name is kept.
+pub(crate) fn declared_bin_targets(
     cargo_cwd: &std::path::Path,
-) {
-    // Same feature set as the runner build so cargo reuses the warm
-    // fingerprints instead of recompiling shared deps under a different
-    // feature resolution.
-    const SHIM_BUILD_ARGS: &[&str] = &[
-        "build",
-        "--bin",
-        "qontinui-shim",
-        "--features",
-        "custom-protocol",
-    ];
-
-    let shim_exe = slot.target_dir.join("debug").join(SHIM_EXE_FILENAME);
-    let warn_stale = |detail: String| {
-        format!(
-            "qontinui-shim sidecar build failed on slot {} — identity shims will be stale \
-             until a rebuild produces {:?} (runner build itself succeeded; deploy continues): {}",
-            slot.id, shim_exe, detail
-        )
-    };
-
-    info!(
-        "Slot {}: building qontinui-shim sidecar (warm target {:?})",
-        slot.id, slot.target_dir
-    );
-
-    // Same S3-backend degrade as the main pool build — see `sccache_guard`.
-    let guarded = crate::sccache_guard::guarded_cargo(
-        Duration::from_secs(SHIM_BUILD_TIMEOUT_SECS),
-        cargo_cwd,
-    )
-    .await
-    .args(SHIM_BUILD_ARGS)
-    .current_dir(cargo_cwd)
-    .env("CARGO_TARGET_DIR", &slot.target_dir)
-    .job_guarded(true);
-
-    let failure = match guarded.run().await {
-        Ok(GuardedOutcome::Exited(output)) if output.status.success() => {
-            if shim_exe.exists() {
-                None
-            } else {
-                Some(warn_stale(format!(
-                    "cargo exited 0 but {:?} is missing",
-                    shim_exe
-                )))
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut declared = package_bin_targets(cargo_cwd)?;
+    // Bins of the other workspace members (the PTY holder is one): the roster
+    // names bins by `--bin`, which cargo resolves across the selected packages.
+    if let Some(root) = cargo_cwd.parent() {
+        let members = std::fs::read_to_string(root.join("Cargo.toml"))
+            .ok()
+            .and_then(|t| toml::from_str::<toml::Value>(&t).ok())
+            .and_then(|m| {
+                m.get("workspace")?.get("members")?.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        for member in members.iter().filter(|m| !m.contains('*')) {
+            if let Some(bins) = package_bin_targets(&root.join(member)) {
+                declared.extend(bins);
             }
         }
-        Ok(GuardedOutcome::Exited(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
-            Some(warn_stale(format!(
-                "cargo exit {}: {}",
-                output.status,
-                tail.replace('\n', " | ")
-            )))
-        }
-        Ok(GuardedOutcome::TimedOut { after, .. }) => {
-            Some(warn_stale(format!("timed out after {}s", after.as_secs())))
-        }
-        Ok(GuardedOutcome::Cancelled { .. }) => Some(warn_stale("cancelled".to_string())),
-        Err(e) => Some(warn_stale(format!("failed to spawn cargo: {}", e))),
-    };
+    }
+    Some(declared)
+}
 
-    match failure {
-        None => {
-            info!(
-                "Slot {}: qontinui-shim sidecar built at {:?}",
-                slot.id, shim_exe
-            );
-        }
-        Some(msg) => {
-            warn!("{}", msg);
-            state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+/// The bin targets of the single package at `dir/Cargo.toml` (see
+/// [`declared_bin_targets`]); `None` when it has no readable `[package]`.
+fn package_bin_targets(dir: &std::path::Path) -> Option<std::collections::BTreeSet<String>> {
+    let cargo_cwd = dir;
+    let text = std::fs::read_to_string(cargo_cwd.join("Cargo.toml")).ok()?;
+    let manifest: toml::Value = toml::from_str(&text).ok()?;
+    let package = manifest.get("package")?.as_table()?;
+    let mut declared = std::collections::BTreeSet::new();
+    if let Some(bins) = manifest.get("bin").and_then(|b| b.as_array()) {
+        declared.extend(
+            bins.iter()
+                .filter_map(|b| b.get("name").and_then(|n| n.as_str()))
+                .map(str::to_string),
+        );
+    }
+    let autobins = package
+        .get("autobins")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if autobins {
+        if let Ok(entries) = std::fs::read_dir(cargo_cwd.join("src").join("bin")) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|e| e == "rs") {
+                    if let Some(stem) = path.file_stem() {
+                        declared.insert(stem.to_string_lossy().into_owned());
+                    }
+                } else if path.join("main.rs").is_file() {
+                    if let Some(dir) = path.file_name() {
+                        declared.insert(dir.to_string_lossy().into_owned());
+                    }
+                }
+            }
         }
     }
+    Some(declared)
+}
+
+/// [`SIDECAR_BUILD_ARGS`] without the `--bin <name>` pairs `declared` lacks.
+/// `None` (the manifest could not be read) keeps every pair. The result names
+/// no `--bin` at all when the tree declares none of the roster — the caller
+/// must then skip cargo, since a bare `cargo build` builds every bin.
+pub(crate) fn sidecar_build_args(
+    declared: Option<&std::collections::BTreeSet<String>>,
+) -> Vec<&'static str> {
+    let mut args = Vec::with_capacity(SIDECAR_BUILD_ARGS.len());
+    let mut i = 0;
+    while i < SIDECAR_BUILD_ARGS.len() {
+        let arg = SIDECAR_BUILD_ARGS[i];
+        if arg == "--bin" {
+            let bin = SIDECAR_BUILD_ARGS[i + 1];
+            if declared.is_none_or(|d| d.contains(bin)) {
+                args.extend([arg, bin]);
+            }
+            i += 2;
+        } else if arg == "-p" {
+            // `-p <pkg>` for a package the tree lacks is an unknown-package
+            // error that costs the whole invocation, like an unknown `--bin`.
+            let pkg = SIDECAR_BUILD_ARGS[i + 1];
+            if pkg != "qontinui-pty-holder" || declared.is_none_or(|d| d.contains(pkg)) {
+                args.extend([arg, pkg]);
+            }
+            i += 2;
+        } else {
+            args.push(arg);
+            i += 1;
+        }
+    }
+    args
+}
+
+/// What sits at a sidecar's path. A zero-length file is NOT a binary: it is a
+/// build placeholder (or a copy of one), and executing it under Git Bash exits
+/// 0 having done nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SidecarFile {
+    /// A non-empty regular file of `bytes` bytes.
+    Present { bytes: u64 },
+    /// A zero-length regular file.
+    Empty,
+    /// Nothing there (or something that is not a regular file).
+    Missing,
+}
+
+impl SidecarFile {
+    pub(crate) fn inspect(path: &std::path::Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(m) if m.is_file() && m.len() > 0 => SidecarFile::Present { bytes: m.len() },
+            Ok(m) if m.is_file() => SidecarFile::Empty,
+            _ => SidecarFile::Missing,
+        }
+    }
+
+    pub(crate) fn is_present(&self) -> bool {
+        matches!(self, SidecarFile::Present { .. })
+    }
+}
+
+/// Remove `path` when it is a ZERO-LENGTH regular file, and only then — never
+/// a file with content. Returns whether a file was removed.
+///
+/// The LKG carry and every deploy outcome call it on their destination, so a
+/// stale 0-byte copy does not survive an LKG promotion or a runner start. That
+/// is true AT THAT MOMENT only: the primary's sidecar directory is the runner's
+/// cargo `target/debug/`, which tauri-build refills with 0-byte placeholder
+/// copies on any later non-pool build-script run until the runner's Phase 1a
+/// lands (see [`SHIM_EXE_FILENAME`]).
+pub(crate) fn remove_if_zero_length(path: &std::path::Path) -> bool {
+    SidecarFile::inspect(path) == SidecarFile::Empty && std::fs::remove_file(path).is_ok()
+}
+
+/// Wall-clock budget for the fail-open sidecar build. It runs right after the
+/// main runner build succeeded on the SAME warm `CARGO_TARGET_DIR` with the
+/// SAME feature set, so every shared dependency — the runner lib crate
+/// included — is already compiled; what remains is compiling and linking
+/// four small bins. 10 minutes is a generous ceiling for a heavily contended
+/// machine.
+const SIDECAR_BUILD_TIMEOUT_SECS: u64 = 600;
+
+/// The per-sidecar verdict [`build_sidecars`] logs after cargo returns: for
+/// each roster entry, what sits in `debug_dir`. Split out so the "exists AND
+/// non-empty, by name" check is testable without running cargo.
+pub(crate) fn inspect_built_sidecars(
+    debug_dir: &std::path::Path,
+) -> Vec<(RunnerSidecar, std::path::PathBuf, SidecarFile)> {
+    RUNNER_SIDECARS
+        .iter()
+        .map(|sidecar| {
+            let path = debug_dir.join(sidecar.filename);
+            let state = SidecarFile::inspect(&path);
+            (*sidecar, path, state)
+        })
+        .collect()
+}
+
+/// Build the roster sidecars the runner tree declares into the slot's target
+/// dir, right after a successful runner build (see [`SHIM_EXE_FILENAME`] for
+/// the contract).
+///
+/// FAIL-OPEN by design: the sidecars are lockstep riders on the runner deploy,
+/// not a gate on it. Any failure (spawn error, timeout, non-zero exit, a
+/// sidecar missing or zero-length afterwards) logs an actionable WARN — one
+/// per sidecar that is not a real binary, by name — and returns. It never
+/// fails the runner build/restart: the cost of a missing sidecar is a stale
+/// or absent helper, the cost of failing the build would be no runner at all.
+///
+/// Only the roster bins the tree's manifest declares are passed
+/// ([`declared_bin_targets`], [`sidecar_build_args`]): cargo rejects an
+/// unknown `--bin` before compiling anything, `--keep-going` notwithstanding,
+/// so a runner ref that predates one sidecar would otherwise lose them all.
+///
+/// The check after cargo returns runs on EVERY outcome, not only on success:
+/// with `--keep-going` a failed invocation can still have produced the other
+/// sidecars, and a successful one can still leave a 0-byte placeholder copy
+/// if cargo did not uplift over it.
+async fn build_sidecars(state: &SharedState, slot: &Arc<BuildSlot>, cargo_cwd: &std::path::Path) {
+    let declared = declared_bin_targets(cargo_cwd);
+    let args = sidecar_build_args(declared.as_ref());
+    let undeclared: Vec<&'static str> = RUNNER_SIDECARS
+        .iter()
+        .filter(|s| declared.as_ref().is_some_and(|d| !d.contains(s.bin)))
+        .map(|s| s.bin)
+        .collect();
+    if declared.is_none() {
+        let msg = format!(
+            "Slot {}: could not read the bin targets {:?} declares — building the whole \
+             sidecar roster; cargo refuses the invocation if the tree lacks one of them",
+            slot.id,
+            cargo_cwd.join("Cargo.toml")
+        );
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+    if !undeclared.is_empty() {
+        let msg = format!(
+            "Slot {}: this runner tree does not declare {:?} (a ref that predates them) — \
+             not building them; a file of that name in the slot is from another build",
+            slot.id, undeclared
+        );
+        info!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+    }
+    // A tree that declares none of the roster (refs before 2026-04-30) gets
+    // no cargo run at all: a bare `cargo build` would build every bin, and
+    // nothing attempted is nothing failed.
+    let cargo_failure: Option<String> = if !args.contains(&"--bin") {
+        info!(
+            "Slot {}: this runner tree declares none of the sidecar bins — nothing to build",
+            slot.id
+        );
+        None
+    } else {
+        info!(
+            "Slot {}: building runner sidecars: cargo {} (warm target {:?})",
+            slot.id,
+            args.join(" "),
+            slot.target_dir
+        );
+        // Same S3-backend degrade as the main pool build — see `sccache_guard`.
+        let guarded = crate::sccache_guard::guarded_cargo(
+            Duration::from_secs(SIDECAR_BUILD_TIMEOUT_SECS),
+            cargo_cwd,
+        )
+        .await
+        .args(&args)
+        .current_dir(cargo_cwd)
+        .env("CARGO_TARGET_DIR", &slot.target_dir)
+        .job_guarded(true);
+        let guarded = with_invocation_env(
+            guarded,
+            state.config.build_pool.jobs.to_set(),
+            CargoInvocation::SidecarBuild,
+        );
+
+        match guarded.run().await {
+            Ok(GuardedOutcome::Exited(output)) if output.status.success() => None,
+            Ok(GuardedOutcome::Exited(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let tail = tail_bytes_keep_utf8(&stderr, LAST_BUILD_STDERR_SHORT_TAIL_BYTES);
+                Some(format!(
+                    "cargo exit {}: {}",
+                    output.status,
+                    tail.replace('\n', " | ")
+                ))
+            }
+            Ok(GuardedOutcome::TimedOut { after, .. }) => {
+                Some(format!("timed out after {}s", after.as_secs()))
+            }
+            Ok(GuardedOutcome::Cancelled { .. }) => Some("cancelled".to_string()),
+            Err(e) => Some(format!("failed to spawn cargo: {}", e)),
+        }
+    };
+
+    let debug_dir = slot.target_dir.join("debug");
+    let verdict = sidecar_build_verdict(slot.id, &debug_dir, &undeclared, cargo_failure.as_deref());
+    if !verdict.built.is_empty() {
+        info!(
+            "Slot {}: runner sidecars ready in {:?}: {}",
+            slot.id,
+            debug_dir,
+            verdict.built.join(", ")
+        );
+    }
+    for msg in verdict.warnings {
+        warn!("{}", msg);
+        state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
+    }
+}
+
+/// What [`build_sidecars`] reports after cargo returns: the sidecars that are
+/// real binaries, and one WARN per declared sidecar that is not.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SidecarBuildVerdict {
+    pub(crate) built: Vec<String>,
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The post-build check, kept pure so every arm is testable without cargo.
+/// `undeclared` sidecars were not built for this tree and are not checked;
+/// `cargo_failure` is `None` when cargo succeeded or was never run.
+pub(crate) fn sidecar_build_verdict(
+    slot_id: usize,
+    debug_dir: &std::path::Path,
+    undeclared: &[&str],
+    cargo_failure: Option<&str>,
+) -> SidecarBuildVerdict {
+    let mut verdict = SidecarBuildVerdict::default();
+    for (sidecar, path, file) in inspect_built_sidecars(debug_dir) {
+        if undeclared.contains(&sidecar.bin) {
+            continue;
+        }
+        let problem = match file {
+            SidecarFile::Present { bytes } => {
+                verdict
+                    .built
+                    .push(format!("{} ({} bytes)", sidecar.bin, bytes));
+                continue;
+            }
+            SidecarFile::Missing => "is missing",
+            SidecarFile::Empty => {
+                "is ZERO-LENGTH (a build placeholder, not a binary — it will not be \
+                 carried to LKG or deployed)"
+            }
+        };
+        verdict.warnings.push(format!(
+            "{} sidecar {:?} {} on slot {} after the sidecar build — {} until a rebuild \
+             produces it (runner build itself succeeded; deploy continues){}",
+            sidecar.bin,
+            path,
+            problem,
+            slot_id,
+            sidecar.consequence,
+            cargo_failure
+                .map(|f| format!(": {}", f))
+                .unwrap_or_default()
+        ));
+    }
+    // A failed invocation whose declared sidecars all look real still gets
+    // named: with `--keep-going` a sidecar that failed to compile may keep an
+    // EARLIER uplift, which can be stale (or the 0-byte placeholder copy, which
+    // the `Empty` arm above already reported). Only when something was checked
+    // and found present — with nothing declared there is nothing it could say.
+    if verdict.warnings.is_empty() && !verdict.built.is_empty() {
+        if let Some(failure) = cargo_failure {
+            verdict.warnings.push(format!(
+                "runner sidecar build failed on slot {} ({}) — every sidecar this runner \
+                 tree declares is present and non-empty, but one or more may be left over \
+                 from an earlier build (runner build itself succeeded; deploy continues)",
+                slot_id, failure
+            ));
+        }
+    }
+    verdict
 }
 
 /// Prebuild the frontend inside a fresh spawn worktree before cargo runs.
@@ -2118,12 +2754,57 @@ async fn build_shim_sidecar(
 /// stdout+stderr** embedded, and records the same blob on the slot so it
 /// reaches `SlotHistory::last_error_detail` / `last_error_log` and the build
 /// submission's `stderr_tail` (see [`record_frontend_failure`]).
+///
+/// `phase` is the build's queue marker: the prebuild's wait for the npm lock is
+/// a queue wait (`AwaitingNpmLock`), and what it runs under the lock is work
+/// (`BuildingFrontend`), so `queue_timeout_secs` bounds the first and never the
+/// second.
 async fn prebuild_worktree_frontend(
     state: &SharedState,
     slot: &Arc<BuildSlot>,
     wt_root: &std::path::Path,
     force_frontend_build: bool,
+    phase: &std::sync::atomic::AtomicU8,
 ) -> Result<(), SupervisorError> {
+    prebuild_worktree_frontend_with(
+        state,
+        slot,
+        wt_root,
+        force_frontend_build,
+        phase,
+        |cwd, args| async move { run_pnpm_command(&cwd, args).await },
+    )
+    .await
+}
+
+/// [`prebuild_worktree_frontend`] with the pnpm invocation as a seam, so a
+/// test can drive the whole prebuild (unlink → freshness gate → install →
+/// sidecar → build) with a stub that writes what pnpm would write, without a
+/// real pnpm or network. Production passes [`run_pnpm_command`].
+async fn prebuild_worktree_frontend_with<F, Fut>(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    wt_root: &std::path::Path,
+    force_frontend_build: bool,
+    phase: &std::sync::atomic::AtomicU8,
+    pnpm: F,
+) -> Result<(), SupervisorError>
+where
+    F: Fn(PathBuf, &'static str) -> Fut,
+    Fut: std::future::Future<Output = Result<std::process::Output, std::io::Error>>,
+{
+    // 0) Never install through a link. A worktree whose `node_modules` is a
+    //    symlink/junction into the shared primary (the allocator's link arm)
+    //    would have `pnpm install` write the PRIMARY's tree and stamp the
+    //    primary's `.modules.yaml` with this worktree's identity — the
+    //    2026-10-02..06 poisoning (plan
+    //    `2026-10-06-a-junctioned-node-modules-install-is-refused-by-every-harness-and-noticed-at-boot`,
+    //    D2). Remove the LINK (never its target) BEFORE the freshness gate,
+    //    so `dep_install_reason` reads this worktree's own sidecar — not the
+    //    primary's, read through the link — and the install below lands in a
+    //    real dir. Unlink, don't refuse: the build proceeds.
+    unlink_node_modules_link_before_install(state, slot, wt_root).await?;
+
     // Idempotency gate, split for the Phase 3 `frontend_only` fast path:
     //   * `install_reason` — Some(why) when `pnpm install` must run: either the
     //     `node_modules/.bin/ui-bridge-build-ir` marker is absent, or the
@@ -2175,7 +2856,20 @@ async fn prebuild_worktree_frontend(
             ),
         )
         .await;
+    // The lock wait is a queue wait, and what runs under the lock is work.
+    BuildPhase::AwaitingNpmLock.store(phase);
     let _npm_guard = state.build_pool.npm_lock.clone().lock_owned().await;
+    BuildPhase::BuildingFrontend.store(phase);
+    // Re-check after the (possibly minutes-long) lock wait: a link re-created
+    // in that window must not be installed through. Idempotent and cheap —
+    // one `symlink_metadata` when `node_modules` is already a real dir. If a
+    // link IS removed here, the freshness gate computed above may have read
+    // through it, so recompute the install reason against the real tree.
+    let install_reason = if unlink_node_modules_link_before_install(state, slot, wt_root).await? {
+        dep_install_reason(wt_root)
+    } else {
+        install_reason
+    };
 
     // 1) pnpm install — produces node_modules/.bin/ui-bridge-build-ir +
     //    everything else `pnpm run build` needs. Use `--frozen-lockfile`
@@ -2212,12 +2906,14 @@ async fn prebuild_worktree_frontend(
             .await;
 
         let install_started = std::time::Instant::now();
-        let install_output = run_pnpm_command(wt_root, install_args).await.map_err(|e| {
-            SupervisorError::BuildFailed(format!(
-                "pnpm {} failed to spawn in spawn worktree {:?}: {}",
-                install_args, wt_root, e
-            ))
-        })?;
+        let install_output = pnpm(wt_root.to_path_buf(), install_args)
+            .await
+            .map_err(|e| {
+                SupervisorError::BuildFailed(format!(
+                    "pnpm {} failed to spawn in spawn worktree {:?}: {}",
+                    install_args, wt_root, e
+                ))
+            })?;
         if !install_output.status.success() {
             // S2: pnpm writes resolution/peer-dep diagnostics to BOTH streams —
             // capture the merged blob, not stderr alone.
@@ -2282,12 +2978,14 @@ async fn prebuild_worktree_frontend(
         .await;
 
     let build_started = std::time::Instant::now();
-    let build_output = run_pnpm_command(wt_root, "run build").await.map_err(|e| {
-        SupervisorError::BuildFailed(format!(
-            "pnpm run build failed to spawn in spawn worktree {:?}: {}",
-            wt_root, e
-        ))
-    })?;
+    let build_output = pnpm(wt_root.to_path_buf(), "run build")
+        .await
+        .map_err(|e| {
+            SupervisorError::BuildFailed(format!(
+                "pnpm run build failed to spawn in spawn worktree {:?}: {}",
+                wt_root, e
+            ))
+        })?;
     if !build_output.status.success() {
         // S2 (the P0's second half): `tsc` and `vite` print their compiler
         // diagnostics (`error TS2339: …`) to **stdout**; stderr usually holds
@@ -2327,6 +3025,114 @@ async fn prebuild_worktree_frontend(
     verify_frontend_built(wt_root)?;
 
     Ok(())
+}
+
+/// The log line emitted when [`unlink_node_modules_link_before_install`]
+/// removes a link. Named by the plan's Arming line, so it is a contract:
+/// grep for it to confirm the step fired on a real spawn.
+const UNLINKED_NODE_MODULES_LOG: &str = "unlinked shared node_modules link before install";
+
+/// If `<dir>/node_modules` is a symlink or junction, remove THE LINK (never
+/// its target, never recursively) so the following `pnpm install` creates a
+/// real `node_modules` owned by `dir`. Logs [`UNLINKED_NODE_MODULES_LOG`].
+/// A real dir, or no `node_modules` at all, is left untouched.
+///
+/// Returns `Ok(true)` iff a link was removed (the caller's freshness verdict,
+/// if computed earlier, may have read through it and is stale).
+///
+/// A failed unlink fails the build (logged at ERROR, so `/logs` shows it):
+/// installing anyway would write through the
+/// link into the shared tree, which is the exact harm this step prevents.
+async fn unlink_node_modules_link_before_install(
+    state: &SharedState,
+    slot: &Arc<BuildSlot>,
+    dir: &std::path::Path,
+) -> Result<bool, SupervisorError> {
+    let nm = dir.join("node_modules");
+    let target = std::fs::read_link(&nm).ok();
+    match unlink_node_modules_link(dir) {
+        Ok(false) => Ok(false),
+        Ok(true) => {
+            let msg = format!(
+                "Slot {}: {} — {:?} (was -> {:?}); installing into a real dir",
+                slot.id, UNLINKED_NODE_MODULES_LOG, nm, target
+            );
+            info!("{}", msg);
+            state.logs.emit(LogSource::Build, LogLevel::Info, msg).await;
+            Ok(true)
+        }
+        Err(e) => {
+            let msg = format!(
+                "Slot {}: {:?} is a symlink/junction and could not be unlinked ({}); refusing \
+                 to run pnpm install through it, which would write the linked (shared) tree",
+                slot.id, nm, e
+            );
+            error!("{}", msg);
+            state
+                .logs
+                .emit(LogSource::Build, LogLevel::Error, msg.clone())
+                .await;
+            Err(SupervisorError::BuildFailed(msg))
+        }
+    }
+}
+
+/// Synchronous core of [`unlink_node_modules_link_before_install`].
+/// `Ok(true)` ⇒ a link was removed; `Ok(false)` ⇒ nothing to do (absent, or a
+/// real dir/file). Inspects with `symlink_metadata`, so the answer is about
+/// the link itself, never about what it points at (a dangling link counts).
+fn unlink_node_modules_link(dir: &std::path::Path) -> std::io::Result<bool> {
+    let nm = dir.join("node_modules");
+    let meta = match std::fs::symlink_metadata(&nm) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if !is_link_metadata(&meta) {
+        return Ok(false);
+    }
+    remove_link(&nm)?;
+    Ok(true)
+}
+
+/// True iff `meta` (from `symlink_metadata`) describes a link: a symlink on
+/// unix; any reparse point (junction, `mklink /D`, file symlink) on Windows.
+fn is_link_metadata(meta: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        meta.file_type().is_symlink()
+    }
+}
+
+/// Remove the link at `path` — ONLY the link, never its target, never
+/// recursively (INV-W4; mirrors the runner's `agent_worktree::census::remove_link`).
+/// Windows: a DIRECTORY link (junction or `mklink /D`) takes `remove_dir`, a
+/// file symlink `remove_file` — each refuses the other's shape, and both
+/// remove the reparse point alone. Elsewhere `remove_file` (`unlink(2)`), which
+/// removes a symlink whatever it points at; `remove_dir` would be `rmdir(2)`
+/// and refuse it with `ENOTDIR`.
+fn remove_link(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        let meta = std::fs::symlink_metadata(path)?;
+        if meta.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            std::fs::remove_dir(path)
+        } else {
+            std::fs::remove_file(path)
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::remove_file(path)
+    }
 }
 
 /// True iff `<wt_root>/node_modules/.bin/ui-bridge-build-ir` is ABSENT — i.e.
@@ -3616,8 +4422,13 @@ async fn free_slot_exe(state: &SharedState, slot: &Arc<BuildSlot>) -> Result<(),
                 );
                 // Temp runner (the arm is gated on `is_temp`), which the
                 // readiness gate exempts; `false` is the honest value.
-                if let Err(e) =
-                    crate::process::manager::stop_runner_by_id(state, &runner_id, false).await
+                if let Err(e) = crate::process::manager::stop_runner_by_id(
+                    state,
+                    &runner_id,
+                    false,
+                    crate::process::manager::CloseIntent::Kill,
+                )
+                .await
                 {
                     warn!(
                         "stop_runner_by_id('{}') failed: {} — escalating to direct kill",
@@ -3765,8 +4576,13 @@ async fn stop_exe_runners_for_build(state: &SharedState) {
                 "Stopping temp runner '{}' (PID {}) running from slot exe {:?} before build",
                 managed.config.name, pid, exe_path
             );
-            if let Err(e) =
-                crate::process::manager::stop_runner_by_id(state, &managed.config.id, false).await
+            if let Err(e) = crate::process::manager::stop_runner_by_id(
+                state,
+                &managed.config.id,
+                false,
+                crate::process::manager::CloseIntent::Kill,
+            )
+            .await
             {
                 warn!(
                     "Failed to stop temp runner '{}' before build: {}",
@@ -3809,6 +4625,113 @@ async fn resolve_pid_exe_path(pid: u32) -> Option<std::path::PathBuf> {
 
 /// Timeout per slot's pre-warm `cargo check`.
 const PREWARM_TIMEOUT_SECS: u64 = 60;
+
+/// Env var that lets the runner's `build.rs` accept a `custom-protocol` build
+/// whose `../dist/index.html` is absent or is the dev PLACEHOLDER. Without it
+/// that build script REFUSES, so a binary embedding the placeholder frontend
+/// can no longer be produced by accident.
+pub(crate) const ALLOW_PLACEHOLDER_DIST_ENV: &str = "QONTINUI_ALLOW_PLACEHOLDER_DIST";
+
+/// Which supervisor-driven cargo invocation a command is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CargoInvocation {
+    /// The slot pre-warm: a `cargo check` that never produces an exe.
+    Prewarm,
+    /// The real slot build that produces the runner exe a runner is started from.
+    SlotBuild,
+    /// The fail-open sidecar `cargo build` that follows a slot build.
+    SidecarBuild,
+    /// A `/build/submit` build (`build_submissions.rs`, a bare `Command`).
+    Submission,
+}
+
+/// The env a supervisor cargo invocation SETS and REMOVES, by kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InvocationEnv {
+    /// Variables set on the child. Owned, because `CARGO_BUILD_JOBS` is
+    /// computed from the machine at runtime.
+    pub set: Vec<(&'static str, String)>,
+    /// Variables removed from what the child would inherit from the supervisor.
+    pub remove: &'static [&'static str],
+}
+
+/// Env rules per invocation kind. Pure so the "only the pre-warm may accept a
+/// placeholder dist" rule is testable.
+///
+/// The pre-warm is a `cargo check` on a possibly fresh tree with no `dist/`
+/// yet; it produces no exe, so allowing the placeholder there embeds nothing.
+/// It must NEVER reach a real build. The runner's `build.rs` declares
+/// `cargo:rerun-if-env-changed=QONTINUI_ALLOW_PLACEHOLDER_DIST`, so a later
+/// real build in the same target dir WITHOUT the variable re-runs the build
+/// script and re-applies the refusal rather than reusing the pre-warm's
+/// permissive result.
+///
+/// Every exe-producing kind actively REMOVES the variable: otherwise a value
+/// in the supervisor's OWN environment (an operator shell, a dev script)
+/// would be inherited by every real build and silently bypass the refusal.
+/// Plan `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
+///
+/// **`CARGO_BUILD_JOBS` on all four kinds** (plan
+/// `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`,
+/// Phase 2). `jobs` is the pool's per-slot share
+/// ([`crate::build_sizing::SlotJobs::to_set`]): every kind holds a pool permit
+/// (the pre-warm runs once per slot, `/build/submit` shares `build_pool.permits`),
+/// so a full pool's jobs sum to at most the machine's cores instead of
+/// `pool_size × cores`. `None` means the supervisor's own environment already
+/// carries `CARGO_BUILD_JOBS`, which the child then inherits untouched.
+pub(crate) fn cargo_invocation_env(kind: CargoInvocation, jobs: Option<u32>) -> InvocationEnv {
+    let mut set: Vec<(&'static str, String)> = Vec::new();
+    if let Some(j) = jobs {
+        set.push((
+            crate::build_sizing::CARGO_BUILD_JOBS_ENV,
+            j.max(1).to_string(),
+        ));
+    }
+    match kind {
+        CargoInvocation::Prewarm => {
+            set.push((ALLOW_PLACEHOLDER_DIST_ENV, "1".to_string()));
+            InvocationEnv { set, remove: &[] }
+        }
+        CargoInvocation::SlotBuild
+        | CargoInvocation::SidecarBuild
+        | CargoInvocation::Submission => InvocationEnv {
+            set,
+            remove: &[ALLOW_PLACEHOLDER_DIST_ENV],
+        },
+    }
+}
+
+/// Apply [`cargo_invocation_env`] for `kind` to a guarded command.
+fn with_invocation_env(
+    mut cmd: GuardedCommand,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) -> GuardedCommand {
+    let env = cargo_invocation_env(kind, jobs);
+    for k in env.remove {
+        cmd = cmd.env_remove(k);
+    }
+    for (k, v) in &env.set {
+        cmd = cmd.env(k, v);
+    }
+    cmd
+}
+
+/// Apply [`cargo_invocation_env`] for `kind` to a plain tokio command (the
+/// `/build/submit` path, which is not a [`GuardedCommand`]).
+pub(crate) fn apply_invocation_env(
+    cmd: &mut tokio::process::Command,
+    jobs: Option<u32>,
+    kind: CargoInvocation,
+) {
+    let env = cargo_invocation_env(kind, jobs);
+    for k in env.remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in &env.set {
+        cmd.env(k, v);
+    }
+}
 
 /// Sweep each slot's target dir for stale `.cargo-lock` advisory files left
 /// behind by a previous supervisor that was killed mid-build.
@@ -3975,7 +4898,7 @@ async fn prewarm_single_slot(
     // Same memory floor as the real-build path: the prewarm `cargo check` also
     // spawns rustc against this workspace, so gating only the real build would
     // let prewarm be the thing that OOMs and poisons the slot.
-    check_ram_guard(state).await;
+    let mem_gate = check_ram_guard(state).await;
 
     // Acquire a permit so concurrent spawn-test calls see this slot as busy.
     state
@@ -4009,11 +4932,18 @@ async fn prewarm_single_slot(
         if busy.is_some() {
             return Ok(());
         }
-        *busy = Some(BuildInfo {
-            started_at: chrono::Utc::now(),
-            requester_id: Some("supervisor-prewarm".to_string()),
-            rebuild_kind: "prewarm".to_string(),
-        });
+        // `occupy` writes `history.last_mem_gate` under this busy lock,
+        // before the claim is visible — see its doc.
+        slot.occupy(
+            &mut busy,
+            BuildInfo {
+                started_at: chrono::Utc::now(),
+                requester_id: Some("supervisor-prewarm".to_string()),
+                rebuild_kind: "prewarm".to_string(),
+                mem_gate: Some(mem_gate),
+            },
+        )
+        .await;
     }
     let _slot_guard = SlotGuard {
         slot: slot.clone(),
@@ -4074,14 +5004,23 @@ async fn prewarm_single_slot(
         slot.id, PREWARM_TIMEOUT_SECS
     );
     // Same S3-backend degrade as the pool build — see `sccache_guard`.
-    let outcome = crate::sccache_guard::guarded_cargo(
+    let cmd = crate::sccache_guard::guarded_cargo(
         Duration::from_secs(PREWARM_TIMEOUT_SECS),
         &state.config.project_dir,
     )
     .await
     .args(args)
     .current_dir(&state.config.project_dir)
-    .env("CARGO_TARGET_DIR", &slot.target_dir)
+    .env("CARGO_TARGET_DIR", &slot.target_dir);
+    // QONTINUI_ALLOW_PLACEHOLDER_DIST=1 — pre-warm ONLY (see
+    // `cargo_invocation_env`): this `cargo check` must keep working on a fresh
+    // tree with no `dist/`, and the runner's build.rs `rerun-if-env-changed`
+    // makes the next real build re-check without it.
+    let outcome = with_invocation_env(
+        cmd,
+        state.config.build_pool.jobs.to_set(),
+        CargoInvocation::Prewarm,
+    )
     .job_guarded(true)
     .stream_lines(line_tx)
     .run()
@@ -4148,6 +5087,89 @@ async fn prewarm_single_slot(
 // =============================================================================
 // Last-known-good (LKG) capture
 // =============================================================================
+
+/// Copy the sidecar `filename` from beside the slot exe into `lkg_dir` through
+/// a per-slot tmp file + atomic rename. Returns the bytes carried.
+///
+/// A ZERO-LENGTH source is refused, never carried: it is a build placeholder,
+/// and an LKG-pinned start would otherwise deploy it beside the runner. The
+/// verdict is taken twice — a stat for the message, and the byte count of the
+/// copy itself, because the slot is released before LKG capture and a queued
+/// build can rewrite the sidecar in between. On a refusal a zero-length file
+/// already at the LKG destination (carried by a build predating this check) is
+/// removed too, so the LKG dir never holds one; a non-empty LKG copy from an
+/// earlier build is left in place, exactly as it is when the source is missing.
+fn carry_sidecar_into_lkg(
+    source_exe: &std::path::Path,
+    lkg_dir: &std::path::Path,
+    filename: &str,
+    slot_id: usize,
+) -> Result<u64, String> {
+    carry_sidecar_into_lkg_via(source_exe, lkg_dir, filename, slot_id, |from, to| {
+        std::fs::copy(from, to)
+    })
+}
+
+/// [`carry_sidecar_into_lkg`] with the copy injected, so a test can stage the
+/// race in which a concurrent build rewrites the slot's sidecar between the
+/// check and the copy.
+fn carry_sidecar_into_lkg_via(
+    source_exe: &std::path::Path,
+    lkg_dir: &std::path::Path,
+    filename: &str,
+    slot_id: usize,
+    copy: impl Fn(&std::path::Path, &std::path::Path) -> std::io::Result<u64>,
+) -> Result<u64, String> {
+    let src = source_exe.with_file_name(filename);
+    let dst = lkg_dir.join(filename);
+    match SidecarFile::inspect(&src) {
+        SidecarFile::Present { .. } => {}
+        SidecarFile::Missing => {
+            return Err(format!("{:?} not found next to the slot exe", src));
+        }
+        SidecarFile::Empty => {
+            let removed = remove_if_zero_length(&dst);
+            return Err(format!(
+                "{:?} is ZERO-LENGTH (a build placeholder, not a binary) — refused to carry it{}",
+                src,
+                if removed {
+                    format!("; removed the zero-length copy already at {:?}", dst)
+                } else {
+                    String::new()
+                }
+            ));
+        }
+    }
+    let tmp = lkg_dir.join(format!("{}.tmp.{}", filename, slot_id));
+    let _ = std::fs::remove_file(&tmp);
+    let result = copy(&src, &tmp)
+        .map_err(|e| format!("copy {:?} -> {:?}: {}", src, tmp, e))
+        .and_then(|bytes| {
+            // Judge the bytes actually COPIED, not the stat above: the slot is
+            // released before LKG capture, so a queued build can already have
+            // rewritten this sidecar with tauri-build's 0-byte placeholder copy.
+            if bytes == 0 {
+                let removed = remove_if_zero_length(&dst);
+                return Err(format!(
+                    "{:?} was ZERO-LENGTH when copied (rewritten after the check, likely \
+                     by a build that took the slot) — refused to carry it{}",
+                    src,
+                    if removed {
+                        format!("; removed the zero-length copy already at {:?}", dst)
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            std::fs::rename(&tmp, &dst)
+                .map(|()| bytes)
+                .map_err(|e| format!("rename {:?} -> {:?}: {}", tmp, dst, e))
+        });
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
 
 /// Copy the freshly-built slot exe to `target-pool/lkg/qontinui-runner.exe`
 /// and write a `lkg.json` sidecar with `{built_at, source_slot, exe_size, sha,
@@ -4258,33 +5280,25 @@ async fn update_lkg_after_success(
         ))
     })?;
 
-    // Carry the `qontinui-shim.exe` sidecar into the LKG dir alongside the
-    // exe (same tmp+rename dance) so an LKG-pinned start (spawn-test
-    // {use_lkg: true}) deploys a matching stub, not whatever stale one sits
-    // in `target/debug/`. See [`SHIM_EXE_FILENAME`] for the placement
-    // contract. Fail-open: the exe promotion above already succeeded; a
-    // missing or uncopyable shim logs one WARN and never fails the build.
-    {
-        let shim_src = source_exe.with_file_name(SHIM_EXE_FILENAME);
-        let shim_dst = lkg_dir.join(SHIM_EXE_FILENAME);
-        let shim_tmp = lkg_dir.join(format!("{}.tmp.{}", SHIM_EXE_FILENAME, slot.id));
-        let shim_result: Result<(), String> = if !shim_src.exists() {
-            Err(format!("{:?} not found next to the slot exe", shim_src))
-        } else {
-            let _ = std::fs::remove_file(&shim_tmp);
-            std::fs::copy(&shim_src, &shim_tmp)
-                .map_err(|e| format!("copy {:?} -> {:?}: {}", shim_src, shim_tmp, e))
-                .and_then(|_| {
-                    std::fs::rename(&shim_tmp, &shim_dst)
-                        .map_err(|e| format!("rename {:?} -> {:?}: {}", shim_tmp, shim_dst, e))
-                })
-        };
-        if let Err(detail) = shim_result {
-            let _ = std::fs::remove_file(&shim_tmp);
+    // Carry every roster sidecar into the LKG dir alongside the exe (same
+    // tmp+rename dance) so an LKG-pinned start (spawn-test {use_lkg: true})
+    // deploys helpers that match the LKG exe, not whatever stale ones sit in
+    // `target/debug/`. See [`SHIM_EXE_FILENAME`] for the placement contract.
+    // Fail-open: the exe promotion above already succeeded; a missing,
+    // zero-length or uncopyable sidecar logs one WARN naming it and never
+    // fails the build.
+    for sidecar in RUNNER_SIDECARS.iter() {
+        if let Err(detail) =
+            carry_sidecar_into_lkg(&source_exe, &lkg_dir, sidecar.filename, slot.id)
+        {
             let msg = format!(
-                "LKG shim sidecar capture failed (slot {}) — identity shims will be stale \
-                 on LKG-pinned starts until a rebuild refreshes {:?}: {}",
-                slot.id, shim_dst, detail
+                "LKG {} sidecar capture failed (slot {}) — {} on LKG-pinned starts until a \
+                 rebuild refreshes {:?}: {}",
+                sidecar.bin,
+                slot.id,
+                sidecar.consequence,
+                lkg_dir.join(sidecar.filename),
+                detail
             );
             warn!("{}", msg);
             state.logs.emit(LogSource::Build, LogLevel::Warn, msg).await;
@@ -4339,1402 +5353,4 @@ async fn update_lkg_after_success(
 }
 
 #[cfg(test)]
-mod tests {
-    //! Regression tests for the post-`npm exit 0` defense-in-depth `dist/`
-    //! sanity gate. See `supervisor-frontend-build-silent-success.md` for
-    //! the bug these guard against.
-    use super::{
-        artifact_progress_probe, build_timeout_reason, classify_build_stderr,
-        dep_hash_sidecar_path, dep_install_reason, dep_manifest_hash, dist_index_ok,
-        merge_process_output, needs_frontend_prebuild, provenance_tree_root,
-        provenance_warn_target, resolve_provenance_head, rev_parse_head, should_self_heal_slot,
-        stderr_submission_tail, update_lkg_after_success, verify_frontend_built, BuildPhase,
-        BuildProvenance, BuildSource, BuildSourceKind, StderrClass,
-        LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES,
-    };
-    use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-    use crate::error::SupervisorError;
-    use crate::process::guarded_command::TimeoutKind;
-    use crate::state::{SharedState, SupervisorState};
-    use std::fs;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    // ---------------------------------------------------------------
-    // External-volume fail-closed guard — plan
-    // `2026-08-07-external-storage-tiering-for-fleet-disk-pressure`,
-    // Phase 5. Every case runs with NO dock attached and no filesystem
-    // access; that is the point, since the plan's HW-ABSENT branch must
-    // be fully verifiable on a box with no external drive.
-    // ---------------------------------------------------------------
-    use super::{disk_guard_allows, disk_guard_allows_for};
-    use crate::external_volume::ExternalVolumeState;
-    use std::path::Path;
-
-    const GB: u64 = 1024 * 1024 * 1024;
-    const POOL: &str = "D:/qontinui-ext/target-pool";
-
-    #[test]
-    fn no_declaration_means_byte_identical_to_the_old_guard() {
-        // The shipping guarantee: on a machine with no external volume,
-        // `disk_guard_allows_for` must agree with `disk_guard_allows` on
-        // every input, including the fail-open None.
-        let pool = Path::new("D:/qontinui-root/qontinui-runner/target-pool");
-        for free in [None, Some(0), Some(29 * GB), Some(30 * GB), Some(900 * GB)] {
-            for floor in [0u64, 30] {
-                let old = disk_guard_allows(free, floor);
-                let new = disk_guard_allows_for(free, floor, None, pool).is_ok();
-                assert_eq!(old, new, "divergence at free={free:?} floor={floor}");
-            }
-        }
-    }
-
-    #[test]
-    fn external_path_with_unresolvable_probe_refuses() {
-        // The inversion. Internally this same input proceeds (asserted
-        // in the equivalence test above).
-        let err = disk_guard_allows_for(
-            None,
-            30,
-            Some(&ExternalVolumeState::Present),
-            Path::new(POOL),
-        )
-        .expect_err("an unresolvable probe on an external volume must refuse");
-        assert!(err.contains("EXTERNAL"), "reason was: {err}");
-        assert!(err.contains("fails CLOSED"), "reason was: {err}");
-    }
-
-    #[test]
-    fn absent_external_volume_refuses_despite_ample_free_space() {
-        // 3.9 TB "free" — on the un-mounted stub, i.e. on the internal disk
-        // this plan exists to protect. Free space is the wrong question.
-        let err = disk_guard_allows_for(
-            Some(3900 * GB),
-            30,
-            Some(&ExternalVolumeState::Absent),
-            Path::new(POOL),
-        )
-        .expect_err("an absent external volume must refuse even with free space");
-        assert!(err.contains("NOT mounted"), "reason was: {err}");
-    }
-
-    #[test]
-    fn mismatched_external_volume_refuses_and_does_not_read_as_a_disconnect() {
-        let err = disk_guard_allows_for(
-            Some(3900 * GB),
-            30,
-            Some(&ExternalVolumeState::Mismatched {
-                expected: "{d913fcde}".into(),
-                found: "{ffffffff}".into(),
-            }),
-            Path::new(POOL),
-        )
-        .expect_err("a wrong volume must refuse");
-        assert!(err.contains("WRONG volume"), "reason was: {err}");
-        assert!(
-            !err.contains("NOT mounted"),
-            "an operator told 'not mounted' will plug the drive in, which is not the fix: {err}"
-        );
-    }
-
-    #[test]
-    fn present_external_volume_above_the_floor_proceeds() {
-        assert!(disk_guard_allows_for(
-            Some(3900 * GB),
-            30,
-            Some(&ExternalVolumeState::Present),
-            Path::new(POOL)
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn the_floor_still_bites_on_a_present_external_volume() {
-        let err = disk_guard_allows_for(
-            Some(GB),
-            30,
-            Some(&ExternalVolumeState::Present),
-            Path::new(POOL),
-        )
-        .expect_err("1 GB is below the 30 GB floor");
-        assert!(err.contains("need at least 30 GB"), "reason was: {err}");
-    }
-
-    #[test]
-    fn disabling_the_guard_still_disables_it_on_an_external_volume() {
-        // `min_free_gb == 0` is the operator's off switch. Silently
-        // re-arming it for external paths would make one setting mean two
-        // different things depending on where the pool happens to live.
-        assert!(disk_guard_allows_for(
-            None,
-            0,
-            Some(&ExternalVolumeState::Absent),
-            Path::new(POOL)
-        )
-        .is_ok());
-    }
-
-    /// `queue_timeout_secs` may bound ONLY the phases in which the request is
-    /// blocked on a lock. Once the build is doing work, the clock must stop —
-    /// otherwise a small queue bound 504s an already-compiling slot and throws
-    /// away the compile.
-    #[test]
-    fn only_lock_waits_count_as_queue_time() {
-        assert!(BuildPhase::AwaitingSlot.is_queue_wait());
-        assert!(BuildPhase::AwaitingNpmLock.is_queue_wait());
-        assert!(
-            !BuildPhase::BuildingFrontend.is_queue_wait(),
-            "a running pnpm build is WORK, not queue time"
-        );
-        assert!(
-            !BuildPhase::Compiling.is_queue_wait(),
-            "a running cargo build is WORK, not queue time — this is the arm whose \
-             timeout abandoned live compiles"
-        );
-    }
-
-    /// A timeout must never trigger the poisoned-slot self-heal: wiping the
-    /// slot's target dir guarantees the retry starts cold, which is the loop
-    /// that made the build lane unrecoverable.
-    #[test]
-    fn timeouts_never_wipe_the_slot_cache() {
-        let timeout = SupervisorError::Timeout("no progress for 1200s".into());
-        assert!(
-            !should_self_heal_slot(&timeout, StderrClass::Environmental),
-            "a timed-out build classifies Environmental (no compiler diagnostic) — but its \
-             incremental cache is good and must be kept"
-        );
-        assert!(!should_self_heal_slot(
-            &timeout,
-            StderrClass::CompilerDiagnostic
-        ));
-        // Non-timeout failures keep the original rule.
-        let other = SupervisorError::Process("linker died".into());
-        assert!(should_self_heal_slot(&other, StderrClass::Environmental));
-        assert!(!should_self_heal_slot(
-            &other,
-            StderrClass::CompilerDiagnostic
-        ));
-    }
-
-    /// A killed build must say WHICH budget killed it — "no progress for N s"
-    /// is a diagnosis; the old "timed out after 5400s" was emitted for a build
-    /// that was actively compiling and said nothing.
-    #[test]
-    fn timeout_reason_names_the_budget_that_fired() {
-        let no_progress = build_timeout_reason(
-            Duration::from_secs(1500),
-            TimeoutKind::NoProgress {
-                idle: Duration::from_secs(1200),
-            },
-        );
-        assert!(
-            no_progress.contains("no-progress watchdog"),
-            "{no_progress}"
-        );
-        assert!(no_progress.contains("1200s"), "{no_progress}");
-        assert!(
-            no_progress.contains("NOT making progress"),
-            "the operator must be told the build was genuinely stuck: {no_progress}"
-        );
-
-        let absolute = build_timeout_reason(Duration::from_secs(21600), TimeoutKind::Absolute);
-        assert!(absolute.contains("absolute backstop"), "{absolute}");
-        assert!(
-            absolute.contains("NOT a stuck build"),
-            "a ceiling hit must not be reported as stuckness: {absolute}"
-        );
-        assert!(
-            absolute.contains(crate::config::BUILD_ABSOLUTE_TIMEOUT_SECS_ENV),
-            "the message must name the knob to raise: {absolute}"
-        );
-    }
-
-    /// The artifact probe must move when something is written under the slot's
-    /// target dir — that is the signal that keeps a silent multi-minute rustc
-    /// from being read as wedged.
-    #[test]
-    fn artifact_probe_moves_when_the_target_dir_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = dir.path().join("slot-0");
-        std::fs::create_dir_all(target.join("debug").join("deps")).unwrap();
-        let probe = artifact_progress_probe(&target);
-        let before = probe();
-        // mtimes have 1s granularity on some filesystems; make the write
-        // unambiguously later.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        std::fs::write(target.join("debug").join("deps").join("x.rcgu.o"), b"obj").unwrap();
-        let after = probe();
-        assert_ne!(
-            before, after,
-            "writing an artifact under debug/deps must register as progress"
-        );
-    }
-
-    /// The phase marker must round-trip through `as_u8`/`from_u8` and produce a
-    /// phase-accurate queue-timeout message for each phase. This guards the
-    /// attribution against regression with no live build (plan
-    /// 2026-06-13-spawn-test-queue-timeout-attribution Verification).
-    #[test]
-    fn build_phase_round_trips_and_maps_to_message() {
-        for phase in [
-            BuildPhase::AwaitingSlot,
-            BuildPhase::AwaitingNpmLock,
-            BuildPhase::BuildingFrontend,
-            BuildPhase::Compiling,
-        ] {
-            // u8 round-trip.
-            assert_eq!(BuildPhase::from_u8(phase.as_u8()), phase);
-        }
-
-        // AwaitingSlot is the only phase whose message names a cargo build slot
-        // (the genuine slot wait). Permit count is irrelevant here.
-        let slot_msg = BuildPhase::AwaitingSlot.timeout_message(30, 3);
-        assert!(slot_msg.contains("cargo build slot"), "{slot_msg}");
-        assert!(slot_msg.contains("30s"), "{slot_msg}");
-
-        // AwaitingNpmLock attributes the wait to the frontend lock and reports
-        // the free cargo permits — the exact mis-attributed starvation case.
-        let npm_msg = BuildPhase::AwaitingNpmLock.timeout_message(30, 3);
-        assert!(npm_msg.contains("frontend (pnpm) lock"), "{npm_msg}");
-        assert!(npm_msg.contains("3 cargo permits free"), "{npm_msg}");
-        assert!(
-            !npm_msg.contains("build slot"),
-            "npm-lock message must NOT claim a slot wait: {npm_msg}"
-        );
-
-        // BuildingFrontend names the frontend build, still reporting free permits.
-        let fe_msg = BuildPhase::BuildingFrontend.timeout_message(45, 2);
-        assert!(fe_msg.contains("frontend (pnpm) build"), "{fe_msg}");
-        assert!(fe_msg.contains("2 cargo permits free"), "{fe_msg}");
-        assert!(!fe_msg.contains("build slot"), "{fe_msg}");
-
-        // Compiling makes clear the slot was already held (not a slot wait).
-        let compile_msg = BuildPhase::Compiling.timeout_message(60, 0);
-        assert!(compile_msg.contains("compiling (cargo)"), "{compile_msg}");
-        assert!(
-            !compile_msg.contains("for a cargo build slot"),
-            "{compile_msg}"
-        );
-    }
-
-    /// An out-of-range marker value decodes to the conservative `AwaitingSlot`
-    /// default (an attempt that never advanced the marker reads as the initial
-    /// slot wait, not a panic).
-    #[test]
-    fn build_phase_from_u8_out_of_range_defaults_to_awaiting_slot() {
-        assert_eq!(BuildPhase::from_u8(7), BuildPhase::AwaitingSlot);
-        assert_eq!(BuildPhase::from_u8(255), BuildPhase::AwaitingSlot);
-    }
-
-    /// `git init` a real repo at `dir` with one commit, returning its HEAD SHA.
-    /// Mirrors the temp-repo fixture pattern in `spawn_worktree.rs` tests.
-    fn init_git_repo_one_commit(dir: &std::path::Path, seed_name: &str) -> String {
-        let run = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(dir)
-                .output()
-                .expect("spawn git");
-            assert!(
-                out.status.success(),
-                "git {:?} failed: {}",
-                args,
-                String::from_utf8_lossy(&out.stderr)
-            );
-            out
-        };
-        run(&["init", "-q", "-b", "main"]);
-        run(&["config", "user.email", "test@example.com"]);
-        run(&["config", "user.name", "test"]);
-        fs::write(dir.join(seed_name), seed_name.as_bytes()).expect("seed");
-        run(&["add", "-A"]);
-        run(&["commit", "-q", "-m", "initial"]);
-        let head = run(&["rev-parse", "HEAD"]);
-        String::from_utf8_lossy(&head.stdout).trim().to_string()
-    }
-
-    /// `provenance_tree_root` selects `.parent()` of the live `project_dir`
-    /// when there's no override. (Source classification is no longer the
-    /// function's job — it comes from `BuildSourceKind`.)
-    #[test]
-    fn provenance_tree_root_live_tree() {
-        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
-        let root = provenance_tree_root(project_dir, None);
-        assert_eq!(root, std::path::Path::new("/ws/qontinui-runner"));
-    }
-
-    /// `provenance_tree_root` selects `.parent()` of the OVERRIDE src-tauri,
-    /// ignoring `project_dir` entirely.
-    #[test]
-    fn provenance_tree_root_override() {
-        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
-        let over = std::path::Path::new("/ws/.spawn-feat/qontinui-runner/src-tauri");
-        let root = provenance_tree_root(project_dir, Some(over));
-        assert_eq!(
-            root,
-            std::path::Path::new("/ws/.spawn-feat/qontinui-runner")
-        );
-    }
-
-    /// The motivating-incident guard: with two distinct git repos (the "live"
-    /// tree and an "override" worktree at a DIFFERENT HEAD), the SHA probed for
-    /// an override build is the OVERRIDE tree's HEAD, not the live tree's.
-    #[tokio::test]
-    async fn override_build_probes_override_tree_sha_not_live() {
-        let base = TempDir::new().expect("tempdir");
-
-        // Live tree: <base>/live/qontinui-runner with src-tauri.
-        let live_root = base.path().join("live").join("qontinui-runner");
-        let live_src_tauri = live_root.join("src-tauri");
-        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
-        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
-
-        // Override tree: <base>/override/qontinui-runner with src-tauri, a
-        // DIFFERENT repo with a different HEAD.
-        let over_root = base.path().join("override").join("qontinui-runner");
-        let over_src_tauri = over_root.join("src-tauri");
-        fs::create_dir_all(&over_src_tauri).expect("mkdir override");
-        let over_sha = init_git_repo_one_commit(&over_root, "override-seed");
-
-        assert_ne!(live_sha, over_sha, "fixture must produce distinct HEADs");
-
-        // Live-tree selection probes the live tree's HEAD.
-        let live_probe_root = provenance_tree_root(&live_src_tauri, None);
-        assert_eq!(
-            rev_parse_head(&live_probe_root).await,
-            Some(live_sha.clone())
-        );
-
-        // Override selection probes the OVERRIDE tree's HEAD — the bug fix.
-        let over_probe_root = provenance_tree_root(&live_src_tauri, Some(over_src_tauri.as_path()));
-        assert_eq!(
-            rev_parse_head(&over_probe_root).await,
-            Some(over_sha.clone()),
-            "override build must record the override tree's sha, not the live tree's"
-        );
-        assert_ne!(
-            rev_parse_head(&over_probe_root).await,
-            Some(live_sha),
-            "override probe must NOT return the live tree's sha"
-        );
-    }
-
-    /// REGRESSION (iteration-2): the pre-cargo provenance WARNING must describe
-    /// the tree that is actually compiled.
-    ///
-    /// The warning names a specific sha and asserts "This build compiles X, NOT
-    /// main". It used to read `project_dir.parent()` unconditionally, so an
-    /// override build emitted the CANONICAL checkout's HEAD and branch — a
-    /// confidently wrong claim, for a build whose recorded `build_sha` was (and
-    /// still is) the override's. This pins the selection to the built tree.
-    #[test]
-    fn provenance_warn_target_names_the_built_tree_not_the_canonical_checkout() {
-        let project_dir = std::path::Path::new("/ws/qontinui-runner/src-tauri");
-        let over = std::path::Path::new("/wt/mtl-iter1/qontinui-runner/src-tauri");
-
-        // Live tree: the canonical checkout, no known sha, not an override.
-        let live = provenance_warn_target(project_dir, None, &BuildSourceKind::LiveTree);
-        assert_eq!(live.root, std::path::Path::new("/ws/qontinui-runner"));
-        assert!(!live.is_override);
-        assert_eq!(live.known_sha, None);
-
-        // Foreign override (`worktree_path` / non-main `git_ref`): the OVERRIDE
-        // tree, flagged as an override so an unresolvable probe renders UNKNOWN.
-        let ovr = provenance_warn_target(project_dir, Some(over), &BuildSourceKind::Override);
-        assert_eq!(
-            ovr.root,
-            std::path::Path::new("/wt/mtl-iter1/qontinui-runner"),
-            "an override build's provenance must come from the override tree"
-        );
-        assert_ne!(
-            ovr.root,
-            std::path::Path::new("/ws/qontinui-runner"),
-            "it must NOT come from the canonical checkout"
-        );
-        assert!(ovr.is_override);
-        assert_eq!(ovr.known_sha, None);
-
-        // Supervisor-materialized origin/main worktree: the worktree root, with
-        // the resolved sha carried through rather than re-probed.
-        let om = provenance_warn_target(
-            project_dir,
-            Some(over),
-            &BuildSourceKind::OriginMain {
-                resolved_sha: "abc123".to_string(),
-            },
-        );
-        assert_eq!(
-            om.root,
-            std::path::Path::new("/wt/mtl-iter1/qontinui-runner")
-        );
-        assert!(!om.is_override);
-        assert_eq!(om.known_sha.as_deref(), Some("abc123"));
-
-        // The warn target and the RECORDED provenance must always name the same
-        // tree — they are two reports of one fact.
-        for (over_opt, kind) in [
-            (None, BuildSourceKind::LiveTree),
-            (Some(over), BuildSourceKind::Override),
-        ] {
-            assert_eq!(
-                provenance_warn_target(project_dir, over_opt, &kind).root,
-                provenance_tree_root(project_dir, over_opt),
-                "warn target must not drift from compute_build_provenance's root"
-            );
-        }
-    }
-
-    /// The same guard end-to-end over real git: given an override build root,
-    /// the HEAD the warning reports is the OVERRIDE's, never the canonical
-    /// checkout's. Two unrelated repos at different HEADs, so a wrong-tree read
-    /// cannot coincidentally pass.
-    #[tokio::test]
-    async fn provenance_warn_head_is_the_override_trees_not_the_canonical_checkouts() {
-        let base = TempDir::new().expect("tempdir");
-
-        let live_root = base.path().join("live").join("qontinui-runner");
-        let live_src_tauri = live_root.join("src-tauri");
-        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
-        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
-
-        let over_root = base.path().join("override").join("qontinui-runner");
-        let over_src_tauri = over_root.join("src-tauri");
-        fs::create_dir_all(&over_src_tauri).expect("mkdir override");
-        let over_sha = init_git_repo_one_commit(&over_root, "override-seed");
-        assert_ne!(live_sha, over_sha, "fixture must produce distinct HEADs");
-
-        let live_target = provenance_warn_target(&live_src_tauri, None, &BuildSourceKind::LiveTree);
-        assert_eq!(
-            resolve_provenance_head(&live_target).await,
-            Some(live_sha.clone())
-        );
-
-        let over_target = provenance_warn_target(
-            &live_src_tauri,
-            Some(over_src_tauri.as_path()),
-            &BuildSourceKind::Override,
-        );
-        let reported = resolve_provenance_head(&over_target).await;
-        assert_eq!(
-            reported,
-            Some(over_sha),
-            "the warning must report the override tree's HEAD"
-        );
-        assert_ne!(
-            reported,
-            Some(live_sha),
-            "reporting the canonical checkout's HEAD is the defect this pins"
-        );
-
-        // An origin/main worktree's sha is carried, not re-probed — so it is
-        // reported even though the fixture dir is not that worktree.
-        let om_target = provenance_warn_target(
-            &live_src_tauri,
-            Some(over_src_tauri.as_path()),
-            &BuildSourceKind::OriginMain {
-                resolved_sha: "0123456789abcdef".to_string(),
-            },
-        );
-        assert_eq!(
-            resolve_provenance_head(&om_target).await.as_deref(),
-            Some("0123456789abcdef")
-        );
-    }
-
-    /// A `worktree_path` need not be a git checkout at all. The provenance then
-    /// cannot be established — and must render UNKNOWN (no sha) rather than
-    /// falling back to some other tree's confident default.
-    #[tokio::test]
-    async fn provenance_warn_head_is_unknown_for_a_non_git_override_tree() {
-        let base = TempDir::new().expect("tempdir");
-
-        let live_root = base.path().join("live").join("qontinui-runner");
-        let live_src_tauri = live_root.join("src-tauri");
-        fs::create_dir_all(&live_src_tauri).expect("mkdir live");
-        let live_sha = init_git_repo_one_commit(&live_root, "live-seed");
-
-        // Plain directories — no `git init`.
-        let over_src_tauri = base
-            .path()
-            .join("plain")
-            .join("qontinui-runner")
-            .join("src-tauri");
-        fs::create_dir_all(&over_src_tauri).expect("mkdir plain");
-
-        let target = provenance_warn_target(
-            &live_src_tauri,
-            Some(over_src_tauri.as_path()),
-            &BuildSourceKind::Override,
-        );
-        assert!(target.is_override, "an override must be flagged as one");
-        let head = resolve_provenance_head(&target).await;
-        assert_ne!(
-            head,
-            Some(live_sha),
-            "an unresolvable override must NEVER borrow the canonical checkout's sha"
-        );
-        assert_eq!(
-            head, None,
-            "unresolvable provenance is UNKNOWN, not a default"
-        );
-    }
-
-    /// Filename of the pnpm bin stub. `.cmd` on Windows (where pnpm installs
-    /// `.bin/<tool>.cmd` shims), bare elsewhere. Mirrors the platform check
-    /// inside [`needs_frontend_prebuild`].
-    fn ui_bridge_build_ir_bin() -> &'static str {
-        if cfg!(windows) {
-            "ui-bridge-build-ir.cmd"
-        } else {
-            "ui-bridge-build-ir"
-        }
-    }
-
-    #[test]
-    fn needs_frontend_prebuild_true_when_node_modules_and_dist_absent() {
-        // Simulates a fresh `git worktree add --detach` — nothing in the
-        // workspace, no prior frontend build. Must trigger the prebuild.
-        let tmp = TempDir::new().expect("tempdir");
-        assert!(
-            needs_frontend_prebuild(tmp.path()),
-            "fresh worktree (no node_modules + no dist/) must require prebuild"
-        );
-    }
-
-    #[test]
-    fn needs_frontend_prebuild_true_when_only_node_modules_present() {
-        // Half-installed state — pnpm install succeeded but the previous
-        // `pnpm run build` never ran or failed. We should NOT skip the
-        // prebuild because dist/index.html is what cargo embeds.
-        let tmp = TempDir::new().expect("tempdir");
-        let bin_dir = tmp.path().join("node_modules").join(".bin");
-        fs::create_dir_all(&bin_dir).expect("mkdir bin");
-        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
-        assert!(
-            needs_frontend_prebuild(tmp.path()),
-            "node_modules present but no dist/index.html must still require prebuild"
-        );
-    }
-
-    #[test]
-    fn needs_frontend_prebuild_true_when_only_dist_present() {
-        // Inverse half-installed state — somehow dist/ exists but
-        // node_modules is gone (e.g. someone ran `rm -rf node_modules`
-        // between sessions). Must re-prebuild because `pnpm run build`
-        // can't run without the dep tree.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(dist.join("index.html"), b"<!doctype html>").expect("write index");
-        assert!(
-            needs_frontend_prebuild(tmp.path()),
-            "dist/ present but no node_modules must still require prebuild"
-        );
-    }
-
-    #[test]
-    fn needs_frontend_prebuild_false_when_both_present() {
-        // Idempotency gate — both signals say a prior prebuild succeeded
-        // and we should reuse it. This is the path that saves ~30s per
-        // repeated spawn-test on the same ref.
-        let tmp = TempDir::new().expect("tempdir");
-        let bin_dir = tmp.path().join("node_modules").join(".bin");
-        fs::create_dir_all(&bin_dir).expect("mkdir bin");
-        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(dist.join("index.html"), b"<!doctype html>").expect("write index");
-        assert!(
-            !needs_frontend_prebuild(tmp.path()),
-            "fully populated worktree must skip prebuild (idempotent reuse)"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // S1 — dep-install FRESHNESS gate (lockfile-hash sidecar)
-    //
-    // Regression class: a reused `.spawn-<ref>` container force-reset to a new
-    // ref keeps its `node_modules/` from the PREVIOUS ref. The old
-    // presence-gated check ("does node_modules/.bin/ui-bridge-build-ir exist?")
-    // said "skip install", so the new ref's TypeScript compiled against the old
-    // ref's dependency tree and produced a phantom `TS2339` that looked exactly
-    // like a red origin/main.
-    // -----------------------------------------------------------------------
-
-    /// Populate `wt_root` as an "already installed" worktree: the pnpm bin
-    /// marker + a lockfile + a package.json with the given contents.
-    fn seed_installed_worktree(wt_root: &std::path::Path, lockfile: &str, package_json: &str) {
-        let bin_dir = wt_root.join("node_modules").join(".bin");
-        fs::create_dir_all(&bin_dir).expect("mkdir node_modules/.bin");
-        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
-        fs::write(wt_root.join("pnpm-lock.yaml"), lockfile).expect("write lockfile");
-        fs::write(wt_root.join("package.json"), package_json).expect("write package.json");
-    }
-
-    /// Simulate what a successful `pnpm install` leaves behind: the sidecar
-    /// recording the dep-manifest hash AT THAT MOMENT. (The async
-    /// `write_dep_hash_sidecar` needs a live `SharedState`; the file it writes
-    /// is exactly this, so the pure gate is driven directly.)
-    fn stamp_dep_hash_sidecar(wt_root: &std::path::Path) {
-        let hash = dep_manifest_hash(wt_root).expect("fixture has manifests");
-        fs::write(dep_hash_sidecar_path(wt_root), hash).expect("write sidecar");
-    }
-
-    #[test]
-    fn dep_install_reason_none_when_lockfile_unchanged() {
-        // THE skip case: same container, same ref, deps untouched since the
-        // last successful install. Must NOT re-pay the ~30s install.
-        let tmp = TempDir::new().expect("tempdir");
-        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
-        stamp_dep_hash_sidecar(tmp.path());
-
-        assert!(
-            dep_install_reason(tmp.path()).is_none(),
-            "unchanged lockfile + present marker + matching sidecar must SKIP install"
-        );
-    }
-
-    #[test]
-    fn dep_install_reason_some_when_lockfile_changed() {
-        // THE regression: container reused across a ref whose deps moved
-        // (`@qontinui/navigation` 0.1.5 → ^0.2.0). `node_modules` and its
-        // marker are still there — only the lockfile content changed — so the
-        // old presence gate skipped and built against stale deps.
-        let tmp = TempDir::new().expect("tempdir");
-        seed_installed_worktree(
-            tmp.path(),
-            "lockfileVersion: 9\n  '@qontinui/navigation': 0.1.5\n",
-            r#"{"dependencies":{"@qontinui/navigation":"^0.1.0"}}"#,
-        );
-        stamp_dep_hash_sidecar(tmp.path());
-        assert!(
-            dep_install_reason(tmp.path()).is_none(),
-            "precondition: the seeded state must be considered fresh"
-        );
-
-        // The container is force-reset to a ref with different deps. Only the
-        // lockfile/package.json change on disk — node_modules is untouched.
-        fs::write(
-            tmp.path().join("pnpm-lock.yaml"),
-            "lockfileVersion: 9\n  '@qontinui/navigation': 0.2.0\n",
-        )
-        .expect("rewrite lockfile");
-
-        let reason = dep_install_reason(tmp.path())
-            .expect("a changed lockfile MUST force a reinstall, not a stale-node_modules build");
-        assert!(
-            reason.contains("CHANGED") && reason.contains("STALE"),
-            "reason must name the staleness so the log is self-explaining; got: {}",
-            reason
-        );
-    }
-
-    #[test]
-    fn dep_install_reason_some_when_package_json_changed_but_lockfile_stale() {
-        // A dep pin bumped in package.json without the lockfile regenerated
-        // still disagrees with the installed tree (and `--frozen-lockfile`
-        // would reject it). Hashing package.json too catches this.
-        let tmp = TempDir::new().expect("tempdir");
-        seed_installed_worktree(
-            tmp.path(),
-            "lockfileVersion: 9\n",
-            r#"{"dependencies":{"@qontinui/navigation":"^0.1.0"}}"#,
-        );
-        stamp_dep_hash_sidecar(tmp.path());
-
-        fs::write(
-            tmp.path().join("package.json"),
-            r#"{"dependencies":{"@qontinui/navigation":"^0.2.0"}}"#,
-        )
-        .expect("rewrite package.json");
-
-        assert!(
-            dep_install_reason(tmp.path()).is_some(),
-            "a package.json dep change must force a reinstall"
-        );
-    }
-
-    #[test]
-    fn dep_install_reason_some_when_sidecar_absent() {
-        // Pre-existing containers (installed before this gate shipped) have
-        // node_modules but no sidecar. Provenance unknown ⇒ must NOT be trusted.
-        let tmp = TempDir::new().expect("tempdir");
-        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
-        // deliberately no stamp
-
-        let reason = dep_install_reason(tmp.path())
-            .expect("absent sidecar means unknown node_modules provenance ⇒ reinstall");
-        assert!(
-            reason.contains("absent"),
-            "reason must say the sidecar is absent; got: {}",
-            reason
-        );
-    }
-
-    #[test]
-    fn dep_install_reason_some_when_marker_absent_even_if_sidecar_matches() {
-        // Someone `rm -rf node_modules/.bin` (or a half-install). A surviving
-        // sidecar must never vouch for a tree that isn't installed — the marker
-        // check is checked FIRST for exactly this reason.
-        let tmp = TempDir::new().expect("tempdir");
-        seed_installed_worktree(tmp.path(), "lockfileVersion: 9\n", r#"{"name":"r"}"#);
-        stamp_dep_hash_sidecar(tmp.path());
-        fs::remove_file(
-            tmp.path()
-                .join("node_modules")
-                .join(".bin")
-                .join(ui_bridge_build_ir_bin()),
-        )
-        .expect("remove marker");
-
-        let reason =
-            dep_install_reason(tmp.path()).expect("missing install marker must force a reinstall");
-        assert!(
-            reason.contains("marker"),
-            "reason must name the missing marker; got: {}",
-            reason
-        );
-    }
-
-    #[test]
-    fn dep_install_reason_none_when_no_manifests_at_all() {
-        // Not a JS project: nothing governs an install, and running one would
-        // just fail. Degrade to the legacy marker-presence outcome.
-        let tmp = TempDir::new().expect("tempdir");
-        let bin_dir = tmp.path().join("node_modules").join(".bin");
-        fs::create_dir_all(&bin_dir).expect("mkdir bin");
-        fs::write(bin_dir.join(ui_bridge_build_ir_bin()), b"stub").expect("write bin stub");
-
-        assert!(dep_manifest_hash(tmp.path()).is_none());
-        assert!(
-            dep_install_reason(tmp.path()).is_none(),
-            "no manifests + marker present must preserve the legacy skip"
-        );
-    }
-
-    #[test]
-    fn dep_manifest_hash_is_stable_and_content_sensitive() {
-        let tmp = TempDir::new().expect("tempdir");
-        fs::write(tmp.path().join("pnpm-lock.yaml"), "a").expect("w");
-        fs::write(tmp.path().join("package.json"), "b").expect("w");
-        let h1 = dep_manifest_hash(tmp.path()).expect("hash");
-        let h2 = dep_manifest_hash(tmp.path()).expect("hash");
-        assert_eq!(h1, h2, "hash must be deterministic for identical bytes");
-
-        // Removing a lockfile must change the hash (absence is hashed, so a
-        // present→absent flip cannot be mistaken for "unchanged").
-        fs::remove_file(tmp.path().join("pnpm-lock.yaml")).expect("rm");
-        let h3 = dep_manifest_hash(tmp.path()).expect("hash");
-        assert_ne!(h1, h3, "removing the lockfile must change the hash");
-
-        // Swapping content between the two files must not collide (name +
-        // length are mixed in ahead of the bytes).
-        fs::write(tmp.path().join("pnpm-lock.yaml"), "b").expect("w");
-        fs::write(tmp.path().join("package.json"), "a").expect("w");
-        let h4 = dep_manifest_hash(tmp.path()).expect("hash");
-        assert_ne!(h1, h4, "content swap across manifests must not collide");
-    }
-
-    // -----------------------------------------------------------------------
-    // S2 — a frontend failure must carry the COMPILER error (tsc writes to
-    // stdout; the legacy capture read stderr only and came back empty).
-    // -----------------------------------------------------------------------
-
-    /// Build a fake finished-process Output with the given streams.
-    fn fake_output(stdout: &str, stderr: &str) -> std::process::Output {
-        std::process::Output {
-            // Status is irrelevant to the merge; take a default failure-ish one.
-            status: Default::default(),
-            stdout: stdout.as_bytes().to_vec(),
-            stderr: stderr.as_bytes().to_vec(),
-        }
-    }
-
-    #[test]
-    fn merge_process_output_keeps_tsc_errors_from_stdout() {
-        // The exact shape of the P0: tsc puts `error TS2339` on stdout and
-        // leaves stderr EMPTY. Reading stderr alone yields "" — a failed build
-        // with no visible reason.
-        let out = fake_output(
-            "src/nav.tsx(12,7): error TS2339: Property 'hasOwnPage' does not exist on type 'NavigationItem'.\n",
-            "",
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).is_empty(),
-            "fixture premise: stderr is empty"
-        );
-
-        let merged = merge_process_output(&out);
-        assert!(
-            merged.contains("error TS2339"),
-            "merged output MUST carry the tsc error from stdout; got: {:?}",
-            merged
-        );
-        assert!(merged.contains("--- stdout ---"));
-        assert!(
-            !merged.contains("--- stderr ---"),
-            "an empty stream must not add an empty labelled section"
-        );
-    }
-
-    #[test]
-    fn merge_process_output_keeps_both_streams() {
-        let merged = merge_process_output(&fake_output("OUT-LINE", "ERR-LINE"));
-        assert!(merged.contains("OUT-LINE") && merged.contains("ERR-LINE"));
-        assert!(merged.contains("--- stdout ---") && merged.contains("--- stderr ---"));
-    }
-
-    #[test]
-    fn merge_process_output_empty_when_both_streams_empty() {
-        assert!(merge_process_output(&fake_output("", "")).is_empty());
-    }
-
-    #[test]
-    fn verify_frontend_built_err_when_index_missing() {
-        // Simulates the empirical 2026-05-21 failure mode: npm exit 0 but
-        // dist/index.html still missing. Must surface a clear error
-        // mentioning the missing artifact so the user can correlate it
-        // with the eventual `tauri::generate_context!` panic.
-        let tmp = TempDir::new().expect("tempdir");
-        let res = verify_frontend_built(tmp.path());
-        let err = res.expect_err("missing dist/index.html must error");
-        let s = err.to_string();
-        assert!(
-            s.contains("dist") && s.contains("index.html"),
-            "error must name the missing artifact (dist/index.html); got: {}",
-            s
-        );
-    }
-
-    #[test]
-    fn verify_frontend_built_err_when_index_empty() {
-        // Pathological case carried over from the legacy safari13
-        // regression: vite exits 0 having written zero bytes. Cargo would
-        // embed an empty index.html and the runner would render a blank
-        // page. Surface as an error too.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(dist.join("index.html"), b"").expect("write empty index");
-        let res = verify_frontend_built(tmp.path());
-        let err = res.expect_err("empty dist/index.html must error");
-        let s = err.to_string();
-        assert!(
-            s.contains("dist") && s.contains("index.html"),
-            "error must name the empty artifact (dist/index.html); got: {}",
-            s
-        );
-    }
-
-    #[test]
-    fn verify_frontend_built_ok_when_index_present_and_nonempty() {
-        // Happy path — a real npm build wrote every required dist artifact.
-        // NOTE: build-id.txt is required as of the build-id-banner plan; a
-        // dist carrying index.html alone is NOT a complete build.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(
-            dist.join("index.html"),
-            b"<!doctype html><html><body>ok</body></html>",
-        )
-        .expect("write index");
-        fs::write(dist.join("build-id.txt"), b"abc123-1785101162102").expect("write build-id");
-        verify_frontend_built(tmp.path()).expect("a complete dist must verify clean");
-    }
-
-    #[test]
-    fn verify_frontend_built_err_when_build_id_missing() {
-        // The regression this plan exists for: vite had not yet written
-        // dist/build-id.txt when cargo was handed the tree, so build.rs took
-        // its invent-a-timestamp fallback and froze a meta-tag/env mismatch
-        // into the binary permanently (2026-07-26, plan
-        // 2026-07-28-runner-build-id-banner-permanent-false-positive D1).
-        // A dist with index.html but no build-id.txt must NOT reach cargo.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(
-            dist.join("index.html"),
-            b"<!doctype html><html><body>ok</body></html>",
-        )
-        .expect("write index");
-        let err = verify_frontend_built(tmp.path())
-            .expect_err("dist without build-id.txt must error before cargo runs");
-        let s = err.to_string();
-        assert!(
-            s.contains("build-id.txt") && !s.contains("index.html"),
-            "error must name the MISSING artifact (dist/build-id.txt) and not \
-             the present one (index.html); got: {}",
-            s
-        );
-    }
-
-    #[test]
-    fn verify_frontend_built_err_when_build_id_empty() {
-        // Same window, zero-byte flavour: the file exists but vite has not
-        // finished writing it. An empty build-id.txt makes build.rs read an
-        // empty string and fall through to the sentinel just as if the file
-        // were absent, so it must be rejected on the same terms.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(
-            dist.join("index.html"),
-            b"<!doctype html><html><body>ok</body></html>",
-        )
-        .expect("write index");
-        fs::write(dist.join("build-id.txt"), b"").expect("write empty build-id");
-        let err = verify_frontend_built(tmp.path())
-            .expect_err("empty dist/build-id.txt must error before cargo runs");
-        let s = err.to_string();
-        assert!(
-            s.contains("build-id.txt") && !s.contains("index.html"),
-            "error must name the EMPTY artifact (dist/build-id.txt) and not \
-             the valid one (index.html); got: {}",
-            s
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_false_when_dist_dir_missing() {
-        // Simulates the multi-agent scenario where a concurrent external
-        // `npm run build` wiped the entire dist/ directory between this
-        // supervisor's npm exit and cargo's embed step.
-        let tmp = TempDir::new().expect("tempdir");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "missing dist/ must be reported as not-ok so the slot is flagged stale"
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_false_when_index_html_missing() {
-        // Simulates an empty-output regression: dist/ exists (an earlier
-        // build created it) but index.html specifically is gone.
-        let tmp = TempDir::new().expect("tempdir");
-        fs::create_dir_all(tmp.path().join("dist")).expect("mkdir dist");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "dist/ without index.html must be reported as not-ok"
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_false_when_index_html_is_empty() {
-        // Simulates the historical safari13 regression where vite exited 0
-        // having written zero bytes (proj_issue_runner_npm_build_safari13_target.md).
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(dist.join("index.html"), b"").expect("write empty index");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "empty dist/index.html must be reported as not-ok"
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_true_when_index_html_present_and_nonempty() {
-        // Happy path — a real build wrote every required dist artifact.
-        // build-id.txt joined the contract with the build-id-banner plan.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(
-            dist.join("index.html"),
-            b"<!doctype html><html><body>ok</body></html>",
-        )
-        .expect("write index");
-        fs::write(dist.join("build-id.txt"), b"abc123-1785101162102").expect("write build-id");
-        assert!(
-            dist_index_ok(tmp.path()),
-            "a complete non-empty dist is the signal of a healthy build"
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_false_when_build_id_missing_or_empty() {
-        // The live-tree half of the same gate. Widening only
-        // verify_frontend_built would have left this path able to flip
-        // frontend_stale=false against a dist vite had not finished writing.
-        let tmp = TempDir::new().expect("tempdir");
-        let dist = tmp.path().join("dist");
-        fs::create_dir_all(&dist).expect("mkdir dist");
-        fs::write(
-            dist.join("index.html"),
-            b"<!doctype html><html><body>ok</body></html>",
-        )
-        .expect("write index");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "dist without build-id.txt must be reported as not-ok"
-        );
-
-        fs::write(dist.join("build-id.txt"), b"").expect("write empty build-id");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "dist with an empty build-id.txt must be reported as not-ok"
-        );
-    }
-
-    #[test]
-    fn dist_index_ok_returns_false_when_index_html_is_a_directory() {
-        // Pathological case: someone created dist/index.html as a
-        // directory (mkdir -p dist/index.html). The metadata.is_file()
-        // guard catches this — without it, len() would return junk.
-        let tmp = TempDir::new().expect("tempdir");
-        fs::create_dir_all(tmp.path().join("dist").join("index.html")).expect("mkdir");
-        assert!(
-            !dist_index_ok(tmp.path()),
-            "dist/index.html as a directory must be reported as not-ok"
-        );
-    }
-
-    // =====================================================================
-    // Phase 2: LKG promotion gate — `update_lkg_after_success` must promote
-    // live-tree builds (recording sha + source in lkg.json) and SKIP override
-    // builds entirely (exe + sidecar untouched). Root fix for the 2026-06-05
-    // incident where a branch build was promoted to LKG and deployed.
-    // =====================================================================
-
-    /// Build a `SharedState` whose runner workspace root is a tempdir, so the
-    /// LKG dir (`<root>/target-pool/lkg/`) and slot exe
-    /// (`<root>/target-pool/slot-0/debug/qontinui-runner.exe`) land under a
-    /// throwaway path. `project_dir` is `<root>/src-tauri` because
-    /// `runner_npm_dir()` takes its parent. Returns the state plus the
-    /// canonicalized workspace root (canonicalized to match `runner_npm_dir`'s
-    /// own `canonicalize()`, so the test's path expectations line up).
-    fn lkg_test_state(workspace_root: &std::path::Path) -> SharedState {
-        let project_dir = workspace_root.join("src-tauri");
-        fs::create_dir_all(&project_dir).expect("mkdir src-tauri");
-        let config = SupervisorConfig {
-            project_dir,
-            watchdog_enabled_at_start: false,
-            auto_start: false,
-            auto_debug: false,
-            log_file: None,
-            log_dir: None,
-            port: 9875,
-            dev_logs_dir: workspace_root.join(".dev-logs"),
-            cli_args: vec![],
-            expo_dir: None,
-            expo_port: 8081,
-            runners: vec![RunnerConfig::default_primary()],
-            build_pool: BuildPoolConfig { pool_size: 1 },
-            no_prewarm: true,
-            no_webview: true,
-            temp_runner_display: None,
-        };
-        Arc::new(SupervisorState::new(config))
-    }
-
-    /// Stage a fake slot-0 exe with known bytes so the copy step has something
-    /// to promote. Returns the exe path.
-    fn stage_slot0_exe(state: &SharedState, bytes: &[u8]) -> std::path::PathBuf {
-        let exe = state.config.runner_exe_path_for_slot(0);
-        fs::create_dir_all(exe.parent().unwrap()).expect("mkdir slot debug");
-        fs::write(&exe, bytes).expect("write slot exe");
-        exe
-    }
-
-    fn live_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
-        BuildProvenance {
-            sha: sha.map(str::to_string),
-            source: BuildSource::LiveTree,
-            built_from: built_from.to_string(),
-            built_at: "2026-06-05T00:00:00Z".to_string(),
-        }
-    }
-
-    fn override_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
-        BuildProvenance {
-            sha: sha.map(str::to_string),
-            source: BuildSource::Override,
-            built_from: built_from.to_string(),
-            built_at: "2026-06-05T00:00:00Z".to_string(),
-        }
-    }
-
-    fn origin_main_provenance(sha: Option<&str>, built_from: &str) -> BuildProvenance {
-        BuildProvenance {
-            sha: sha.map(str::to_string),
-            source: BuildSource::OriginMain,
-            built_from: built_from.to_string(),
-            built_at: "2026-06-07T00:00:00Z".to_string(),
-        }
-    }
-
-    /// Live-tree build promotes: the LKG exe is written with the slot's bytes
-    /// and `lkg.json` records `sha` + `"source":"live_tree"`. Also asserts the
-    /// in-memory `last_known_good` lock is populated from the same provenance.
-    #[tokio::test]
-    async fn live_tree_build_promotes_and_records_provenance() {
-        let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canon root");
-        let state = lkg_test_state(&root);
-        stage_slot0_exe(&state, b"fresh-live-tree-bytes");
-
-        let slot = state.build_pool.slots[0].clone();
-        let prov = live_provenance(Some("abc123def456"), "/ws/qontinui-runner");
-
-        update_lkg_after_success(&state, &slot, &prov)
-            .await
-            .expect("live-tree build must promote to LKG");
-
-        // Exe promoted with the slot's bytes.
-        let lkg_exe = state.config.lkg_exe_path();
-        assert_eq!(
-            fs::read(&lkg_exe).expect("read lkg exe"),
-            b"fresh-live-tree-bytes",
-            "LKG exe must carry the promoted slot bytes"
-        );
-
-        // Sidecar carries sha + source from provenance.
-        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
-        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
-        assert_eq!(meta["sha"], "abc123def456", "lkg.json must record sha");
-        assert_eq!(
-            meta["source"], "live_tree",
-            "lkg.json must record source=live_tree, got {meta_raw}"
-        );
-        assert_eq!(meta["source_slot"], 0);
-
-        // In-memory lock hydrated from the same provenance.
-        let lkg = state.build_pool.last_known_good.read().await.clone();
-        let lkg = lkg.expect("last_known_good must be populated after live-tree promote");
-        assert_eq!(lkg.sha.as_deref(), Some("abc123def456"));
-        assert_eq!(lkg.source, BuildSource::LiveTree);
-    }
-
-    /// Live-tree build with a failed git probe (`sha: None`) still promotes;
-    /// `lkg.json`'s `sha` serializes as JSON null (honest "unknown SHA"),
-    /// `source` is still `live_tree`.
-    #[tokio::test]
-    async fn live_tree_build_with_null_sha_promotes_with_null_in_sidecar() {
-        let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canon root");
-        let state = lkg_test_state(&root);
-        stage_slot0_exe(&state, b"live-no-sha");
-
-        let slot = state.build_pool.slots[0].clone();
-        let prov = live_provenance(None, "/ws/qontinui-runner");
-
-        update_lkg_after_success(&state, &slot, &prov)
-            .await
-            .expect("live-tree build must promote even when sha probe failed");
-
-        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
-        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
-        assert!(
-            meta["sha"].is_null(),
-            "null sha must serialize as JSON null"
-        );
-        assert_eq!(meta["source"], "live_tree");
-    }
-
-    /// Override build does NOT promote: a PRE-EXISTING LKG exe + sidecar are
-    /// left byte-for-byte untouched, the in-memory lock is unchanged, and the
-    /// call still returns `Ok` (skip is not an error). This is the gate.
-    #[tokio::test]
-    async fn override_build_does_not_touch_lkg() {
-        let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canon root");
-        let state = lkg_test_state(&root);
-
-        // Pre-seed a prior good LKG (exe + sidecar) so we can prove the
-        // override build leaves it intact rather than there simply being
-        // nothing to write.
-        let lkg_dir = state.config.lkg_dir();
-        fs::create_dir_all(&lkg_dir).expect("mkdir lkg");
-        let lkg_exe = state.config.lkg_exe_path();
-        fs::write(&lkg_exe, b"prior-good-lkg-bytes").expect("seed lkg exe");
-        let meta_path = state.config.lkg_metadata_path();
-        let prior_meta = r#"{"built_at":"2026-06-01T00:00:00Z","source_slot":2,"exe_size":20,"sha":"prior0000000","source":"live_tree"}"#;
-        fs::write(&meta_path, prior_meta).expect("seed lkg.json");
-
-        // Stage a DIFFERENT slot exe that would be promoted if the gate failed.
-        stage_slot0_exe(&state, b"foreign-override-bytes");
-
-        let slot = state.build_pool.slots[0].clone();
-        let prov = override_provenance(Some("feedface0000"), "/ws/.spawn-feat/qontinui-runner");
-
-        update_lkg_after_success(&state, &slot, &prov)
-            .await
-            .expect("override build must return Ok (skip, not error)");
-
-        // Exe untouched — still the prior good bytes, NOT the foreign slot exe.
-        assert_eq!(
-            fs::read(&lkg_exe).expect("read lkg exe"),
-            b"prior-good-lkg-bytes",
-            "override build must NOT overwrite the LKG exe"
-        );
-        // Sidecar untouched — byte-for-byte the prior content.
-        assert_eq!(
-            fs::read_to_string(&meta_path).expect("read lkg.json"),
-            prior_meta,
-            "override build must NOT rewrite lkg.json"
-        );
-        // In-memory lock unchanged (still None — we never set it on the prior
-        // seed; the gate must not populate it from an override build).
-        assert!(
-            state.build_pool.last_known_good.read().await.is_none(),
-            "override build must NOT populate the last_known_good lock"
-        );
-    }
-
-    /// Phase B: an `origin_main` build IS promoted to LKG (it is vouched, unlike
-    /// `override`). The LKG exe carries the slot bytes and `lkg.json` records
-    /// `"source":"origin_main"` + the resolved sha. This is the fix for the
-    /// stale-LKG symptom: an origin/main primary build SHOULD advance LKG.
-    #[tokio::test]
-    async fn origin_main_build_promotes_to_lkg() {
-        let tmp = TempDir::new().expect("tempdir");
-        let root = tmp.path().canonicalize().expect("canon root");
-        let state = lkg_test_state(&root);
-        stage_slot0_exe(&state, b"fresh-origin-main-bytes");
-
-        let slot = state.build_pool.slots[0].clone();
-        let prov = origin_main_provenance(
-            Some("0a1b2c3d4e5f"),
-            "/ws/.spawn-origin-main/qontinui-runner",
-        );
-
-        update_lkg_after_success(&state, &slot, &prov)
-            .await
-            .expect("origin/main build must promote to LKG");
-
-        // Exe promoted with the slot's bytes.
-        let lkg_exe = state.config.lkg_exe_path();
-        assert_eq!(
-            fs::read(&lkg_exe).expect("read lkg exe"),
-            b"fresh-origin-main-bytes",
-            "LKG exe must carry the promoted origin/main slot bytes"
-        );
-
-        // Sidecar records sha + source=origin_main from provenance.
-        let meta_raw = fs::read_to_string(state.config.lkg_metadata_path()).expect("read lkg.json");
-        let meta: serde_json::Value = serde_json::from_str(&meta_raw).expect("parse lkg.json");
-        assert_eq!(meta["sha"], "0a1b2c3d4e5f", "lkg.json must record sha");
-        assert_eq!(
-            meta["source"], "origin_main",
-            "lkg.json must record source=origin_main, got {meta_raw}"
-        );
-
-        // In-memory lock hydrated from the same provenance.
-        let lkg = state.build_pool.last_known_good.read().await.clone();
-        let lkg = lkg.expect("last_known_good must be populated after origin/main promote");
-        assert_eq!(lkg.sha.as_deref(), Some("0a1b2c3d4e5f"));
-        assert_eq!(lkg.source, BuildSource::OriginMain);
-    }
-
-    /// The `from_working_tree` flag selects the build's source classification:
-    /// the working-tree path uses `BuildSourceKind::LiveTree` ⇒ `live_tree`;
-    /// the default origin/main path uses
-    /// `BuildSourceKind::OriginMain { resolved_sha }` ⇒ `origin_main`. This is
-    /// the pure classification seam the primary rebuild path threads — the kind
-    /// alone decides the recorded `BuildSource`, disambiguating an origin/main
-    /// primary build from a spawn-test override (both `Some(src_tauri)`).
-    #[test]
-    fn build_source_kind_classifies_working_tree_vs_origin_main() {
-        // from_working_tree:true → live tree.
-        assert_eq!(
-            BuildSourceKind::LiveTree.build_source(),
-            BuildSource::LiveTree
-        );
-        // from_working_tree:false (default) → origin/main.
-        assert_eq!(
-            BuildSourceKind::OriginMain {
-                resolved_sha: "deadbeef".to_string(),
-            }
-            .build_source(),
-            BuildSource::OriginMain
-        );
-        // spawn-test foreign override stays Override (unchanged).
-        assert_eq!(
-            BuildSourceKind::Override.build_source(),
-            BuildSource::Override
-        );
-
-        // The vouched predicate: working-tree + origin/main promote; override
-        // does not.
-        assert!(BuildSourceKind::LiveTree.build_source().is_vouched());
-        assert!(BuildSourceKind::OriginMain {
-            resolved_sha: "x".to_string()
-        }
-        .build_source()
-        .is_vouched());
-        assert!(!BuildSourceKind::Override.build_source().is_vouched());
-    }
-
-    // ---------- Issue 3: stderr classifier + submission tail ----------
-
-    /// A stderr carrying a real `error[E####]` diagnostic code classifies as a
-    /// compiler diagnostic — the user's code is broken, no poisoned-slot retry.
-    #[test]
-    fn classify_compiler_error_code_is_diagnostic() {
-        let stderr = "   Compiling qontinui-runner v0.1.0\n\
-             error[E0432]: unresolved import `crate::does_not_exist`\n\
-              --> src/main.rs:3:5\n\
-             error: aborting due to previous error\n";
-        assert_eq!(
-            classify_build_stderr(stderr),
-            StderrClass::CompilerDiagnostic
-        );
-    }
-
-    /// Cargo's terminal `could not compile` summary also classifies as a
-    /// compiler diagnostic even if the `error[E####]` line was truncated off
-    /// the captured tail.
-    #[test]
-    fn classify_could_not_compile_is_diagnostic() {
-        let stderr = "   Compiling qontinui-runner v0.1.0\n\
-             error: could not compile `qontinui-runner` (bin \"qontinui-runner\") due to 1 previous error\n";
-        assert_eq!(
-            classify_build_stderr(stderr),
-            StderrClass::CompilerDiagnostic
-        );
-    }
-
-    /// A failure with ONLY "Compiling …" progress noise + a linker/fingerprint
-    /// error and NO compiler diagnostic classifies as environmental — the
-    /// poisoned-slot self-heal should fire and retry in a cleaned slot. This is
-    /// the exact 2 KB-tail surface the user saw (`Compiling qontinui-runner …`).
-    #[test]
-    fn classify_environmental_noise_is_environmental() {
-        let stderr =
-            "   Compiling qontinui-runner v0.1.0 (D:\\qontinui-root\\qontinui-runner\\src-tauri)\n\
-             error: linking with `link.exe` failed: exit code: 1104\n\
-             LINK : fatal error LNK1104: cannot open file 'qontinui_runner.exe'\n";
-        assert_eq!(classify_build_stderr(stderr), StderrClass::Environmental);
-    }
-
-    /// A bare `error:` line (no `error[E####]`, no `could not compile`) — e.g. a
-    /// "could not find Cargo.toml" environmental failure — must NOT be misread
-    /// as a compiler diagnostic, or the self-heal would never fire.
-    #[test]
-    fn classify_bare_error_line_is_environmental() {
-        let stderr = "error: could not find `Cargo.toml` in `/tmp/x` or any parent directory\n";
-        assert_eq!(classify_build_stderr(stderr), StderrClass::Environmental);
-    }
-
-    /// The submission tail returns the input unchanged when it's under the cap,
-    /// and a boundary-safe tail (≤ cap bytes, preserving the END where cargo's
-    /// real error lives) when it's over.
-    #[test]
-    fn stderr_submission_tail_caps_and_keeps_tail() {
-        let small = "error[E0277]: trait bound not satisfied";
-        assert_eq!(stderr_submission_tail(small), small);
-
-        let big =
-            "x".repeat(LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES * 2) + "\nerror[E0599]: tail marker";
-        let tail = stderr_submission_tail(&big);
-        assert!(tail.len() <= LAST_BUILD_STDERR_SUBMISSION_TAIL_BYTES);
-        assert!(
-            tail.ends_with("error[E0599]: tail marker"),
-            "tail must preserve the END of the stderr where the real error lives"
-        );
-    }
-}
+mod tests;

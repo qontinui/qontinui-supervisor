@@ -1,6 +1,8 @@
 //! Integration-level tests that exercise [`SymbolWatcher`] end-to-end
 //! via the `MockTransport` (no coord process required).
 
+#![cfg(test)]
+
 use super::coord_client::{ClaimRequestWire, MockTransport};
 use super::file_watch::SaveEvent;
 use super::{find_repo_root, make_resource_key, read_machine_id, SymbolWatcher, WatcherConfig};

@@ -7,12 +7,14 @@ pub mod bazel_remote;
 /// error that does not name its own cause is a defect the gate must catch.
 pub mod build_diagnostics;
 pub mod build_monitor;
+pub mod build_sizing;
 pub mod build_submissions;
 pub mod cache_key;
 pub mod cache_telemetry;
 pub mod ci_runner_lifecycle;
 pub mod ci_runner_probe;
 pub mod config;
+pub mod coord_client;
 pub mod dev_action;
 pub mod diagnostics;
 pub mod error;
@@ -29,6 +31,10 @@ pub mod fs_atomic;
 pub mod git_provenance;
 pub mod health_cache;
 pub mod log_capture;
+/// The one loopback address the supervisor binds and dials, and the URL
+/// builders for itself and for runners
+/// (plan `2026-11-11-supervisor-and-temp-runner-probes-still-dial-localhost`).
+pub mod loopback;
 pub mod origin_guard;
 pub mod otel;
 pub mod pii_scrub;
@@ -59,6 +65,10 @@ pub mod sdk_features;
 pub mod self_provenance;
 pub mod server;
 pub mod settings;
+/// Test-only: classifies a source file the codemod extracted as test code for
+/// the source-scanning guards (plan 2026-10-01-oversized-source-files-owe-a-decomposition).
+#[cfg(test)]
+mod source_scan;
 pub mod spawn_worktree;
 pub mod state;
 /// Test-only wall-clock policy: the one place a residual deadline's size is
@@ -69,6 +79,12 @@ pub mod state;
 /// binaries under `tests/` share ONE definition of the env knob's name with
 /// the in-crate unit tests; a second spelling is how the two drift apart.
 pub mod test_clock;
+/// Test-only: serializes the tests that switch the build guards' env floors off.
+#[cfg(test)]
+mod test_env;
+/// Test-only: a loopback port that refuses connects and stays reserved.
+#[cfg(test)]
+mod test_ports;
 // Phase 4.1 (`plans/2026-05-21-coordination-improvements.md`): per-machine
 // tree-sitter symbol watcher daemon. Reports `ClaimKind::Symbol` claims to
 // coord via the existing `/claims/{acquire,release}` endpoints. Shipped as

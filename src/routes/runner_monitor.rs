@@ -11,7 +11,6 @@ use axum::response::{IntoResponse, Json, Response};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::config::RUNNER_API_PORT;
 use crate::state::SharedState;
 
 /// Default timeout for runner monitor proxy requests (seconds).
@@ -33,7 +32,7 @@ pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
             StatusCode::BAD_GATEWAY,
             Json(json!({
                 "error": "Runner is not responding. Is qontinui-runner running?",
-                "runner_port": RUNNER_API_PORT,
+                "runner_port": state.runner_api_port,
             })),
         )
             .into_response();
@@ -49,8 +48,10 @@ pub async fn proxy(State(state): State<SharedState>, req: Request) -> Response {
     let runner_path = path.strip_prefix("/runner-api").unwrap_or(path);
 
     let target_url = format!(
-        "http://127.0.0.1:{}{}{}",
-        RUNNER_API_PORT, runner_path, query
+        "{}{}{}",
+        crate::loopback::runner_loopback_base(state.runner_api_port),
+        runner_path,
+        query
     );
     debug!(
         "Runner monitor proxy: {} {} -> {}",

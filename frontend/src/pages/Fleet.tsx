@@ -155,9 +155,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
         </td>
         <td>
           <div className="flex gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-            <span className={`badge ${statusBadgeClass(r.derivedStatus)}`}>
-              {r.derivedStatus}
-            </span>
+            <span className={`badge ${statusBadgeClass(r.derivedStatus)}`}>{r.derivedStatus}</span>
             {/*
               No `wsConnected` badge here on purpose. WS presence is the FIRST
               branch of the backend's status derivation — `ws_session_id is not
@@ -290,9 +288,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                 <div style={{ marginBottom: r.recentCrash ? '0.6rem' : 0 }}>
                   <div style={{ marginBottom: '0.4rem' }}>
                     <strong className="text-danger">UI Error:</strong>{' '}
-                    <span style={{ fontFamily: 'var(--font-mono)' }}>
-                      {r.uiError.message}
-                    </span>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{r.uiError.message}</span>
                   </div>
                   <div
                     className="text-muted"
@@ -305,9 +301,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                   >
                     <span>
                       <strong>Kind:</strong>{' '}
-                      <span style={{ fontFamily: 'var(--font-mono)' }}>
-                        {r.uiError.kind}
-                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>{r.uiError.kind}</span>
                     </span>
                     <span>
                       <strong>Reported:</strong> {formatTs(r.uiError.reportedAt)}
@@ -349,8 +343,7 @@ function FleetRow({ runner: r, expanded, toggle }: FleetRowProps) {
                     }}
                   >
                     <span>
-                      <strong>Reported:</strong>{' '}
-                      {formatTs(r.recentCrash.reportedAt)}
+                      <strong>Reported:</strong> {formatTs(r.recentCrash.reportedAt)}
                     </span>
                     {r.recentCrash.panicLocation && (
                       <span>
@@ -570,10 +563,7 @@ export default function Fleet() {
 
       {/* Error state */}
       {error && (
-        <div
-          className="card"
-          style={{ marginBottom: '1rem', borderColor: 'var(--danger)' }}
-        >
+        <div className="card" style={{ marginBottom: '1rem', borderColor: 'var(--danger)' }}>
           <div className="card-header">
             <span className="card-title text-danger">Error</span>
           </div>

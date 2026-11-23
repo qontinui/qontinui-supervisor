@@ -22,10 +22,21 @@
 //! Files live in `<TEMP_DIR>/qontinui-supervisor-spawn-logs/<runner_id>-<rfc3339-millis>.log`.
 //! The directory is created lazily on first use. There is no rotation — the
 //! file is hard-capped at [`EARLY_LOG_BYTE_CAP`] bytes via inline truncation
-//! so a runaway runner can't fill the disk. Files are deleted when the
-//! runner is explicitly stopped via `POST /runners/{id}/stop`; files for
-//! runners that died unexpectedly are preserved (the whole point of this
-//! capture).
+//! so a runaway runner can't fill the disk. No stop deletes a file: the
+//! dev-action attribution watcher reads each spawn's early log only when its
+//! window closes, which can be up to
+//! [`crate::dev_action::attribution::LONGEST_BACKSTOP`] after the spawn. The
+//! max-age sweep (`process::manager::reap_stale_test_runners`) prunes, every
+//! five minutes, each file not written for [`EARLY_LOG_RETENTION`]
+//! ([`prune_stale_early_logs`]), whether its runner was stopped or died on its
+//! own. A runner still alive but silent for that long keeps its file: the sweep
+//! hands the prune a snapshot of the live spawns' early-log paths, taken from
+//! the registry before the sweep starts (`manager::live_early_log_paths`), and
+//! the prune skips those. The prune itself still takes no lock: a spawn that
+//! starts after the snapshot writes a fresh file, which no age prune touches.
+//! A spawn whose exit is never stamped counts as live until the spawn ring
+//! evicts it (`state::SPAWN_RING_CAPACITY`) or its runner leaves the registry,
+//! so its file is kept that long.
 //!
 //! # Best-effort
 //!
@@ -33,6 +44,7 @@
 //! filesystem failure (disk full, permission denied, antivirus interfering)
 //! must never crash the supervisor or block runner startup.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -57,12 +69,70 @@ const RETAIN_AFTER_TRUNCATE: u64 = (EARLY_LOG_BYTE_CAP * 3) / 4;
 /// Subdirectory under `std::env::temp_dir()` where early-log files live.
 pub const EARLY_LOG_SUBDIR: &str = "qontinui-supervisor-spawn-logs";
 
-/// Resolve the early-log directory inside the platform temp dir. Creates the
-/// directory if it does not exist. Returns `None` on a creation error so
-/// callers can degrade gracefully (no early-log capture, but the runner
-/// still starts).
+/// How far past [`crate::dev_action::attribution::LONGEST_BACKSTOP`] an early
+/// log is kept: covers the sweep's 5-minute interval and a window closing a
+/// result tail after a late result, with room to spare.
+pub const EARLY_LOG_RETENTION_MARGIN: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// How long an early-log file is kept after its last write. A spawn writes its
+/// file from the spawn on, so a file last written longer ago than this belongs
+/// to a spawn whose every attribution window has closed.
+pub const EARLY_LOG_RETENTION: std::time::Duration = std::time::Duration::from_secs(
+    crate::dev_action::attribution::LONGEST_BACKSTOP.as_secs()
+        + EARLY_LOG_RETENTION_MARGIN.as_secs(),
+);
+
+/// Remove every regular file in `dir` last modified more than
+/// [`EARLY_LOG_RETENTION`] before `now`, except the paths in `live`: the
+/// early logs of spawns still running when the caller took that snapshot, a
+/// live but silent runner's included. An age prune of one directory listing:
+/// it reads no registry and takes no lock, so the caller snapshots the live
+/// paths before calling. Best-effort: an unreadable directory, entry or mtime
+/// is skipped, and a file dated after `now` is kept. Returns how many files it
+/// removed.
+pub fn prune_stale_early_logs(
+    dir: &Path,
+    now: std::time::SystemTime,
+    live: &HashSet<PathBuf>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let stale = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > EARLY_LOG_RETENTION);
+        let path = entry.path();
+        if stale && !live.contains(&path) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => pruned += 1,
+                Err(e) => debug!("Failed to prune early-log file {:?}: {}", path, e),
+            }
+        }
+    }
+    pruned
+}
+
+/// Where every spawn's early log is written and what the sweep prunes, whether
+/// or not the directory exists yet.
+pub fn early_log_dir_path() -> PathBuf {
+    std::env::temp_dir().join(EARLY_LOG_SUBDIR)
+}
+
+/// Resolve the early-log directory inside the platform temp dir
+/// ([`early_log_dir_path`]). Creates the directory if it does not exist.
+/// Returns `None` on a creation error so callers can degrade gracefully (no
+/// early-log capture, but the runner still starts).
 pub fn early_log_dir() -> Option<PathBuf> {
-    let dir = std::env::temp_dir().join(EARLY_LOG_SUBDIR);
+    let dir = early_log_dir_path();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!("Failed to create early-log dir {:?}: {}", dir, e);
         return None;
@@ -248,9 +318,10 @@ fn truncate_file_in_place(file: &mut File, keep_bytes: u64) -> std::io::Result<(
     Ok(())
 }
 
-/// Delete an early-log file. Best-effort: a missing file is fine, and any
-/// other IO error is logged at debug level (the file lives under temp_dir
-/// and will be cleaned up by OS-level temp sweeps eventually).
+/// Delete an early-log file: test cleanup only, since no production path
+/// deletes one ([`prune_stale_early_logs`] bounds them). Best-effort: a missing
+/// file is fine, and any other IO error is logged at debug level.
+#[cfg(test)]
 pub fn delete_early_log(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => debug!("Removed early-log file {:?}", path),
@@ -368,11 +439,48 @@ mod tests {
         );
     }
 
+    /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.6: a live
+    /// runner that has been silent past the retention keeps its early log;
+    /// a stale file no live spawn holds is still pruned.
+    #[test]
+    fn early_log_prune_skips_live_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::now();
+        let past_retention = EARLY_LOG_RETENTION + std::time::Duration::from_secs(60);
+        let aged = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, "INFO booted, then silent\n").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(now - past_retention)
+                .unwrap();
+            path
+        };
+        let live_silent = aged("test-live-silent.log");
+        let dead = aged("test-dead.log");
+
+        let live: HashSet<PathBuf> = [live_silent.clone()].into_iter().collect();
+        assert_eq!(prune_stale_early_logs(dir.path(), now, &live), 1);
+        assert!(
+            live_silent.exists(),
+            "a live, silent runner's early log was pruned"
+        );
+        assert!(!dead.exists(), "a stale file no live spawn holds was kept");
+
+        // Once its runner is gone the same file is pruned.
+        assert_eq!(prune_stale_early_logs(dir.path(), now, &HashSet::new()), 1);
+        assert!(!live_silent.exists());
+    }
+
     #[test]
     fn early_log_dir_creates_subdir_under_temp() {
         let dir = early_log_dir().expect("temp dir should be writable");
         assert!(dir.exists());
         assert!(dir.ends_with(EARLY_LOG_SUBDIR));
+        // The directory the writer resolves is the one the sweep is handed.
+        assert_eq!(dir, early_log_dir_path());
     }
 
     #[test]

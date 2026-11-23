@@ -92,10 +92,12 @@ pub struct RecentPanic {
     pub file_path: String,
 }
 
-/// Resolve the expected panic-log path for a runner. The supervisor sets
-/// `QONTINUI_RUNNER_LOG_DIR` env per runner; if that was set at spawn time,
-/// pass it as `log_dir_hint` here. Otherwise we fall back to the same
-/// default the runner uses (`<LOCALAPPDATA>/qontinui-runner/dev-logs`).
+/// Resolve the expected panic-log path for a runner. Pass the runner's log dir
+/// as `log_dir_hint` when the supervisor knows it — `<root>/logs` for every
+/// non-primary runner (its instance root), `<log-dir>/runner-<id>` for the
+/// primary under `--log-dir` (see `env_forwarders::panic_log_dir_for`).
+/// Otherwise we fall back to the same default the runner uses
+/// (`<LOCALAPPDATA>/qontinui-runner/dev-logs`).
 ///
 /// Note: this does NOT check the file's existence — callers use
 /// `parse_panic_file` for that.

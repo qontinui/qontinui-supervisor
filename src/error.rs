@@ -13,6 +13,36 @@ pub enum SupervisorError {
     #[error("Runner not found: {0}")]
     RunnerNotFound(String),
 
+    /// A start or a stop holds this runner's lifecycle lock, so it cannot be
+    /// removed right now. Retry once that has finished.
+    #[error("Runner '{0}' is being started or stopped; retry once that has finished")]
+    RunnerLifecycleBusy(String),
+
+    /// A crash watchdog's start found, once it held the lifecycle lock, that
+    /// a stop or a start had landed since the exit it was answering.
+    #[error("Crash restart superseded: {0}")]
+    StartSuperseded(String),
+
+    /// The supervisor is shutting down, so it starts no runner: a runner
+    /// started now would be managed by nobody once this process exits (off
+    /// Windows nothing in the OS would reap a temp one either). Plan
+    /// `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`.
+    #[error("Supervisor is shutting down; not starting runner '{0}'")]
+    ShuttingDown(String),
+
+    /// `POST /supervisor/restart` refused because of where this process sits
+    /// in systemd: a replacement spawned by a service's main process would be
+    /// killed with that service. A conflict with the process's own state, not
+    /// a malformed request.
+    #[error("{0}")]
+    SelfRestartRefused(String),
+
+    /// A primary rebuild that waited for its spawn container gave up because
+    /// the runner was asked to stop during the wait. A conflict with a newer
+    /// request, not a malformed one.
+    #[error("{0}")]
+    RebuildAbandoned(String),
+
     /// Legacy variant — retained for call sites in `process/manager.rs` and
     /// `routes/runner.rs` that report "build currently in progress". With the
     /// parallel build pool, this is derived from "any slot busy".
@@ -30,6 +60,22 @@ pub enum SupervisorError {
         /// retrying. Computed as `avg_build_duration - min(elapsed)` over
         /// active slots. `None` when no history exists yet.
         estimated_wait_secs: Option<f64>,
+    },
+
+    /// The `.spawn-<ref>` container a spawn-test builds in is held by another
+    /// build (a same-ref spawn-test, the primary's origin/main rebuild, or a
+    /// sweep removing it), and the caller opted out of waiting via
+    /// `X-Queue-Mode: no-wait`. A queue answer like [`Self::BuildPoolFull`]:
+    /// nothing was built or started; retry later.
+    #[error(
+        "Spawn container {container} is busy: held by {}",
+        .holder.as_deref().unwrap_or("another build")
+    )]
+    SpawnContainerBusy {
+        container: String,
+        /// The holder's label, `None` for the instant before a new holder
+        /// labels the lock it has just taken.
+        holder: Option<String>,
     },
 
     #[error("Build failed: {0}")]
@@ -133,6 +179,18 @@ pub enum SupervisorError {
 
     #[error("{0}")]
     Other(String),
+
+    /// A lifecycle body failed AFTER it had already acted on the runner (a
+    /// restart's stop or build; a rebuild-and-restart's stop of a running
+    /// runner, or its build), so the action is a failure that ran, never a
+    /// refusal that touched nothing, even when the error that ended it is a
+    /// precondition refusal of a later step (a start finding the runner up, a
+    /// refused port). Carried to the door that minted the trial, whose
+    /// `dev_action::run_result_for` maps it to `Errored`. Transparent on the
+    /// wire: its message, status and body are the wrapped error's. Build one
+    /// with [`SupervisorError::after_act`].
+    #[error("{0}")]
+    AfterAct(Box<SupervisorError>),
 }
 
 /// Payload of [`SupervisorError::UnverifiedExe`] — everything an operator needs
@@ -155,6 +213,16 @@ pub struct UnverifiedExeInfo {
 }
 
 impl SupervisorError {
+    /// Mark `err` as having ended a body that had already acted (see
+    /// [`SupervisorError::AfterAct`]). Idempotent: an error already marked is
+    /// returned as it is, never wrapped twice.
+    pub fn after_act(err: SupervisorError) -> SupervisorError {
+        match err {
+            already @ SupervisorError::AfterAct(_) => already,
+            other => SupervisorError::AfterAct(Box::new(other)),
+        }
+    }
+
     /// Render this error to the same `(StatusCode, JSON body)` pair that
     /// [`IntoResponse`] would, but as values rather than a `Response`.
     ///
@@ -181,6 +249,16 @@ impl SupervisorError {
                     .unwrap()
                     .insert("estimated_wait_secs".to_string(), serde_json::json!(w));
             }
+            return (StatusCode::SERVICE_UNAVAILABLE, body);
+        }
+
+        if let SupervisorError::SpawnContainerBusy { container, holder } = self {
+            let body = serde_json::json!({
+                "error": "spawn_container_busy",
+                "message": self.to_string(),
+                "container": container,
+                "holder": holder,
+            });
             return (StatusCode::SERVICE_UNAVAILABLE, body);
         }
 
@@ -238,8 +316,10 @@ impl SupervisorError {
 
         if let SupervisorError::RestartUnsafe(detail) = self {
             // The payload is already the exact wire shape (built in
-            // `restart_readiness::decide`) so the body a caller reads and the
-            // body the log line carries can never drift.
+            // `restart_readiness::decide`) so the refusal a caller reads and the
+            // one the log line carries can never drift. A door that minted a trial
+            // merges its action fields on top
+            // (`dev_action::MintedAction::answer_failure`).
             return (StatusCode::CONFLICT, detail.payload.clone());
         }
 
@@ -275,8 +355,14 @@ impl SupervisorError {
             SupervisorError::RunnerNotRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerAlreadyRunning => StatusCode::CONFLICT,
             SupervisorError::RunnerNotFound(_) => StatusCode::NOT_FOUND,
+            SupervisorError::RunnerLifecycleBusy(_) => StatusCode::CONFLICT,
+            SupervisorError::StartSuperseded(_) => StatusCode::CONFLICT,
+            SupervisorError::ShuttingDown(_) => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::SelfRestartRefused(_) => StatusCode::CONFLICT,
+            SupervisorError::RebuildAbandoned(_) => StatusCode::CONFLICT,
             SupervisorError::BuildInProgress => StatusCode::CONFLICT,
             SupervisorError::BuildPoolFull { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            SupervisorError::SpawnContainerBusy { .. } => StatusCode::SERVICE_UNAVAILABLE,
             SupervisorError::InsufficientDisk { .. } => StatusCode::INSUFFICIENT_STORAGE,
             SupervisorError::UnverifiedExe(_) => StatusCode::CONFLICT,
             SupervisorError::RestartUnsafe(_) => StatusCode::CONFLICT,
@@ -290,6 +376,8 @@ impl SupervisorError {
             SupervisorError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
             SupervisorError::Validation(_) => StatusCode::BAD_REQUEST,
             SupervisorError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            // The marker is not a wire concept: answer exactly as the error would.
+            SupervisorError::AfterAct(inner) => return inner.to_status_body(),
         };
         let body = serde_json::json!({ "error": self.to_string() });
         (status, body)
@@ -341,5 +429,29 @@ mod tests {
         assert!(message.contains("port 9876"), "{message}");
         assert!(message.contains("PID 247696"), "{message}");
         assert!(body["recovery"].is_array());
+    }
+
+    /// `SpawnContainerBusy` is a 503 queue answer like `BuildPoolFull`, with a
+    /// typed body naming the container and the build that holds it.
+    #[test]
+    fn spawn_container_busy_maps_to_service_unavailable_naming_its_holder() {
+        let err = SupervisorError::SpawnContainerBusy {
+            container: "/ws/.spawn-origin_main".to_string(),
+            holder: Some("spawn-test test-1".to_string()),
+        };
+        let (status, body) = err.to_status_body();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["error"], "spawn_container_busy");
+        assert_eq!(body["container"], "/ws/.spawn-origin_main");
+        assert_eq!(body["holder"], "spawn-test test-1");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("held by spawn-test test-1"), "{message}");
+
+        let unlabelled = SupervisorError::SpawnContainerBusy {
+            container: "/ws/.spawn-origin_main".to_string(),
+            holder: None,
+        };
+        assert!(unlabelled.to_string().ends_with("held by another build"));
+        assert!(unlabelled.to_status_body().1["holder"].is_null());
     }
 }

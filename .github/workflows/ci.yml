@@ -33,23 +33,301 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Where the four Linux jobs run ───────────────────────────────────────
+  #
+  # On every run that is NOT a fork pull_request (main and merge-candidate*/**
+  # pushes, workflow_dispatch, same-repo pull_requests) this job decides
+  # whether `Rust Check`, `Compose Parity`, `CI script tests` and
+  # `Frontend Check` run on the
+  # self-hosted pool `[self-hosted, Linux, X64, ram-16g]` or on the free
+  # GitHub-hosted `ubuntu-latest` floor. This file never routes a FORK
+  # pull_request run, and this job is skipped on one. That alone does not keep
+  # a fork's code off the pool: a pull_request run uses the PR's own copy of
+  # this file, so a fork could rewrite `runs-on`. What stops it is the repo's
+  # fork-PR approval policy, `all_external_contributors`: no outside
+  # contributor's run starts until a maintainer approves it. Never approve a
+  # fork run whose diff touches `.github/`.
+  #
+  # PULL REQUESTS ROUTE TOO (2026-11-11). A same-repo pull_request routes
+  # exactly like a push: external PRs are prohibited on every qontinui repo, so
+  # a PR run executes the same code a push run would and repo visibility is not
+  # a trust boundary (decision_record self-hosted-runners-on-public-repos,
+  # amendment 2026-11-04; policy production-and-cost
+  # external-prs-are-prohibited-so-public-repo-ci-is-not-a-trust-boundary).
+  # A FORK pull_request (head repo != this repo) still goes to the floor: an
+  # optional free guard on top of the fork-PR approval policy,
+  # `all_external_contributors`, which stays. A PR backlog is a capacity
+  # question, and the router's SATURATED / STALLED overflow under `auto` is
+  # what bounds it; the forced `self-hosted` lane gives that overflow up.
+  #
+  # THE POOL: four repo-scoped registrations on nawa (Debian 13),
+  # `nawa-sup-1..4` (read 2026-11-03), plus any org runner carrying the same
+  # labels: since 2026-11-04 the org's Default runner group admits public
+  # repos (finding ac7f50a6). Each nawa runner is its own systemd unit in
+  # ci-runners.slice (MemoryHigh 60 GiB, MemoryMax 64 GiB, PrivateTmp=yes, per
+  # `systemctl show`), and all four run as the host's one `runner` account,
+  # which is in no sudo group.
+  #
+  # WHY. The org is on GitHub Free: about 20 concurrent hosted jobs
+  # org-wide, shared with every public repo's PR CI, and coord's land of a
+  # PR waits on its merge-candidate run. Measured 2026-11-03 over ~12
+  # merge-candidate push runs: this repo's jobs waited p90 22.6 min (max
+  # 31.6) for a hosted runner, against run times of 0.2-12.1 min, and the run
+  # wall p90 was 32.2 min. The cost under `auto`: the four jobs wait for
+  # this job, which itself needs a hosted runner. That is seconds when
+  # hosted runners are free, but under a saturated hosted queue it waits
+  # like any hosted job (qontinui-runner's `route` sat queued 10 m 40 s on
+  # 2026-11-03, run 41646964958). A forced lane skips this job entirely.
+  #
+  # The decision is the fleet's route-with-a-hosted-floor router: a VERBATIM
+  # copy of qontinui-claude-config `scripts/route-ci-lane.py` (blob c67b16e7;
+  # its hermetic test is `scripts/route-ci-lane-test.py` there). Re-sync by
+  # copying the file again and checking `git hash-object` against ccfg's
+  # blob, never by editing it here. With `actions: read` it reads THIS
+  # repo's queued jobs and routes to the floor when the pool is STALLED (a
+  # pool job queued >= 10 min), SATURATED (>= 4 queued) or its signal is
+  # unreadable. The repo variable picks the lane:
+  #
+  #   SUPERVISOR_CI_LINUX_LANE = auto         this job runs and decides
+  #                            = self-hosted  this job is SKIPPED; the four
+  #                                           jobs go to the pool with no
+  #                                           overflow (a dead pool holds
+  #                                           them until GitHub cancels a
+  #                                           self-hosted job queued 24 h)
+  #                            = hosted | unset | anything else
+  #                                           this job is SKIPPED; the four
+  #                                           jobs run hosted (kill switch)
+  #
+  # Setting the lane only moves runs created afterwards. To free a run stuck
+  # on the pool, cancel it and re-run it: a re-run goes hosted.
+  #
+  # RE-RUNS GO TO THE FLOOR, and each job's `runs-on` decides that, not this
+  # job. A pool that picks jobs up and then fails them reads healthy to the
+  # queue signal, so a retry must not land on it again. coord retries with
+  # "re-run failed jobs", which does not re-run a `route` that succeeded, so
+  # the router's own `--hosted-on-rerun` never fires for coord's retries:
+  # `runs-on` reads `needs.route.outputs.labels` only on attempt 1.
+  #
+  # The router ALWAYS exits 0 with outputs written, and the four jobs run
+  # under `!cancelled()` with a hosted fallback, so a route job that fails,
+  # times out or is skipped leaves them on the floor (or, forced, on the
+  # pool), never SKIPPED, which coord's check classification would count as
+  # passing. Their names are unchanged: they are the required check contexts.
+  route:
+    if: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'auto' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      labels: ${{ steps.route.outputs.labels }}
+      lane: ${{ steps.route.outputs.lane }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Route the four Linux jobs
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUPERVISOR_CI_LINUX_LANE: ${{ vars.SUPERVISOR_CI_LINUX_LANE }}
+          SUPERVISOR_CI_LINUX_LANE_SOURCE: repo variable SUPERVISOR_CI_LINUX_LANE
+          SUPERVISOR_CI_LINUX_HOSTED_LABEL: ubuntu-latest
+          SUPERVISOR_CI_LINUX_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: >-
+          python3 -B .github/scripts/route-ci-lane.py
+          --self-hosted-labels self-hosted,Linux,X64,ram-16g
+          --env-prefix SUPERVISOR_CI_LINUX
+          --title "Linux jobs"
+          --default-lane hosted
+          --hosted-on-rerun
+
   rust-check:
     name: Rust Check
-    runs-on: ubuntu-latest
+    # `route` decides where this runs (see above). `!cancelled()` is
+    # load-bearing: on a fork pull_request or a non-`auto` lane `route` is
+    # SKIPPED, and without it a job that needs a skipped job is skipped too,
+    # which would turn every required check below into `skipped` (= passing
+    # to coord).
+    needs: route
+    if: ${{ !cancelled() }}
+    # The pool on a FIRST attempt of a run that is not a fork pull_request,
+    # when the lane is forced `self-hosted` or `route` said so under `auto` (its
+    # `labels` output); everything else is the hosted floor: a fork
+    # pull_request, any re-run, the `hosted`/unset lane, and a `route` that
+    # produced nothing. The pool
+    # label set is spelled in nine places: this expression and the same one on
+    # the three jobs below, the four `# coord-pools:` lines, and `route`'s
+    # --self-hosted-labels. Change them together, because the router counts
+    # only jobs carrying EXACTLY that set; `CI script tests` fails on drift
+    # (.github/scripts/check-ci-lane-labels.py). ram-16g is the class at or above
+    # this job's peak: a cold `cargo build --all-targets` of this crate at
+    # CARGO_BUILD_JOBS=20, run on nawa 2026-11-03 inside a transient
+    # `systemd-run --user --scope`, peaked at 13.2 GiB of that scope's
+    # memory.peak (page cache included; 4.7 GiB anonymous).
+    # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     steps:
+      # persist-credentials: false because no later step needs git auth, and
+      # on the pool, while the job runs, a persisted token would sit in a
+      # .git/config every other registration's job can read (one account,
+      # one home). The same holds for every checkout in the four routed jobs.
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # SELF-HOSTED ONLY (`route` put this job on the pool). What a hosted VM
+      # hands every job and a persistent host has to be told:
+      #
+      #   1. A WORKING HOST. A tool this job needs that the host lacks fails
+      #      HERE, in a second, naming the runner. That red is the host's, not
+      #      the change's, and a re-run goes hosted. lsof and python3 are what
+      #      the orphan-kill suite below exercises the kill primitives with;
+      #      without them it would fail ~10 minutes in.
+      #   2. A HOME of its own, and a rustup of the slot's own. Every
+      #      registration on the host runs as ONE account with ONE home, so
+      #      the job gets HOME and TMPDIR under $RUNNER_TEMP, which the runner
+      #      empties per job. CARGO_HOME stays on the account's persistent
+      #      registry, which cargo locks itself. RUSTUP_HOME does not: the
+      #      toolchain step runs `rustup default`, which on the account's
+      #      shared RUSTUP_HOME rewrites the settings every other job on the
+      #      host reads. A slot (item 5) is flock-held by one job at a time,
+      #      so a RUSTUP_HOME per slot, beside its target, has no concurrent
+      #      writer; it downloads 1.95.0 once per slot.
+      #      This runs before the toolchain step, which finds rustup through
+      #      CARGO_HOME.
+      #   3. A PERSISTED SIBLING. The runner keeps $GITHUB_WORKSPACE/..
+      #      between jobs, and the sibling checkout below reuses the
+      #      ../qontinui-schemas there: re-cloning it would reset the mtimes
+      #      of its two path-dependency crates and rebuild both on every job.
+      #      A checkout that fails, e.g. on a git lock left by a job killed
+      #      mid-fetch, is retried once from an empty directory.
+      #   4. A MEMORY-DERIVED COMPILE CAP. cargo's default parallelism is
+      #      nproc, 128 rustc on nawa. CARGO_BUILD_JOBS is the smallest of
+      #      MemTotal and every cgroup memory.max/memory.high above this job,
+      #      / 3 GiB, clamped to nproc, and 1 at or below 8 GiB: 20 on a nawa
+      #      unit, measured at a 13.2 GiB peak (see `runs-on`).
+      #      RUST_TEST_THREADS is 4, the hosted VM's nproc and so libtest's
+      #      default there, so the suite's concurrency does not change with
+      #      the machine it lands on.
+      #   5. A PERSISTENT TARGET. actions/checkout cleans with `git clean
+      #      -ffdx`, which deletes ./target on every job. So the target lives
+      #      under the account's persistent home, in a slot of a fixed pool
+      #      (.github/scripts/ci-cache-slot.sh: K slots, default 4, repo var
+      #      CI_CACHE_SLOTS; the root's total bounded by B, default 40 GiB, repo
+      #      var CI_CACHE_BUDGET_GIB), and ./target is a symlink to it: the
+      #      clean removes the link, never the tree behind it. A slot is
+      #      flock-held for the whole job, so two jobs never share a cargo build
+      #      lock; with every slot held the job builds cold under $RUNNER_TEMP.
+      #      It used to be ONE per registration, which an org-wide pool
+      #      multiplied without bound (104G on nawa, 2026-11-04; plan
+      #      2026-11-04-devops-ci-persistent-target-caches-keyed-per-registration-grow-without-bound-on-the-org-pool),
+      #      so the helper also reaps those legacy per-registration dirs.
+      #      CARGO_TARGET_DIR is deliberately not set. It saves CPU on a
+      #      shared host, not wall time. Warm (run 41699811297), this job
+      #      compiled 6 units, all of them this crate, where a cold run
+      #      compiled 583, but it took as long: this crate's own lib, bin and
+      #      test binaries rebuild every run, and the tests' execution
+      #      dominates. Bounded: a target over min(40 GiB, B/K) (a full Rust
+      #      Check leaves about 7 GiB) or unreadable starts cold; over B in
+      #      total, or under 60 GiB free on the filesystem, other unlocked slots
+      #      are evicted first, then this job's target. dist/ and
+      #      frontend/node_modules stay in the workspace, so the clean still
+      #      hands the no-dist step below the fresh tree it requires, and
+      #      build.rs reruns for an absent dist/.
+      - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          CI_CACHE_SLOTS: ${{ vars.CI_CACHE_SLOTS }}
+          CI_CACHE_BUDGET_GIB: ${{ vars.CI_CACHE_BUDGET_GIB }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for tool in cc git curl python3 lsof npm flock; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=self-hosted host not provisioned::runner '$RUNNER_NAME' lacks:$missing. The HOST is at fault, not this change: provision it. A re-run goes to the hosted floor; SUPERVISOR_CI_LINUX_LANE=hosted keeps new runs off the pool."
+            exit 1
+          fi
+
+          pool_home="$HOME"
+          # shellcheck source=/dev/null
+          . .github/scripts/ci-cache-slot.sh
+          ci_cache_slot_select --root "$pool_home/.cache/qontinui-supervisor-ci" \
+            --budget-gib 40 --entry-bound-gib 40 --floor-gib 60 --entry target
+          state="$CI_CACHE_STATE_DIR"
+          job_home="$RUNNER_TEMP/home"
+          mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
+
+          budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "$cg" != "/sys/fs/cgroup" ] && [ -n "$cg" ]; do
+            for f in memory.max memory.high; do
+              v=$(cat "$cg/$f" 2>/dev/null || echo max)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              if [ $((v / 1024)) -lt "$budget_kb" ]; then budget_kb=$((v / 1024)); fi
+            done
+            cg="${cg%/*}"
+          done
+          cpus=$(nproc)
+          jobs=$(( budget_kb / 3145728 ))
+          [ "$budget_kb" -gt 8388608 ] || jobs=1
+          [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$cpus" ] || jobs=$cpus
+          threads=4
+          [ "$threads" -le "$cpus" ] || threads=$cpus
+
+          {
+            echo "CARGO_HOME=${CARGO_HOME:-$pool_home/.cargo}"
+            echo "RUSTUP_HOME=$state/rustup"
+            echo "HOME=$job_home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+            echo "CARGO_BUILD_JOBS=$jobs"
+            echo "RUST_TEST_THREADS=$threads"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this job's slot ($CI_CACHE_SLOT), under $state"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
+
+          # ci_cache_slot_select already bounded it (unreadable, over its
+          # bound, or under the free-space floor: cold) and created it.
+          cache="$CI_CACHE_ENTRY_DIR"
+          used_kb="$CI_CACHE_ENTRY_USED_KB"
+          if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
+          ln -sfn "$cache" target
+          echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
 
       # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
       # at ../qontinui-schemas/rust. Without the sibling checkout, clippy + tests
       # fail with "failed to read ../qontinui-schemas/rust/Cargo.toml".
       # PINNED: the commit comes from .github/sibling-pins.conf, not schemas main
       # (plan 2026-08-31-schemas-releases-strand-consumer-cargo-locks §7.4 Phase 3b).
+      # On the pool the previous job's copy persists at $GITHUB_WORKSPACE/..
+      # and is reused (schemas-pin.sh fetches by sha, force-checks-out and
+      # cleans it), so cargo keeps its path-dependency crates fresh. A pin
+      # the script refuses fails first, leaving the copy alone. A checkout
+      # that fails, e.g. on a git lock left by a job killed mid-fetch, has
+      # the copy removed and is retried once.
       - name: Checkout sibling repos
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+        run: |
+          # A refusal of the pin itself fails here, with the copy untouched.
+          bash .github/scripts/schemas-pin.sh read > /dev/null
+          rc=0
+          bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.." || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=schemas sibling checkout failed::exit $rc; removing ../qontinui-schemas and retrying once"
+            rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
+            bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+          fi
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation, so the
@@ -86,7 +364,15 @@ jobs:
           git checkout -- Cargo.lock || true
           exit 1
 
+      # Hosted only. A pool job builds in its registration's persistent target
+      # and keeps the registry in the account's CARGO_HOME (both set up above),
+      # so a restore would only unpack into a per-job HOME nobody keeps. And it
+      # must never SAVE: the key carries the OS but not the distro, so an entry
+      # a Debian 13 pool host saved on a main push would be restored by the next
+      # hosted ubuntu run, its build-script and proc-macro binaries linked
+      # against a newer glibc than the hosted image has.
       - name: Cache cargo dependencies
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v4
         with:
           path: |
@@ -120,17 +406,57 @@ jobs:
       # coord's CI (see that job's comment). If it ever goes private this step
       # fails and roster_matches_the_runner_definition then hard-fails on a
       # missing source. That direction is deliberate: red, never silently green.
+      #
+      # The same checkout carries src-tauri/src/instance_env.rs for
+      # tests/root_confined_env_keys.rs, which holds this repo's copy of the
+      # runner's ROOT_CONFINED_ENV_KEYS (src/process/instance_root.rs) to the
+      # runner's own list. In CI that test REQUIRES the file named by
+      # $QONTINUI_RUNNER_INSTANCE_ENV_RS: the copy had drifted (it lacked
+      # QONTINUI_TOUCH_LEDGER_DIR, coord finding 7a74f9f1) with nothing to see it.
       - name: Check out qontinui-runner's roster declaration
         uses: actions/checkout@v5
         with:
           repository: qontinui/qontinui-runner
           path: .runner-roster
-          sparse-checkout: src-tauri/src/fleet.rs
+          sparse-checkout: |
+            src-tauri/src/fleet.rs
+            src-tauri/src/instance_env.rs
           sparse-checkout-cone-mode: false
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Check formatting
         run: cargo fmt --check
+
+      # build.rs builds dist/ with npm, and when npm fails the crate must still
+      # compile and serve static/dashboard.html: `Assets` is
+      # `#[allow_missing = true]` (src/routes/dashboard.rs). Without it, the
+      # derive fails on a missing dist/ and the crate does not compile. Until
+      # 2026-10-28 that was every fresh worktree on a standard Windows Node.js
+      # install (build.rs spawned a bare `npm`, which Windows did not find),
+      # and nothing here saw it, because this job has npm and so always builds
+      # a dist/. A fresh checkout has no dist/ and no frontend/node_modules, so
+      # the step puts a failing `npm` first on PATH. It must run BEFORE the
+      # clippy step, whose build.rs run produces dist/.
+      - name: The crate compiles when npm fails and there is no dist/
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e dist ] || [ -e frontend/node_modules ]; then
+            echo "::error::dist/ or frontend/node_modules exists before any build, so this step cannot test their absence"
+            exit 1
+          fi
+          shim="$RUNNER_TEMP/failing-npm"
+          mkdir -p "$shim"
+          printf '#!/bin/sh\necho "failing npm shim: $*" >&2\nexit 1\n' > "$shim/npm"
+          chmod +x "$shim/npm"
+          PATH="$shim:$PATH" cargo check --lib 2>&1 | tee "$RUNNER_TEMP/no-dist-check.out"
+          grep -q 'SPA will not be embedded' "$RUNNER_TEMP/no-dist-check.out" \
+            || { echo "::error::build.rs did not report the fallback, so the failing npm never ran"; exit 1; }
+          if [ -e dist ]; then
+            echo "::error::dist/ exists after a build whose npm failed, so the no-dist path was not exercised"
+            exit 1
+          fi
 
       - name: Run clippy
         run: cargo clippy -- -D warnings
@@ -157,7 +483,11 @@ jobs:
       - name: Run tests
         run: |
           set +e
-          cargo test 2>&1 | tee /tmp/cargo-test.out
+          # Every output this job captures and re-reads lives in $RUNNER_TEMP,
+          # which the runner gives each job and empties, never at a fixed /tmp
+          # path: on the self-hosted pool several jobs share one host, and a
+          # shared file would let one job's census count another job's tests.
+          cargo test 2>&1 | tee "$RUNNER_TEMP/cargo-test.out"
           SUBRC=${PIPESTATUS[0]}
           set -e
 
@@ -174,22 +504,64 @@ jobs:
           # number; a `grep` here would exit non-zero on no match and, under
           # this shell's `pipefail`, abort the step in exactly the zero-tests
           # case the guard exists for.
-          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-test.out)
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk "$RUNNER_TEMP/cargo-test.out")
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
           MIN_TESTS=1200
-          echo "supervisor cargo test: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+
+          # ── CRATE-TARGET FLOOR ──────────────────────────────────────────
+          # SUMMARIES is the number of crate targets that printed a summary,
+          # and the test floor above cannot see it shrink: a fail-fast abort
+          # after the biggest targets, or a selection that keeps them and drops
+          # the rest, still clears 1200 tests. Measured on run 36615898220
+          # (main a1d0889, 2026-09-29): 2476 tests across 21 targets; the floor
+          # is half, the same ratio as the test floor. Plan
+          # 2026-09-20-rust-verification-residuals-cached-green-straddles-the-edit-target-count-unfloored-and-source-pins-scan-themselves,
+          # Phase 3.
+          MIN_TARGETS=10
+
+          # ── A RED RUN IS STILL A READING ────────────────────────────────
+          # Both floors are evaluated whatever cargo exited, and both facts are
+          # printed, so a red run's log says how much of the suite it reached
+          # rather than stopping at cargo's first error. A failing floor exits
+          # with cargo's own status when that was already non-zero, so the
+          # step's exit code is never laundered into a different one; and no
+          # line here calls a red run's reading a pass.
+          FAIL_RC=${SUBRC}
+          [ "${FAIL_RC}" -ne 0 ] || FAIL_RC=1
+          echo "supervisor cargo test: cargo exited ${SUBRC}; ${RAN} tests ran across ${SUMMARIES} summary line(s)" \
+               "(floors: ${MIN_TESTS} tests, ${MIN_TARGETS} crate targets)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
                  "That is UNKNOWN, not a pass."
-            exit 1
+            exit "${FAIL_RC}"
           fi
+          if [ "${SUBRC}" -eq 0 ]; then
+            WHY="cargo exited 0, so this is a collapse, not a crash"
+          else
+            WHY="cargo exited ${SUBRC}, so the run is RED and stopped early; cargo's own error above is the cause, and this line records how much of the suite that run reached"
+          fi
+          FLOOR_MISSED=0
           if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
-            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
-                 "suite collapsed — almost certainly a target-selection change rather than" \
+            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). ${WHY}." \
+                 "On a green exit it is almost certainly a target-selection change rather than" \
                  "deleted tests. Do NOT lower the floor to make this pass."
-            exit 1
+            FLOOR_MISSED=1
+          fi
+          if [ "${SUMMARIES}" -lt "${MIN_TARGETS}" ]; then
+            echo "::error::Only ${SUMMARIES} of the suite's crate targets reported a summary" \
+                 "(floor ${MIN_TARGETS}). ${WHY}. Fewer targets than the floor is a fail-fast" \
+                 "abort or a target-selection collapse. Do NOT lower the floor."
+            FLOOR_MISSED=1
+          fi
+          if [ "${FLOOR_MISSED}" -ne 0 ]; then
+            exit "${FAIL_RC}"
+          fi
+          if [ "${SUBRC}" -ne 0 ]; then
+            echo "::error::cargo test exited ${SUBRC}: this run is RED. It reached ${RAN} tests" \
+                 "across ${SUMMARIES} crate targets, at or above both floors — which says how much" \
+                 "of the suite ran, never that it passed. cargo's own error above is the cause."
           fi
 
           # ── THE CROSS-LANGUAGE PIN MUST ITSELF HAVE RUN ──────────────────
@@ -256,7 +628,7 @@ jobs:
               }
             }
             END { print (found ? 1 : 0), ran+0 }
-          ' /tmp/cargo-test.out)
+          ' "$RUNNER_TEMP/cargo-test.out")
           CONTRACT_FOUND=${CONTRACT%% *}
           CONTRACT_RAN=${CONTRACT##* }
           # The reading must BE a reading before it is compared. Two failure
@@ -290,7 +662,7 @@ jobs:
                      "assignment above under set -e and never reaches this — so its END block" \
                      "did not run, or its output grammar changed. This is a fault in the" \
                      "census, not a verdict about the pin. Fix the census."
-                exit 1 ;;
+                exit "${FAIL_RC}" ;;
             esac
           done
           echo "supervisor orphan_kill_contract: target ran ${CONTRACT_FOUND}, ${CONTRACT_RAN} tests (floor ${MIN_CONTRACT_TESTS})"
@@ -307,7 +679,7 @@ jobs:
                  "would make the next real deletion silent again. Third cause: cargo itself" \
                  "exited ${SUBRC}, and a non-zero value there means the target failed to" \
                  "BUILD — cargo own error above is then what to read, not this message."
-            exit 1
+            exit "${FAIL_RC}"
           fi
           if [ "${CONTRACT_RAN}" -lt "${MIN_CONTRACT_TESTS}" ]; then
             echo "::error::The orphan_kill_contract target ran ${CONTRACT_RAN} test(s)," \
@@ -317,17 +689,24 @@ jobs:
                  "cargo itself exited ${SUBRC}; a non-zero value there with a count of 0" \
                  "means the binary DIED before its harness printed anything, and cargo's" \
                  "own error above is the cause rather than removed tests."
-            exit 1
+            exit "${FAIL_RC}"
           fi
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+          QONTINUI_RUNNER_INSTANCE_ENV_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/instance_env.rs
 
-      # `cargo test` swallows stdout for tests that pass, so the roster
-      # cross-check's verdict — which source it read, and at which sha — would
-      # leave no artifact in the CI log, and a control that leaves no artifact
-      # cannot be audited. Re-run just this binary with --nocapture so the
-      # evidence is recorded.
+      # `cargo test` swallows stdout for tests that pass, so the two cross-repo
+      # checks' verdicts would leave no artifact in the CI log, and a control
+      # that leaves no artifact cannot be audited. Re-run just these two
+      # binaries with --nocapture so the evidence is recorded:
+      #   - machine_local_artifacts: which source the roster cross-check read,
+      #     and at which sha;
+      #   - root_confined_env_keys: which runner instance_env.rs it read, and
+      #     "all N runner keys present in the M-key copy" (or the keys the
+      #     runner has since dropped, which it reports rather than fails).
+      # Both run in ONE cargo invocation, so they share one compile rather than
+      # adding a second re-run step.
       #
       # It is NOT, however, "already compiled by the step above, so this costs
       # milliseconds" — that was this comment's original claim and it is wrong.
@@ -336,27 +715,41 @@ jobs:
       # `Finished ... in 44.01s`. The re-run is still worth ~44s; the number is
       # now measured rather than assumed. The recompile itself is a separate
       # defect (~90s per run across the two re-run steps) and is not fixed here.
-      - name: Record the machine-local artifact roster verdict
+      - name: Record the machine-local artifact roster and root-confined key verdicts
         run: |
           # `--test <target>` is a TARGET selector and cargo errors on an unknown
-          # target, so this step is already fail-closed against the target
-          # disappearing. The residual it is NOT closed against is the target
+          # target, so this step is already fail-closed against a target
+          # disappearing. The residual it is NOT closed against is a target
           # surviving with every #[test] removed — exit 0, "0 passed", and a step
-          # whose own name claims a verdict was recorded. That is what the count
-          # assertion below covers; the floor is 1 because this target holds a
-          # handful of tests and a number pretending to be tighter would be made
-          # up rather than measured (5 on 2026-09-06).
+          # whose own name claims a verdict was recorded. That is what the
+          # per-target count assertions below cover. Each floor is 1: both
+          # targets hold a handful of tests (5 and 2 on 2026-10-25) and a number
+          # pretending to be tighter would be made up rather than measured.
+          #
+          # --no-fail-fast: without it cargo stops after the first failing test
+          # binary, the second prints no summary, and the per-target check would
+          # blame the step's wiring for what is really the first binary's red.
           set +e
-          cargo test --test machine_local_artifacts -- --nocapture 2>&1 | tee /tmp/cargo-mla.out
+          cargo test --no-fail-fast --test machine_local_artifacts --test root_confined_env_keys -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-mla.out"
           SUBRC=${PIPESTATUS[0]}
           set -e
 
-          # ── TEST-COUNT FLOOR ────────────────────────────────────────────
+          # ── TEST-COUNT FLOOR, PER TARGET ────────────────────────────────
           # Plan 2026-09-06-rust-verification-green-but-vacuous, Phase 4.
-          # A target-selection change can collapse this suite to a handful of
-          # tests while the step still exits 0 and prints a plausible summary.
-          # The floor is the only thing that sees that, and it is committed so
-          # that LOWERING it shows up in a diff.
+          # A target-selection change can collapse a suite to nothing while the
+          # step still exits 0 and prints a plausible summary. The floor is the
+          # only thing that sees that, and it is committed so that LOWERING it
+          # shows up in a diff.
+          #
+          # The floor is applied to EACH target's own section of the output (from
+          # its `Running tests/<target>.rs` line to the next `Running` line), not
+          # to the sum: summed, one target's 2 tests would hide the other being
+          # emptied, since an emptied binary still prints a `0 passed` summary.
+          # The job sets CARGO_TERM_COLOR=always, so cargo wraps `Running` in
+          # ANSI codes; the extractor strips them before matching, as the shared
+          # vacuity awk does. A test that itself printed a line starting with
+          # `Running ` would end its target's section early — neither does
+          # today, and the result would be a red step, never a silent pass.
           #
           # The parser is `awk -f`, from a file this repo commits, because the
           # source of record lives in qontinui-claude-config and this runner
@@ -364,23 +757,29 @@ jobs:
           # number; a `grep` here would exit non-zero on no match and, under
           # this shell's `pipefail`, abort the step in exactly the zero-tests
           # case the guard exists for.
-          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-mla.out)
-          RAN=${VACUITY%% *}
-          SUMMARIES=${VACUITY##* }
           MIN_TESTS=1
-          echo "supervisor machine_local_artifacts: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
-          if [ "${SUMMARIES}" -eq 0 ]; then
-            echo "::error::No test summary of either format was found in this run's output." \
-                 "The command exited ${SUBRC} but produced no evidence that any test executed." \
-                 "That is UNKNOWN, not a pass."
-            exit 1
-          fi
-          if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
-            echo "::error::Only ${RAN} tests ran (floor ${MIN_TESTS}). The step exited 0 but the" \
-                 "suite collapsed — almost certainly a target-selection change rather than" \
-                 "deleted tests. Do NOT lower the floor to make this pass."
-            exit 1
-          fi
+          for TARGET in machine_local_artifacts root_confined_env_keys; do
+            awk -v t="${TARGET}" '
+              { l = $0; gsub(/\033\[[0-9;]*[a-zA-Z]/, "", l) }
+              l ~ /^[ \t]*Running / { f = (l ~ ("tests.?" t "[.]rs")); next }
+              f' "$RUNNER_TEMP/cargo-mla.out" > "$RUNNER_TEMP/cargo-${TARGET}.out"
+            VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk "$RUNNER_TEMP/cargo-${TARGET}.out")
+            RAN=${VACUITY%% *}
+            SUMMARIES=${VACUITY##* }
+            echo "supervisor ${TARGET}: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests)"
+            if [ "${SUMMARIES}" -eq 0 ]; then
+              echo "::error::No test summary of either format was found for ${TARGET} in this run's output." \
+                   "The command exited ${SUBRC} but produced no evidence that this target executed." \
+                   "That is UNKNOWN, not a pass."
+              exit 1
+            fi
+            if [ "${RAN}" -lt "${MIN_TESTS}" ]; then
+              echo "::error::Only ${RAN} ${TARGET} tests ran (floor ${MIN_TESTS}). The step exited" \
+                   "${SUBRC} but the target collapsed — almost certainly a target-selection change" \
+                   "or tests removed from the file. Do NOT lower the floor to make this pass."
+              exit 1
+            fi
+          done
 
           # ── NO SILENT RECOMPILE ──────────────────────────────────────────
           # Plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target,
@@ -395,7 +794,7 @@ jobs:
           # matches — proven by the plan's own mutation case: with the bug
           # reintroduced, this step measured 47.03s (a real recompile) and
           # the un-stripped grep still read clean. Strip SGR sequences first.
-          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-mla.out | grep -q 'Compiling qontinui-supervisor'; then
+          if sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/cargo-mla.out" | grep -q 'Compiling qontinui-supervisor'; then
             echo "::error::qontinui-supervisor recompiled during this step — it should" \
                  "already be built from 'Run tests' above. That is the exact defect" \
                  "plan 2026-09-06-supervisor-ci-recompiles-the-crate-once-per-cargo-test-target" \
@@ -408,6 +807,7 @@ jobs:
           exit "${SUBRC}"
         env:
           QONTINUI_RUNNER_FLEET_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/fleet.rs
+          QONTINUI_RUNNER_INSTANCE_ENV_RS: ${{ github.workspace }}/.runner-roster/src-tauri/src/instance_env.rs
 
       # Same reason, for the orphan-kill suite — and here the silence is not
       # merely unaudited, it is a green that can mean the suite never ran.
@@ -441,7 +841,7 @@ jobs:
       - name: Record the orphan-kill suite's skip reasons
         run: |
           set +e
-          cargo test --test orphan_kill_unix -- --nocapture 2>&1 | tee /tmp/cargo-orphan.out
+          cargo test --test orphan_kill_unix -- --nocapture 2>&1 | tee "$RUNNER_TEMP/cargo-orphan.out"
           SUBRC=${PIPESTATUS[0]}
           set -e
 
@@ -464,10 +864,13 @@ jobs:
           # exits 0 and always prints a number, where a `grep` would exit
           # non-zero on no match and, under this shell's pipefail, abort the step
           # in exactly the zero-tests case the guard exists for.
-          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-orphan.out)
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk "$RUNNER_TEMP/cargo-orphan.out")
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
-          echo "supervisor orphan_kill_unix: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          # No crate-target floor above 1, by choice: `--test orphan_kill_unix`
+          # selects ONE target, so there is no suite to collapse (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
+          MIN_TARGETS=1
+          echo "supervisor orphan_kill_unix: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
@@ -491,9 +894,11 @@ jobs:
           # (port busy, no python3, an `lsof` that cannot run) and reporting
           # "3 passed". Each skip is correct in the test — an unrunnable probe is
           # UNKNOWN about the kill primitives, not a verdict on them — but on
-          # ubuntu-latest an UNKNOWN here is a broken runner, not a fact to
-          # accept, and the point of this step is that the primitives were
-          # exercised.
+          # ubuntu-latest or the self-hosted pool an UNKNOWN here is a broken
+          # runner, not a fact to accept, and the point of this step is that the
+          # primitives were exercised. One pool-only cause is not a broken
+          # runner: every registration on the host shares its network, so a
+          # concurrent job there can hold one of the ports. A re-run goes hosted.
           #
           # The census counts POSITIVE evidence, never skips. A skip census would
           # fail OPEN — delete the skip calls, rename the marker, or delete the
@@ -526,7 +931,7 @@ jobs:
               }
             }
             END { for (n in seen) print n }
-          ' /tmp/cargo-orphan.out | sort | tr '\n' ' ')
+          ' "$RUNNER_TEMP/cargo-orphan.out" | sort | tr '\n' ' ')
           EXERCISED=${EXERCISED% }
           echo "supervisor orphan_kill_unix: exercised [${EXERCISED}] against a live listener (roster: ${EXPECTED_PRIMITIVES})"
 
@@ -558,10 +963,12 @@ jobs:
                  "process:${MISSING}. The suite exited ${SUBRC} and ran ${RAN} tests;" \
                  "whatever that exit code says, those primitives were not tested, which is" \
                  "UNKNOWN rather than a pass. Any reason a test gave for declining is listed" \
-                 "below. On ubuntu-latest all of them should run: python3, lsof and ports" \
-                 "9896-9898 are all expected to be available. Fix the runner (or the test)," \
-                 "never this roster."
-            awk '/ORPHAN_KILL_SKIP: /{print "  " $0}' /tmp/cargo-orphan.out
+                 "below. On ubuntu-latest and on the self-hosted pool all of them should run:" \
+                 "python3, lsof and ports 9896-9898 are all expected to be available (on the" \
+                 "pool ${RUNNER_NAME:-?} shares the host's network with its other registrations," \
+                 "so a concurrent job can hold a port; a re-run goes hosted). Fix the runner" \
+                 "(or the test), never this roster."
+            awk '/ORPHAN_KILL_SKIP: /{print "  " $0}' "$RUNNER_TEMP/cargo-orphan.out"
             exit 1
           fi
           if [ -n "${UNGATED}" ]; then
@@ -580,7 +987,7 @@ jobs:
           # here is a ~44s regression that changes no verdict.
           # See the roster step's identical assertion above for why this
           # strips SGR sequences before grepping.
-          if sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-orphan.out | grep -q 'Compiling qontinui-supervisor'; then
+          if sed -E 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/cargo-orphan.out" | grep -q 'Compiling qontinui-supervisor'; then
             echo "::error::qontinui-supervisor recompiled during this step — see the" \
                  "roster step's identical assertion above for what this means and why."
             exit 1
@@ -594,16 +1001,55 @@ jobs:
   # malformed pin must never degrade to "fetch main"), so they are tested here.
   ci-scripts-tests:
     name: CI script tests
-    runs-on: ubuntu-latest
+    # Routed like Rust Check: see `route` and Rust Check's `runs-on`.
+    needs: route
+    if: ${{ !cancelled() }}
+    # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # SELF-HOSTED ONLY: a HOME and TMPDIR of the job's own, as in Rust Check
+      # (every registration on the host shares one account and one home).
+      - name: "Self-hosted: own HOME and TMPDIR"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/home" "$RUNNER_TEMP/tmp"
+          {
+            echo "HOME=$RUNNER_TEMP/home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $RUNNER_TEMP/home"
       - name: Schemas sibling pin tests
         run: bash .github/scripts/test-schemas-pin.sh
+      - name: Pre-commit cargo target-dir tests
+        run: bash .github/scripts/test-pre-commit-cargo.sh
+      # The persistent-cache slot pool's selection, eviction, legacy reap and
+      # lock lifetime, over a fixture tree; and that no workflow keys a
+      # persistent path by $RUNNER_NAME again.
+      - name: CI cache slot pool tests
+        run: bash .github/scripts/test-ci-cache-slot.sh
+      # The pool label set is spelled in several places (see Rust Check's
+      # `runs-on`). Drift there makes the router count no pool jobs, so a dead
+      # pool reads healthy and the hosted floor never takes over, silently.
+      - name: Pool label set is spelled the same everywhere
+        run: |
+          bash .github/scripts/test-ci-lane-labels.sh
+          python3 -I -B .github/scripts/check-ci-lane-labels.py .github/workflows/ci.yml
 
   compose-parity:
     name: Compose Parity (cross-repo fixture drift)
-    runs-on: ubuntu-latest
+    # Routed like Rust Check: see `route` and Rust Check's `runs-on`. Its
+    # `cargo test compose_parity` compiles every test target, the build the
+    # ram-16g class was measured on.
+    needs: route
+    if: ${{ !cancelled() }}
+    # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     # Enforces the supervisor-side half of the load-bearing invariant that
     # qontinui-supervisor/src/cache_key.rs::compose and
@@ -640,15 +1086,94 @@ jobs:
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # SELF-HOSTED ONLY. The same step as Rust Check's, which says why each
+      # part exists; keep the two identical. Both jobs draw from the one slot
+      # pool, so whichever of the two jobs last held a slot left it warm for
+      # the other.
+      - name: "Self-hosted: host check, own HOME and rustup, compile caps and the persistent target"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          CI_CACHE_SLOTS: ${{ vars.CI_CACHE_SLOTS }}
+          CI_CACHE_BUDGET_GIB: ${{ vars.CI_CACHE_BUDGET_GIB }}
+        run: |
+          set -euo pipefail
+          missing=""
+          for tool in cc git curl python3 lsof npm flock; do
+            command -v "$tool" >/dev/null || missing="$missing $tool"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error title=self-hosted host not provisioned::runner '$RUNNER_NAME' lacks:$missing. The HOST is at fault, not this change: provision it. A re-run goes to the hosted floor; SUPERVISOR_CI_LINUX_LANE=hosted keeps new runs off the pool."
+            exit 1
+          fi
+
+          pool_home="$HOME"
+          # shellcheck source=/dev/null
+          . .github/scripts/ci-cache-slot.sh
+          ci_cache_slot_select --root "$pool_home/.cache/qontinui-supervisor-ci" \
+            --budget-gib 40 --entry-bound-gib 40 --floor-gib 60 --entry target
+          state="$CI_CACHE_STATE_DIR"
+          job_home="$RUNNER_TEMP/home"
+          mkdir -p "$state/rustup" "$job_home" "$RUNNER_TEMP/tmp"
+
+          budget_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+          cg="/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)"
+          while [ "$cg" != "/sys/fs/cgroup" ] && [ -n "$cg" ]; do
+            for f in memory.max memory.high; do
+              v=$(cat "$cg/$f" 2>/dev/null || echo max)
+              case "$v" in ''|*[!0-9]*) continue ;; esac
+              if [ $((v / 1024)) -lt "$budget_kb" ]; then budget_kb=$((v / 1024)); fi
+            done
+            cg="${cg%/*}"
+          done
+          cpus=$(nproc)
+          jobs=$(( budget_kb / 3145728 ))
+          [ "$budget_kb" -gt 8388608 ] || jobs=1
+          [ "$jobs" -ge 1 ] || jobs=1
+          [ "$jobs" -le "$cpus" ] || jobs=$cpus
+          threads=4
+          [ "$threads" -le "$cpus" ] || threads=$cpus
+
+          {
+            echo "CARGO_HOME=${CARGO_HOME:-$pool_home/.cargo}"
+            echo "RUSTUP_HOME=$state/rustup"
+            echo "HOME=$job_home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+            echo "CARGO_BUILD_JOBS=$jobs"
+            echo "RUST_TEST_THREADS=$threads"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $job_home; CARGO_HOME stays in $pool_home; RUSTUP_HOME and the target are this job's slot ($CI_CACHE_SLOT), under $state"
+          echo "memory budget $((budget_kb / 1048576)) GiB, nproc $cpus -> CARGO_BUILD_JOBS=$jobs RUST_TEST_THREADS=$threads"
+
+          # ci_cache_slot_select already bounded it (unreadable, over its
+          # bound, or under the free-space floor: cold) and created it.
+          cache="$CI_CACHE_ENTRY_DIR"
+          used_kb="$CI_CACHE_ENTRY_USED_KB"
+          if [ -e target ] && [ ! -L target ]; then rm -rf target; fi
+          ln -sfn "$cache" target
+          echo "target -> $cache ($((used_kb / 1048576)) GiB already built)"
 
       # qontinui-supervisor's Cargo.toml declares qontinui-types as a path: dep
       # at ../qontinui-schemas/rust. Without the sibling checkout, the build
       # fails with "failed to read ../qontinui-schemas/rust/Cargo.toml".
-      # PINNED to .github/sibling-pins.conf, same as rust-check.
+      # PINNED to .github/sibling-pins.conf, same as rust-check, and on the
+      # pool reused and retried the same way (see Rust Check's step).
       - name: Checkout sibling repos
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+        run: |
+          # A refusal of the pin itself fails here, with the copy untouched.
+          bash .github/scripts/schemas-pin.sh read > /dev/null
+          rc=0
+          bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.." || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=schemas sibling checkout failed::exit $rc; removing ../qontinui-schemas and retrying once"
+            rm -rf "${GITHUB_WORKSPACE:?}/../qontinui-schemas"
+            bash .github/scripts/schemas-pin.sh checkout "$GITHUB_WORKSPACE/.."
+          fi
 
       # Pin matches rust-toolchain.toml (channel = "1.95.0"). The toolchain
       # file overrides any other channel for every cargo invocation.
@@ -658,7 +1183,9 @@ jobs:
           toolchain: "1.95.0"
           components: rustfmt, clippy
 
+      # Hosted only, for the reasons on Rust Check's identical step.
       - name: Cache cargo dependencies
+        if: runner.environment == 'github-hosted'
         uses: actions/cache@v4
         with:
           path: |
@@ -680,7 +1207,7 @@ jobs:
           # legitimate consolidation does not red the step; what it catches is
           # the filter matching NOTHING, which is the failure that is silent.
           set +e
-          cargo test compose_parity 2>&1 | tee /tmp/cargo-parity.out
+          cargo test compose_parity 2>&1 | tee "$RUNNER_TEMP/cargo-parity.out"
           SUBRC=${PIPESTATUS[0]}
           set -e
 
@@ -697,11 +1224,16 @@ jobs:
           # number; a `grep` here would exit non-zero on no match and, under
           # this shell's `pipefail`, abort the step in exactly the zero-tests
           # case the guard exists for.
-          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk /tmp/cargo-parity.out)
+          VACUITY=$(awk -f .github/scripts/cargo-vacuity-count.awk "$RUNNER_TEMP/cargo-parity.out")
           RAN=${VACUITY%% *}
           SUMMARIES=${VACUITY##* }
           MIN_TESTS=1
-          echo "supervisor compose_parity: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS})"
+          # No crate-target floor above 1, by choice. The name filter still runs
+          # every target (20 summaries on run 36615898220, 2026-09-29), but this
+          # step guards the NAMED tests; suite coverage is the Rust Check job's
+          # floor, not this one's (plan 2026-09-20-rust-verification-residuals-…, Phase 3).
+          MIN_TARGETS=1
+          echo "supervisor compose_parity: ${RAN} tests ran across ${SUMMARIES} summary line(s) (floor ${MIN_TESTS} tests, ${MIN_TARGETS} target)"
           if [ "${SUMMARIES}" -eq 0 ]; then
             echo "::error::No test summary of either format was found in this run's output." \
                  "The command exited ${SUBRC} but produced no evidence that any test executed." \
@@ -718,7 +1250,11 @@ jobs:
 
   frontend-check:
     name: Frontend Check
-    runs-on: ubuntu-latest
+    # Routed like Rust Check: see `route` and Rust Check's `runs-on`.
+    needs: route
+    if: ${{ !cancelled() }}
+    # coord-pools: [self-hosted, Linux, X64, ram-16g] | [ubuntu-latest]
+    runs-on: ${{ fromJSON((github.run_attempt == 1 && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.SUPERVISOR_CI_LINUX_LANE == 'self-hosted' && '["self-hosted","Linux","X64","ram-16g"]') || (github.run_attempt == 1 && needs.route.outputs.labels) || '["ubuntu-latest"]') }}
 
     defaults:
       run:
@@ -727,12 +1263,38 @@ jobs:
     steps:
       - name: Checkout qontinui-supervisor
         uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
+      # SELF-HOSTED ONLY: a HOME and TMPDIR of the job's own, as in Rust Check
+      # (every registration on the host shares one account and one home). npm's
+      # cache is under HOME, so on the pool it is this job's own and empty.
+      - name: "Self-hosted: own HOME and TMPDIR"
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/home" "$RUNNER_TEMP/tmp"
+          {
+            echo "HOME=$RUNNER_TEMP/home"
+            echo "TMPDIR=$RUNNER_TEMP/tmp"
+          } >> "$GITHUB_ENV"
+          echo "HOME -> $RUNNER_TEMP/home"
+
+      # On the pool setup-node takes Node 20 from the host's shared tool cache
+      # (downloaded there once; the host's own /usr/bin/node is v22.23.4,
+      # `node --version` on nawa 2026-11-03). The npm
+      # CACHE is hosted-only: on the pool a restore would land in a per-job
+      # HOME nobody keeps, and a save would put a pool-built entry into this
+      # repo's Actions cache. `package-manager-cache` is pinned too, so a
+      # `packageManager` field added to a package.json later cannot turn
+      # setup-node v5's automatic caching back on for the pool.
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
           node-version: 20
-          cache: npm
+          cache: ${{ runner.environment == 'github-hosted' && 'npm' || '' }}
+          package-manager-cache: ${{ runner.environment == 'github-hosted' }}
           cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
@@ -742,15 +1304,15 @@ jobs:
         run: npx tsc --noEmit
 
       - name: Lint
-        run: npm run lint 2>/dev/null || echo "No lint script configured, skipping"
+        run: npm run lint
         if: always()
 
       - name: Format check
-        run: npx prettier --check "src/**/*.{ts,tsx}" 2>/dev/null || echo "No prettier config, skipping"
+        run: npm run format:check
         if: always()
 
       - name: Test
-        run: npx vitest run 2>/dev/null || echo "No test config, skipping"
+        run: npm test
         if: always()
 
       - name: Build

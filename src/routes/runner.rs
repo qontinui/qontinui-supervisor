@@ -4,16 +4,18 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 
+use crate::dev_action::run_result::unhealthy_after_start_reason;
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, ActionRunResult, AttributionTargets, PredictedSignature,
-    SlotResolution,
+    mint_action, record_start_verdict, run_result_for, start_verdict, ActionKind, ActionRecord,
+    ActionRunResult, AttributionTargets, MintedAction, RunResultGuard, SyncProbe,
 };
 use crate::diagnostics::RestartSource;
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
 use crate::process::claude_env::StripInheritedClaudeMarkers;
-use crate::process::health_probe::{wait_for_runner_healthy_default, HealthProbeFailure};
+use crate::process::health_probe::{
+    wait_for_action_boot_healthy, wait_for_runner_healthy_default, HealthProbeFailure,
+};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::state::SharedState;
@@ -21,9 +23,11 @@ use crate::state::SharedState;
 /// Query string for endpoints that opt-OUT of the post-spawn health wait.
 ///
 /// Default is `wait=true` (poll up to 30s for the runner's `/health` to come
-/// up before returning 200). Pass `?wait=false` to get the legacy
+/// up before returning 200; a `rebuild: true` restart has already answered 202,
+/// so it polls longer, for its own boot). Pass `?wait=false` to get the legacy
 /// fire-and-forget behavior (200 the moment the OS process spawns, even if
-/// it's hung).
+/// it's hung); the minted action's result then comes from a detached health
+/// wait, not from the response (`dev_action::record_start_verdict`).
 #[derive(Deserialize, Default)]
 pub struct StartWaitQuery {
     #[serde(default = "default_wait_true")]
@@ -37,163 +41,105 @@ fn default_wait_true() -> bool {
 /// Build the standard 503 body for a runner that started but didn't bind
 /// its API port within the wait budget. Shared between the legacy
 /// `/runner/restart` and the per-runner `/runners/{id}/start` so both
-/// endpoints expose an identical contract.
+/// endpoints expose an identical contract, the action's fields included: its
+/// watcher is what reads why the runner never came up.
 pub(crate) fn unhealthy_after_start_response(
     runner_id: &str,
     failure: HealthProbeFailure,
+    minted: &MintedAction,
 ) -> Response {
-    let body = serde_json::json!({
-        "error": "runner_unhealthy_after_start",
-        "runner_id": runner_id,
-        "elapsed_ms": failure.elapsed_ms,
-        "recent_logs": failure.recent_logs,
-    });
+    let body = minted.stamp(unhealthy_after_start_body(runner_id, &failure));
     (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response()
 }
 
-/// Render an [`ActionRisk`] as the `risk` ACK field: `null` when there is no
-/// actionable risk (healthy / no-history case), otherwise an object carrying the
-/// `route_lkg` advice, the human-readable `warning`, and the `top_signature`
-/// evidence so the initiator sees exactly what tripped the assessment.
-fn risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
-    if !risk.is_actionable() {
-        return serde_json::Value::Null;
-    }
+/// What every answer to a failed health wait says: a held-open door's 503, and a
+/// detached rebuild's `GET /build/{id}/status`.
+fn unhealthy_after_start_body(runner_id: &str, failure: &HealthProbeFailure) -> serde_json::Value {
     serde_json::json!({
-        "route_lkg": risk.route_lkg,
-        "warning": risk.warn,
-        "top_signature": risk.top_signature,
+        "error": "runner_unhealthy_after_start",
+        "runner_id": runner_id,
+        "elapsed_ms": failure.elapsed_ms,
+        "ended": failure.ended,
+        "recent_logs": failure.recent_logs,
     })
 }
 
-/// Map an error that ended a primary-runner action to the action's own terminal
-/// result.
-///
-/// [`SupervisorError::RestartUnsafe`] is the readiness gate REFUSING — nothing
-/// ran, so no effect surface was touched and a clean attribution window carries
-/// no information about it. Everything else ran and failed. Both classify to
-/// `D3Category::Failure` (plan §5 rejects a sixth category); the distinction is
-/// carried on the record and surfaces in the outcome's `evidence_ref`.
-///
-/// The refusal's `message` already begins with the gate's own code —
-/// `restart_refused_unsafe: …` when the runner reported live work,
-/// `restart_refused_unknown: …` when no verdict could be obtained — which is
-/// what an operator (and `GET /build/{id}/status`) greps for, so it is carried
-/// verbatim rather than re-worded here.
-fn run_result_for(err: &SupervisorError) -> ActionRunResult {
-    match err {
-        SupervisorError::RestartUnsafe(detail) => ActionRunResult::Refused {
-            reason: detail.message.clone(),
-        },
-        other => ActionRunResult::Errored {
-            reason: other.to_string(),
-        },
-    }
+/// The body a detached rebuild-restart records when its health wait fails
+/// (surfaced on `GET /build/{id}/status`): the shared body plus `status`, which
+/// a poller of that route branches on.
+fn detached_unhealthy_after_start_body(
+    runner_id: &str,
+    failure: &HealthProbeFailure,
+) -> serde_json::Value {
+    let mut body = unhealthy_after_start_body(runner_id, failure);
+    body["status"] = "unhealthy_after_start".into();
+    body
 }
 
-/// Mint a dev-action snapshot for a primary-runner action (restart / build),
-/// evaluate the active dev-state set at execution time, store the record, and
-/// spawn the detached attribution watcher.
+/// Mint a dev-action trial for a primary-runner action (restart / build)
+/// through [`mint_action`], targeting the primary's registry entry
+/// ([`primary_attribution_targets`]).
 ///
-/// State evaluation includes `LEGACY_EXE_FALLBACK` via a cheap
-/// `resolve_source_exe_with_slot` probe — the `None` slot id is the
-/// genuinely-new signal (§2 of the plan) that the legacy `target/debug` exe
-/// (no embedded assets) is what would deploy. Resolution is a read of facts
-/// already in memory, so this stays off the blocking green path (§8 criterion
-/// 6).
-///
-/// Returns `(record, states_active, predicted, risk)`. The `Arc<ActionRecord>`
-/// is returned (rather than just its id) so the executing path can record the
-/// action's **terminal result** on it — the input the attribution watcher was
-/// missing, without which a refused or failed action still closed `Confirmed`
+/// The returned record is there so the executing path can record the action's **terminal result** on it,
+/// without which a refused or failed action closed `Confirmed`
 /// (`plans/2026-09-04-supervisor-refused-restart-reports-confirmed.md`).
-/// Phase 4: `predicted` is coord's state-conditioned expectations for this
-/// `(kind, states_active)` — fetched best-effort with a 2s timeout so the
-/// initiating agent is warned BEFORE the action completes. An empty vec when
-/// coord is unreachable / has no history (fail-open; never blocks the action).
+/// `risk` is advice: the restart path biases toward LKG on it and warns; it
+/// never refuses.
 ///
-/// "Act on predictions": `risk` is the pure
-/// [`assess_action_risk`] verdict over `predicted` + `states_active`. It is
-/// [`ActionRisk::none`] in the common healthy / no-history case (behavior
-/// unchanged) and carries `route_lkg` + a loud `warn` when a boot-failure-class
-/// signature clears the threshold. The caller decides what to do with it
-/// (the restart path biases toward LKG + warns; never refuses).
+/// `backstop_override` replaces the kind's backstop on the watcher's window
+/// (`WindowTiming::with_backstop_override`), for an action that can outlast it.
 async fn mint_primary_action(
     state: &SharedState,
     kind: ActionKind,
     params_digest: String,
     requester_id: Option<String>,
-    build_duration: Option<std::time::Duration>,
-) -> (
-    std::sync::Arc<ActionRecord>,
-    Vec<&'static str>,
-    Vec<PredictedSignature>,
-    ActionRisk,
-) {
-    // Resolve the slot the start path WOULD deploy so LEGACY_EXE_FALLBACK is a
-    // real signal, not Unknown. A resolution error (no exe anywhere) ⇒ leave it
-    // unevaluated so the state surfaces as `Unknown`, never a false `False`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
-        Ok((origin, _)) => SlotResolution::Resolved(origin),
-        Err(_) => SlotResolution::NotEvaluated,
-    };
-    let states = evaluate_all(state, slot_resolution).await;
-    let record = ActionRecord::new(kind, requester_id, params_digest, &states);
-    let action_id = record.action_id;
-    // Stamp the ACK with the canonical string ids (Phase-2b stores typed
-    // `DevState`; the ACK wire form is the canonical-id array, unchanged).
-    let states_active: Vec<&'static str> =
-        record.states_active.iter().map(|s| s.as_str()).collect();
+    backstop_override: Option<std::time::Duration>,
+) -> MintedAction {
+    mint_action(
+        state,
+        kind,
+        params_digest,
+        requester_id,
+        primary_attribution_targets(state).await,
+        backstop_override,
+    )
+    .await
+}
 
-    // Phase 4: fetch coord's state-conditioned expectations for this
-    // (kind, states) so the ACK warns the agent before the action completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(kind.as_str(), &states_active, 5).await;
+/// Re-key a restart's trial to `restart_lkg` when its start ran the LKG exe:
+/// the start was pointed at an LKG exe that exists (`lkg_pinned`, by the
+/// auto-bias or `use_lkg: true`) and `restart_runner` returned `Ok`, which it
+/// does only after spawning that exe (a pinned override whose file is missing
+/// fails the start rather than falling back to a slot exe). A refused or
+/// failed restart ran nothing and stays a `restart`, as does one that ran the
+/// fresh exe. Returns whether the trial was re-keyed.
+fn record_lkg_treatment(record: &ActionRecord, lkg_pinned: bool, restarted: bool) -> bool {
+    lkg_pinned && restarted && record.rekey_restart_to_lkg()
+}
 
-    // "Act on predictions": assess the prediction set against the active states.
-    // Pure + fail-open — `none()` in the healthy case. `route_lkg` + `warn` only
-    // when a boot-failure-class signature clears the threshold. Emit the warning
-    // here (loud `tracing::warn!` + a Supervisor log entry) so the risk is
-    // visible BEFORE the action's outcome lands, regardless of how the caller
-    // uses the advice.
-    let risk = assess_action_risk(&predicted, &states_active);
-    if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %action_id, kind = kind.as_str(), "{warn}");
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
-            .await;
-    }
-
-    let arc = state.dev_actions.write().await.insert(record);
-
-    // The watcher targets the primary's early-log + cached health. The
-    // early-log path is read at window close (it may not be set until the
-    // restart spawns the runner); capture the runner id now so the health scan
-    // can find the right cached snapshot.
-    let (early_log_path, runner_id) = match state.get_primary().await {
-        Some(primary) => (
-            primary.early_log_path.read().await.clone(),
-            Some(primary.config.id.clone()),
-        ),
-        None => (None, None),
-    };
-    spawn_attribution_watcher(
-        state.clone(),
-        arc.clone(),
-        AttributionTargets {
-            early_log_path,
-            managed: None,
-            panic_log_path: None,
-            runner_id,
+/// Where the watcher of a primary-runner action looks for its effects.
+///
+/// It is handed the primary's registry entry, the same `Arc` the restart
+/// starts again in place, so at window close it reads the entry's spawn ring
+/// and, for every spawn inside the window, that spawn's early log and startup
+/// panic (under `--log-dir` the panic log is in `<log-dir>/runner-primary`).
+/// It used to be handed no entry, and so read the runner default panic log
+/// whatever the supervisor's flags, and the early log of the boot that was
+/// running at the mint. The runner id is captured now so the health scan can
+/// find the right cached snapshot. With no primary registered there is
+/// nothing to read.
+async fn primary_attribution_targets(state: &SharedState) -> AttributionTargets {
+    match state.get_primary().await {
+        Some(primary) => AttributionTargets {
+            runner_id: Some(primary.config.id.clone()),
+            managed: Some(primary),
         },
-        build_duration,
-    );
-
-    (arc, states_active, predicted, risk)
+        None => AttributionTargets::default(),
+    }
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RestartRequest {
     #[serde(default)]
     pub rebuild: bool,
@@ -217,10 +163,11 @@ pub struct RestartRequest {
     ///
     /// - `None` (DEFAULT) — no explicit operator choice. The supervisor is free
     ///   to AUTO-bias toward the last-known-good binary when
-    ///   [`assess_action_risk`] flags this restart as high-risk (a
-    ///   boot-failure-class prediction under the active states), instead of the
-    ///   freshest slot exe that history says white-screens. The restart is never
-    ///   refused — only biased — and the risk is warned loudly.
+    ///   [`assess_action_risk`](crate::dev_action::policy::assess_action_risk)
+    ///   flags this restart as high-risk (a boot-failure-class prediction under
+    ///   the active states), instead of the freshest slot exe that history says
+    ///   white-screens. The restart is never refused — only biased — and the
+    ///   risk is warned loudly.
     /// - `Some(true)` — explicitly pin this restart to the LKG binary (same
     ///   effect the auto-bias would apply, but operator-requested).
     /// - `Some(false)` — explicitly OPT OUT of the auto-LKG bias: run the
@@ -232,6 +179,15 @@ pub struct RestartRequest {
     /// compiles a fresh exe, so an LKG pin would be self-defeating).
     #[serde(default)]
     pub use_lkg: Option<bool>,
+    /// Restart the primary with the HANDOFF intent — same contract as
+    /// `POST /runners/{id}/restart`'s `handoff`
+    /// ([`crate::routes::runners::RestartRunnerRequest::handoff`]): the
+    /// close-request carries `{"handoff":"holders"}`, the readiness gate reads
+    /// `safe_with_handoff` (false or absent refuses with
+    /// `409 restart_refused_unsafe_for_handoff`), and the graceful wait is
+    /// extended. Defaults to `false`, the restart this route always did.
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 #[derive(Deserialize)]
@@ -241,24 +197,25 @@ pub struct WatchdogRequest {
     pub reset_attempts: bool,
 }
 
-// NOTE: `RestartRequest` deliberately does NOT carry `#[serde(deny_unknown_fields)]`,
-// while its sibling `routes::runners::RestartRunnerRequest` does. The asymmetry is
-// load-bearing, not an oversight: `qontinui-runner`'s
-// `src-tauri/src/mcp/ai_session.rs` documents POSTing `/runner/restart` with
-// `trigger_auto_continue` and `wait_timeout_seconds`, neither of which exists here.
-// They are ignored today; denying unknown fields would turn a documented caller into
-// a 422. Add the attribute only together with a fix for that caller.
+// NOTE: `RestartRequest` carries `#[serde(deny_unknown_fields)]`, like its sibling
+// `routes::runners::RestartRunnerRequest`. It used to omit it because
+// `qontinui-runner`'s `ai_session.rs` documented POSTing `/runner/restart` with
+// `trigger_auto_continue` and `wait_timeout_seconds`, neither of which exists here;
+// qontinui-runner#1971 removed that caller (and qontinui-claude-config#1635 the
+// last script one), so an unknown key is now a typo and
+// fails as a 422 instead of being dropped silently.
 
 impl RestartRequest {
     /// The build source this request selects, as the typed value every layer
     /// below the wire takes. See [`manager::BuildTree`] for why the internal
     /// representation is an enum and not this bool.
     pub fn build_tree(&self) -> manager::BuildTree {
-        if self.from_working_tree {
-            manager::BuildTree::LiveWorkingTree
-        } else {
-            manager::BuildTree::OriginMain
-        }
+        manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -315,6 +272,112 @@ impl Default for RebuildWhenIdleRequest {
     }
 }
 
+/// The tree `POST /runner/rebuild-when-idle` rebuilds the primary from. One
+/// constant so the detached rebuild and the `build_source` its 202 echoes
+/// cannot disagree.
+const REBUILD_WHEN_IDLE_TREE: manager::BuildTree = manager::BuildTree::OriginMain;
+
+/// The backstop of a `rebuild_when_idle` action's window: its wait's deadline
+/// plus a whole build's backstop, since it mints at arm time and builds only
+/// once the primary drains. The kind's own 2-hour backstop could expire inside
+/// a `deadline_secs` of up to 24 h and close the window before the rebuild ran.
+/// It records a result on every exit, so this bounds only a dead task's row.
+fn rebuild_when_idle_backstop(deadline_secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(deadline_secs)
+        .saturating_add(crate::dev_action::attribution::LONG_BACKSTOP_WINDOW)
+}
+
+/// The terminal result of `rebuild_when_idle`'s rebuild once the primary
+/// drained: the error's when the restart failed ([`run_result_for`]), else the
+/// verdict of the health wait that followed it ([`start_verdict`]), so a
+/// rebuilt primary that never binds its API is not `Ran`. With no health check
+/// at all (no primary to probe once the restart returned) it is `Errored`.
+fn rebuild_when_idle_result(
+    restart: &Result<(), SupervisorError>,
+    health: SyncProbe,
+) -> ActionRunResult {
+    match restart {
+        Err(e) => run_result_for(e),
+        Ok(()) => match start_verdict(health) {
+            crate::dev_action::StartVerdict::Now(result) => result,
+            crate::dev_action::StartVerdict::AfterHealthWait => ActionRunResult::Errored {
+                reason: "runner_unhealthy_after_start: the primary was gone when its \
+                         post-rebuild health check ran"
+                    .to_string(),
+            },
+        },
+    }
+}
+
+/// The build-status body of a `rebuild_when_idle` whose rebuild-restart
+/// succeeded, by the verdict its post-rebuild health wait recorded
+/// ([`rebuild_when_idle_result`]): `"rebuilt"` (200) once the rebuild's own boot
+/// answered, else `"rebuilt_unhealthy"` (502) carrying the health wait's
+/// error. The rebuild ran either way, so an operator polling
+/// `GET /build/{id}/status` must not read a boot nothing confirmed healthy as a
+/// clean rebuild. It can mean the boot did not answer within the wait (a bound,
+/// not proof: it may still answer), ended early, or had no primary left to check,
+/// and a crash-watchdog respawn may be up by the time this is read.
+fn rebuilt_body(
+    result: &ActionRunResult,
+    waited_secs: u64,
+    ticks: u64,
+    drained_reason: &str,
+) -> (u16, serde_json::Value) {
+    match result.reason() {
+        None => (
+            StatusCode::OK.as_u16(),
+            serde_json::json!({
+                "status": "rebuilt",
+                "waited_secs": waited_secs,
+                "ticks": ticks,
+                "drained_reason": drained_reason,
+            }),
+        ),
+        Some(error) => (
+            StatusCode::BAD_GATEWAY.as_u16(),
+            serde_json::json!({
+                "status": "rebuilt_unhealthy",
+                "error": error,
+                "waited_secs": waited_secs,
+                "ticks": ticks,
+                "drained_reason": drained_reason,
+            }),
+        ),
+    }
+}
+
+/// The operator log line of a `rebuild_when_idle` whose rebuild ran and whose
+/// own boot was not confirmed healthy ([`rebuilt_body`]'s `rebuilt_unhealthy`),
+/// and none for one that was. Nobody is watching this door when it fires, so the line
+/// has the level of the failed restart beside it.
+fn unhealthy_rebuild_log(result: &ActionRunResult, runner_name: &str) -> Option<String> {
+    result.reason().map(|reason| {
+        format!(
+            "Rebuild-when-idle: '{runner_name}' rebuilt, but that boot was not confirmed healthy: {reason}"
+        )
+    })
+}
+
+/// The health of the primary's boot `action_id` started, by the wait for a
+/// start nobody is held open on. Not probed when no primary is registered.
+async fn primary_health_after_start(
+    state: &SharedState,
+    after: &str,
+    action_id: uuid::Uuid,
+) -> SyncProbe {
+    let Some(primary) = state.get_primary().await else {
+        return SyncProbe::NotProbed;
+    };
+    let runner_id = primary.config.id.clone();
+    match wait_for_action_boot_healthy(state, &runner_id, action_id).await {
+        Ok(()) => SyncProbe::Healthy,
+        Err(failure) => SyncProbe::Unhealthy {
+            reason: unhealthy_after_start_reason(&runner_id, &failure, after),
+        },
+    }
+}
+
 /// `POST /runner/rebuild-when-idle` — watch the primary until its Claude
 /// sessions drain, then rebuild it from `origin/main`.
 ///
@@ -346,7 +409,13 @@ impl Default for RebuildWhenIdleRequest {
 ///     `origin/main` worktree — "latest code" as asked, not the contested
 ///     working checkout.
 ///
-/// Returns 202 + `build_id` immediately; poll `GET /build/{id}/status`.
+/// Returns 202 + `build_id` immediately; poll `GET /build/{id}/status`. Its
+/// `detached` body ends as `rebuilt` (200), `rebuilt_unhealthy` (502: the
+/// rebuild ran and its own boot was not confirmed healthy), `gave_up_waiting` (408: nothing
+/// rebuilt, nothing stopped), `aborted` (404: the primary left the registry) or
+/// `error` (500: the restart failed, or the readiness gate refused it at fire
+/// time; the `error` text says which), or `panicked` (500) if its task panicked.
+/// Only `rebuilt` reads as `succeeded`.
 pub async fn rebuild_when_idle(
     State(state): State<SharedState>,
     body: OptionalJson<RebuildWhenIdleRequest>,
@@ -377,8 +446,9 @@ pub async fn rebuild_when_idle(
 
     // A rebuild-restart is a `build`-kind action, exactly as the rebuild arm of
     // `restart_runner` mints it — the outcome lands after the build, not after
-    // this 202.
-    let (action_record, _states_active, _predicted, risk) = mint_primary_action(
+    // this 202. It mints now, at arm time, so its window's backstop covers the
+    // wait's deadline as well as the build.
+    let minted = mint_primary_action(
         &state,
         ActionKind::Build,
         format!(
@@ -386,22 +456,23 @@ pub async fn rebuild_when_idle(
             poll_secs, deadline_secs
         ),
         None,
-        None,
+        Some(rebuild_when_idle_backstop(deadline_secs)),
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
 
     let exec_state = state.clone();
-    let exec_record = action_record.clone();
+    let exec_record = minted.record.clone();
+    let exec_guard =
+        RunResultGuard::arm(minted.record.clone(), "rebuild-when-idle's detached task");
     // The detached future outlives this handler, so it gets its own copy of the
     // name rather than borrowing the one the 202 body still needs.
     let exec_runner_name = runner_name.clone();
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
+            let _run_guard = exec_guard;
             let started = std::time::Instant::now();
             let deadline = std::time::Duration::from_secs(deadline_secs);
             let poll = std::time::Duration::from_secs(poll_secs);
@@ -429,13 +500,17 @@ pub async fn rebuild_when_idle(
                     );
                 };
 
-                let (port_open, api_responding) = {
+                let (port_open, api_responding, spawn_up) = {
                     let h = managed.cached_health.read().await;
-                    (h.runner_port_open, h.runner_responding)
+                    (h.runner_port_open, h.runner_responding, h.spawn_up)
                 };
                 let (liveness, root_pid, started_at) = {
                     let r = managed.runner.read().await;
-                    (r.liveness(port_open, api_responding), r.pid, r.started_at)
+                    (
+                        r.liveness(port_open, api_responding, spawn_up),
+                        r.pid,
+                        r.started_at,
+                    )
                 };
 
                 let readiness = crate::restart_readiness::probe_with_census_fallback(
@@ -518,16 +593,32 @@ pub async fn rebuild_when_idle(
             // from origin/main, then restart.
             // `force: false` keeps the readiness gate armed inside — it is the
             // authoritative check, and a refusal here is a real refusal.
-            if let Err(e) = manager::restart_runner(
+            let restart = manager::restart_runner(
                 &exec_state,
                 true,
                 RestartSource::Manual,
                 false,
-                manager::BuildTree::OriginMain,
+                REBUILD_WHEN_IDLE_TREE,
+                manager::CloseIntent::Kill,
+                Some(exec_record.action_id),
             )
-            .await
-            {
-                exec_record.record_run_result(run_result_for(&e));
+            .await;
+            // Success records its verdict too, so the window closes a tail
+            // after the rebuild instead of on its backstop.
+            let health = match &restart {
+                Ok(()) => {
+                    primary_health_after_start(
+                        &exec_state,
+                        "rebuild-when-idle",
+                        exec_record.action_id,
+                    )
+                    .await
+                }
+                Err(_) => SyncProbe::NotProbed,
+            };
+            let result = rebuild_when_idle_result(&restart, health);
+            exec_record.record_run_result(result.clone());
+            if let Err(e) = restart {
                 exec_state
                     .logs
                     .emit(
@@ -545,33 +636,59 @@ pub async fn rebuild_when_idle(
                     }),
                 );
             }
+            if let Some(line) = unhealthy_rebuild_log(&result, &exec_runner_name) {
+                exec_state
+                    .logs
+                    .emit(LogSource::Supervisor, LogLevel::Error, line)
+                    .await;
+            }
 
-            (
-                StatusCode::OK.as_u16(),
-                serde_json::json!({
-                    "status": "rebuilt",
-                    "waited_secs": started.elapsed().as_secs(),
-                    "ticks": ticks,
-                    "drained_reason": last_reason,
-                }),
-            )
+            rebuilt_body(&result, started.elapsed().as_secs(), ticks, &last_reason)
         },
-    );
+    ).await;
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
+        Json(minted.stamp(serde_json::json!({
             "status": "watching",
             "build_id": submission_id,
-            "action_id": action_id,
+            // Same contract as the two restart 202s: name the tree the
+            // eventual rebuild compiles. This route already 404'd above when
+            // no primary is configured, so it is never `null` here.
+            "build_source": REBUILD_WHEN_IDLE_TREE.build_source(true),
             "runner": runner_name,
             "poll_secs": poll_secs,
             "deadline_secs": deadline_secs,
-            "risk": risk_json,
             "message": "Watching the primary for active sessions. It will rebuild from origin/main once they drain, and give up without rebuilding if the deadline passes first.",
-        })),
+        }))),
     )
         .into_response())
+}
+
+/// The guard that takes the primary's transient LKG `source_exe_override` off
+/// again, armed by [`restart_runner`] the moment it writes the override.
+///
+/// On the normal path (`run_now`) the restart has returned, so its start has
+/// resolved its exe, and the override comes off at once. Waiting for the lifecycle
+/// lock there would couple the answer to whatever holds it next: a stop queued
+/// behind the restart's start would hold the route for the length of that stop and
+/// leave its health wait polling a stopped runner. On a client hanging up the guard
+/// is dropped and runs on its own task while the restart's start may still be under
+/// way on its own task too, so only that cleanup first waits for the primary's
+/// lifecycle lock, which the start holds until it has resolved and copied its exe.
+/// Without the wait the start would launch the fresh exe the risk model routed away
+/// from.
+fn lkg_override_guard(
+    primary: std::sync::Arc<crate::state::ManagedRunner>,
+) -> manager::CleanupIfDropped {
+    let (now, if_dropped) = (primary.clone(), primary);
+    manager::CleanupIfDropped::new(async move {
+        *now.source_exe_override.write().await = None;
+    })
+    .if_dropped_run(async move {
+        let _lifecycle = if_dropped.lifecycle.lock().await;
+        *if_dropped.source_exe_override.write().await = None;
+    })
 }
 
 pub async fn restart_runner(
@@ -601,16 +718,25 @@ pub async fn restart_runner(
     } else {
         ActionKind::Restart
     };
-    let (action_record, states_active, predicted, risk) = mint_primary_action(
+    let minted = mint_primary_action(
         &state,
         action_kind,
-        format!("rebuild={};force={}", rebuild, body.force),
+        // `;handoff=true` only when set, so a non-handoff action's label is
+        // unchanged.
+        if body.handoff {
+            format!("rebuild={};force={};handoff=true", rebuild, body.force)
+        } else {
+            format!("rebuild={};force={}", rebuild, body.force)
+        },
         None,
         None,
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
+    let action_record = minted.record.clone();
+    // Every exit below records a result; this covers the ones that cannot: the
+    // handler future dropped mid-restart when its client disconnects, or a
+    // panic in the detached rebuild task, which the rebuild arm moves it into.
+    let run_guard = RunResultGuard::arm(action_record.clone(), "POST /runner/restart");
 
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     //
@@ -637,9 +763,16 @@ pub async fn restart_runner(
         let force = body.force;
         let from_working_tree = body.from_working_tree;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
+        let build_source = if state.get_primary().await.is_some() {
+            serde_json::json!(build_tree.build_source(true))
+        } else {
+            serde_json::Value::Null
+        };
         let do_health_wait = wait_q.wait;
+        let exec_guard = run_guard;
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
-            state.build_submissions.clone(),
+            &state.build_submissions,
             state.config.project_dir.clone(),
             None,
             async move {
@@ -653,6 +786,8 @@ pub async fn restart_runner(
                     RestartSource::Manual,
                     force,
                     build_tree,
+                    intent,
+                    Some(exec_record.action_id),
                 )
                 .await
                 {
@@ -679,45 +814,41 @@ pub async fn restart_runner(
 
                 // Port-bind verification (the manager call returns once the OS
                 // process spawns; the runner may still be pre-bind or hung).
-                // `wait=false` opts out (legacy behavior).
+                // `wait=false` answers without it, and the detached health
+                // wait below records the verdict instead (D9).
+                let primary_id = exec_state
+                    .get_primary()
+                    .await
+                    .map(|p| p.config.id.clone())
+                    .unwrap_or_default();
+                let mut probe = SyncProbe::NotProbed;
                 if do_health_wait {
                     if let Some(primary) = exec_state.get_primary().await {
                         let runner_id = primary.config.id.clone();
-                        if let Err(failure) =
-                            wait_for_runner_healthy_default(&exec_state, &runner_id).await
+                        // The 202 has gone, so nobody is held open on this wait.
+                        if let Err(failure) = wait_for_action_boot_healthy(
+                            &exec_state,
+                            &runner_id,
+                            exec_record.action_id,
+                        )
+                        .await
                         {
+                            let reason = unhealthy_after_start_reason(
+                                &runner_id,
+                                &failure,
+                                "the detached rebuild-restart",
+                            );
                             exec_state
                                 .logs
-                                .emit(
-                                    LogSource::Supervisor,
-                                    LogLevel::Warn,
-                                    format!(
-                                        "Runner '{}' did not become healthy {}ms after \
-                                         detached rebuild-restart",
-                                        runner_id, failure.elapsed_ms
-                                    ),
-                                )
+                                .emit(LogSource::Supervisor, LogLevel::Warn, reason.clone())
                                 .await;
                             // Phase 3 path 4: the runner started but never
                             // bound its port. It RAN, and it failed.
-                            exec_record.record_run_result(ActionRunResult::Errored {
-                                reason: format!(
-                                    "runner_unhealthy_after_start: runner '{}' did not become \
-                                     healthy within {}ms of the detached rebuild-restart",
-                                    runner_id, failure.elapsed_ms
-                                ),
-                            });
-                            return (
-                                StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                                serde_json::json!({
-                                    "status": "unhealthy_after_start",
-                                    "error": "runner_unhealthy_after_start",
-                                    "runner_id": runner_id,
-                                    "elapsed_ms": failure.elapsed_ms,
-                                    "recent_logs": failure.recent_logs,
-                                }),
-                            );
+                            exec_record.record_run_result(ActionRunResult::Errored { reason });
+                            let body = detached_unhealthy_after_start_body(&runner_id, &failure);
+                            return (StatusCode::SERVICE_UNAVAILABLE.as_u16(), body);
                         }
+                        probe = SyncProbe::Healthy;
                     }
                 }
 
@@ -789,11 +920,15 @@ pub async fn restart_runner(
                     None => serde_json::Value::Null,
                 };
 
-                // The build + restart completed. `Ran` leaves the effect
-                // surfaces in charge of the verdict (existing precedence) and,
-                // critically, CLOSES the window here rather than at the
-                // backstop — the window is now a measurement of the action.
-                exec_record.record_run_result(ActionRunResult::Ran);
+                // The build + restart completed. `Ran` once the runner
+                // answered (now, or from the detached health wait) leaves the
+                // effect surfaces in charge of the verdict (existing
+                // precedence) and, critically, CLOSES the window then rather
+                // than at the backstop — the window is a measurement of the
+                // action. `Healthy` here came from the own-boot wait above, so
+                // unlike a held-open door's it needs no `held_to_own_boot`.
+                let verdict = start_verdict(probe);
+                record_start_verdict(&exec_state, &primary_id, verdict, exec_guard);
 
                 (
                     StatusCode::OK.as_u16(),
@@ -804,11 +939,12 @@ pub async fn restart_runner(
                     }),
                 )
             },
-        );
+        )
+        .await;
 
         return Ok((
             StatusCode::ACCEPTED,
-            Json(serde_json::json!({
+            Json(minted.stamp(serde_json::json!({
                 // Phase 4: this ACK is emitted BEFORE the readiness gate runs,
                 // so it cannot honestly claim the rebuild is under way — the
                 // observed case is a restart refused 1.4s later that had already
@@ -822,15 +958,18 @@ pub async fn restart_runner(
                 "build_id": submission_id.to_string(),
                 "submission_id": submission_id.to_string(),
                 "poll": "/builds",
-                "action_id": action_id.to_string(),
-                "states_active": states_active,
-                "predicted": predicted,
-                "risk": risk_json,
-                "outcome_url": format!("/actions/{}/outcome", action_id),
+                // Which tree the detached rebuild compiles. This route always
+                // targets the primary, so it is the policy decision itself —
+                // echoed so a misread escape hatch is visible now, not after a
+                // 10-20 min build has put the wrong binary under the primary.
+                // `null` when no primary is configured: the detached restart
+                // fails on it at once, and a label would name a build that
+                // never runs (same contract as `POST /runners/{id}/restart`).
+                "build_source": build_source,
                 "message": "rebuild-restart submitted; the build+restart runs detached from \
                             this connection — poll GET /builds (or GET /build/{id}/status) \
                             for the terminal outcome",
-            })),
+            }))),
         )
             .into_response());
     }
@@ -854,17 +993,21 @@ pub async fn restart_runner(
     // it is a no-op (fail-open) and the normal slot resolution runs.
     let want_lkg = match body.use_lkg {
         Some(explicit) => explicit,
-        None => risk.route_lkg,
+        None => minted.risk.route_lkg,
     };
     // Track whether we set a transient override so we can clear it after the
     // restart, keeping the bias scoped to THIS restart (later restarts re-decide
-    // from fresh predictions rather than inheriting a sticky pin).
-    let mut biased_primary: Option<std::sync::Arc<crate::state::ManagedRunner>> = None;
+    // from fresh predictions rather than inheriting a sticky pin). The guard
+    // (`lkg_override_guard`) is armed the moment the override is written, so it
+    // comes off on every exit, a client hanging up included: left in place,
+    // every later start of the primary would launch the LKG exe.
+    let mut lkg_override: Option<manager::CleanupIfDropped> = None;
     if want_lkg {
         let lkg_exe = state.config.lkg_exe_path();
         if lkg_exe.exists() {
             if let Some(primary) = state.get_primary().await {
                 *primary.source_exe_override.write().await = Some(lkg_exe.clone());
+                lkg_override = Some(lkg_override_guard(primary));
                 let reason = if body.use_lkg == Some(true) {
                     "operator-requested (use_lkg:true)"
                 } else {
@@ -879,16 +1022,15 @@ pub async fn restart_runner(
                     .logs
                     .emit(LogSource::Supervisor, LogLevel::Warn, msg)
                     .await;
-                biased_primary = Some(primary);
             }
-        } else if risk.route_lkg || body.use_lkg == Some(true) {
+        } else if minted.risk.route_lkg || body.use_lkg == Some(true) {
             // Wanted LKG but none exists — surface it rather than silently
             // running the freshest slot exe under known high risk.
             let msg = format!(
                 "Restart wanted the last-known-good binary (risk_route_lkg={}, \
                  use_lkg={:?}) but no LKG exe exists at {:?}; proceeding with the \
                  freshest slot exe",
-                risk.route_lkg,
+                minted.risk.route_lkg,
                 body.use_lkg,
                 state.config.lkg_exe_path()
             );
@@ -906,29 +1048,47 @@ pub async fn restart_runner(
         RestartSource::Manual,
         body.force,
         body.build_tree(),
+        body.close_intent(),
+        Some(action_record.action_id),
     )
     .await;
 
     // Clear the transient LKG override so the bias does not leak into the next
-    // restart (which re-evaluates risk from fresh predictions). The runner has
-    // already resolved + copied its exe by the time `restart_runner` returns, so
-    // clearing now does not affect the just-started process.
-    if let Some(primary) = biased_primary {
-        *primary.source_exe_override.write().await = None;
+    // restart (which re-evaluates risk from fresh predictions). On this path the
+    // runner has already resolved + copied its exe, since `restart_runner` has
+    // returned, so clearing now does not affect the just-started process, and the
+    // guard does not wait on the lifecycle lock here. Had the client hung up
+    // instead, the guard's own task would wait for that lock first
+    // (`lkg_override_guard`).
+    let lkg_pinned = lkg_override.is_some();
+    if let Some(lkg_override) = lkg_override {
+        lkg_override.run_now().await;
     }
+    // S3: a restart that ran the LKG exe is a `restart_lkg` trial. Decided only
+    // now, once the start has run: a readiness refusal or a failed start ran no
+    // exe and stays a `restart`. Still before any run result is recorded on the
+    // action, and the watcher's window closes only on that result (plus its
+    // tail), so the snapshot is ingested under the re-keyed kind.
+    record_lkg_treatment(&action_record, lkg_pinned, restart_result.is_ok());
     // Phase 3 path 2: the SYNCHRONOUS `rebuild:false` restart. The action was
     // minted before the `if rebuild` branch, so a readiness refusal here
     // returned 409 to the caller while the minted action still closed
     // `Confirmed` 30s later — and was ingested to coord that way.
-    if let Err(e) = &restart_result {
-        action_record.record_run_result(run_result_for(e));
+    if let Err(e) = restart_result {
+        return Ok(minted.answer_failure(&e));
     }
-    restart_result?;
 
     // Port-bind verification: the manager call above returns the moment the
     // OS process is spawned, but the runner may still be pre-bind (or hung).
     // Poll its `/health` for up to 30s so callers can distinguish a healthy
-    // restart from a wedged one. `wait=false` opts out (legacy behavior).
+    // restart from a wedged one. `wait=false` answers without it, and the
+    // detached health wait records the verdict instead (D9).
+    let primary_id = state
+        .get_primary()
+        .await
+        .map(|p| p.config.id.clone())
+        .unwrap_or_default();
+    let mut probe = SyncProbe::NotProbed;
     if wait_q.wait {
         // Look up the primary runner id so the probe targets the right
         // managed entry. The legacy endpoint always restarts the primary,
@@ -936,41 +1096,39 @@ pub async fn restart_runner(
         if let Some(primary) = state.get_primary().await {
             let runner_id = primary.config.id.clone();
             if let Err(failure) = wait_for_runner_healthy_default(&state, &runner_id).await {
+                let reason = unhealthy_after_start_reason(&runner_id, &failure, "the restart");
                 action_record.record_run_result(ActionRunResult::Errored {
-                    reason: format!(
-                        "runner_unhealthy_after_start: runner '{}' did not become healthy \
-                         within {}ms of the restart",
-                        runner_id, failure.elapsed_ms
-                    ),
+                    reason: reason.clone(),
                 });
                 state
                     .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Warn,
-                        format!(
-                            "Runner '{}' did not become healthy {}ms after restart",
-                            runner_id, failure.elapsed_ms
-                        ),
-                    )
+                    .emit(LogSource::Supervisor, LogLevel::Warn, reason)
                     .await;
-                return Ok(unhealthy_after_start_response(&runner_id, failure));
+                return Ok(unhealthy_after_start_response(&runner_id, failure, &minted));
             }
+            probe = SyncProbe::Healthy;
         }
     }
 
-    action_record.record_run_result(ActionRunResult::Ran);
+    record_start_verdict(
+        &state,
+        &primary_id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &primary_id,
+            action_record.action_id,
+            start_verdict(probe),
+            chrono::Utc::now(),
+        )
+        .await,
+        run_guard,
+    );
 
-    Ok(Json(serde_json::json!({
+    Ok(Json(minted.stamp(serde_json::json!({
         "status": "restarted",
         "message": "Runner restarted successfully",
-        "action_id": action_id.to_string(),
-        "states_active": states_active,
-        "predicted": predicted,
-        "risk": risk_json,
         "routed_lkg": want_lkg,
-        "outcome_url": format!("/actions/{}/outcome", action_id),
-    }))
+    })))
     .into_response())
 }
 
@@ -1127,6 +1285,12 @@ pub async fn reset_build(
     })))
 }
 
+/// The tree `POST /runner/fix-and-rebuild` compiles. `run_cargo_build` takes no
+/// build-dir override, so this route always builds the live working checkout;
+/// both of its 202 arms echo it so the acknowledgement names the tree the same
+/// way the restart and rebuild-when-idle 202s do.
+const FIX_AND_REBUILD_SOURCE: manager::BuildSource = manager::BuildSource::LiveTree;
+
 /// POST /runner/fix-and-rebuild — Rebuild the live runner tree, detached from
 /// the HTTP connection.
 ///
@@ -1154,9 +1318,16 @@ pub async fn fix_and_rebuild(
     State(state): State<SharedState>,
 ) -> Result<impl IntoResponse, SupervisorError> {
     // Idempotent accept: if a prior rebuild is still running, return it.
+    //
+    // The write guard is held from this check through recording the new
+    // submission below, across the mint (a coord round trip) and the submit.
+    // Two calls inside that window would otherwise both build, racing the slots
+    // and the LKG, which is what the tracker exists to prevent. Nothing the
+    // guard is held across reads the tracker.
+    let mut inflight = state.fix_and_rebuild_inflight.write().await;
     {
-        let inflight = state.fix_and_rebuild_inflight.read().await;
-        if let Some(existing_id) = *inflight {
+        if let Some(existing) = inflight.as_ref() {
+            let existing_id = existing.submission_id;
             if let Some(arc) = state.build_submissions.get(&existing_id).await {
                 if !arc.read().await.status.is_terminal() {
                     state
@@ -1172,15 +1343,16 @@ pub async fn fix_and_rebuild(
                         .await;
                     return Ok((
                         StatusCode::ACCEPTED,
-                        Json(serde_json::json!({
+                        Json(existing.action.stamp(serde_json::json!({
                             "status": "accepted",
                             "build_id": existing_id.to_string(),
                             "submission_id": existing_id.to_string(),
                             "poll": format!("/build/{existing_id}/status"),
+                            "build_source": FIX_AND_REBUILD_SOURCE,
                             "deduplicated": true,
                             "message": "fix-and-rebuild already in flight; \
                                         poll GET /build/{id}/status for the terminal outcome",
-                        })),
+                        }))),
                     )
                         .into_response());
                 }
@@ -1197,13 +1369,11 @@ pub async fn fix_and_rebuild(
         )
         .await;
 
-    // Mint a `build`-kind dev-action snapshot at submission. The window is
-    // build-duration + 30s; the exact build duration isn't known at submission
-    // time, so the watcher uses the 30s tail (the build's own time is bounded
-    // by the build-submissions state machine — Phase 3's coord ingest will
-    // thread the precise duration). State eval captures the cause-side context
+    // Mint a `build`-kind dev-action snapshot at submission. The window stays
+    // open until the build records its result below, then a 30s tail, capped
+    // by the build backstop. State eval captures the cause-side context
     // (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at submission.
-    let (action_record, states_active, predicted, risk) = mint_primary_action(
+    let minted = mint_primary_action(
         &state,
         ActionKind::Build,
         "fix_and_rebuild".to_string(),
@@ -1211,8 +1381,6 @@ pub async fn fix_and_rebuild(
         None,
     )
     .await;
-    let action_id = action_record.action_id;
-    let risk_json = risk_ack_json(&risk);
 
     // Submit the live-tree rebuild to the build-submissions state machine. The
     // exec future runs in a detached background task — a client disconnect can
@@ -1221,12 +1389,14 @@ pub async fn fix_and_rebuild(
     // Phase 3 path 3: `fix-and-rebuild` mints an identical `ActionKind::Build`,
     // so a failing `run_cargo_build` returned 500 into the submission while the
     // action closed `Confirmed`.
-    let exec_record = action_record.clone();
+    let exec_record = minted.record.clone();
+    let exec_guard = RunResultGuard::arm(minted.record.clone(), "fix-and-rebuild's detached task");
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
+            let _run_guard = exec_guard;
             match crate::build_monitor::run_cargo_build(&exec_state).await {
                 Ok(()) => {
                     exec_record.record_run_result(ActionRunResult::Ran);
@@ -1239,9 +1409,7 @@ pub async fn fix_and_rebuild(
                     )
                 }
                 Err(e) => {
-                    exec_record.record_run_result(ActionRunResult::Errored {
-                        reason: e.to_string(),
-                    });
+                    exec_record.record_run_result(run_result_for(&e));
                     (
                         StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                         serde_json::json!({
@@ -1252,29 +1420,28 @@ pub async fn fix_and_rebuild(
                 }
             }
         },
-    );
+    )
+    .await;
 
-    // Record the new in-flight submission id for idempotent-accept dedup.
-    {
-        let mut inflight = state.fix_and_rebuild_inflight.write().await;
-        *inflight = Some(submission_id);
-    }
+    // Record the new in-flight submission for idempotent-accept dedup, under
+    // the guard taken at the check.
+    *inflight = Some(crate::state::FixAndRebuildInflight {
+        submission_id,
+        action: minted.clone(),
+    });
+    drop(inflight);
 
     Ok((
         StatusCode::ACCEPTED,
-        Json(serde_json::json!({
+        Json(minted.stamp(serde_json::json!({
             "status": "accepted",
             "build_id": submission_id.to_string(),
             "submission_id": submission_id.to_string(),
             "poll": format!("/build/{submission_id}/status"),
-            "action_id": action_id.to_string(),
-            "states_active": states_active,
-            "predicted": predicted,
-            "risk": risk_json,
-            "outcome_url": format!("/actions/{}/outcome", action_id),
+            "build_source": FIX_AND_REBUILD_SOURCE,
             "message": "fix-and-rebuild submitted; the build runs detached from this \
                         connection — poll GET /build/{id}/status for the terminal outcome",
-        })),
+        }))),
     )
         .into_response())
 }
@@ -1342,20 +1509,44 @@ pub async fn supervisor_restart(
 
     let remaining_args: Vec<String> = args.into_iter().skip(1).collect();
 
-    // NOTE: we deliberately do NOT call `stop_all_temp_runners` here — same
-    // reasoning as the shutdown path in `main.rs` ("the dominant source of
-    // `POST /supervisor/shutdown` latency: it iterated every temp runner with
-    // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
-    // wall-clock"). The `std::process::exit(0)` below closes this process's
-    // handles, including the kill-on-exit JobObject's, so the kernel reaps
-    // every assigned temp runner anyway.
+    // A supervisor that is the MAIN process of a systemd service — which is
+    // how `supervisor-verbs.sh start` runs it on Linux once plan Phase 2
+    // lands — cannot restart itself this way: the replacement would be
+    // spawned into the same unit, and systemd kills the rest of that unit's
+    // cgroup the moment this process exits. Refuse BEFORE spawning anything,
+    // naming the way that works.
+    let own_unit = crate::process::systemd_scope::own_unit(std::path::Path::new("/proc")).await;
+    if let Some(why) =
+        crate::process::systemd_scope::self_restart_refusal(&own_unit, std::process::id())
+    {
+        let msg = format!("Supervisor self-restart refused: {why}");
+        state
+            .logs
+            .emit(LogSource::Supervisor, LogLevel::Warn, msg.clone())
+            .await;
+        return Err(SupervisorError::SelfRestartRefused(msg));
+    }
+
+    // What happens to temp runners on this spawn-and-exit path is
+    // PLATFORM-SPECIFIC:
+    // - Windows: the `std::process::exit(0)` below closes this process's
+    //   handles, including the kill-on-exit JobObject's, so the kernel reaps
+    //   every assigned temp runner. No sweep runs here — it was "the dominant
+    //   source of `POST /supervisor/shutdown` latency" (a 5 s graceful-stop
+    //   poll plus a 5 s port-free wait per runner).
+    // - Off Windows the runner job is a no-op stub and nothing reaps them, so
+    //   the bounded (~2.5 s: ≤500 ms read, then 2 s kill), concurrent
+    //   shutdown sweep runs below, after the shutdown is latched and BEFORE the
+    //   hard exit is armed — otherwise that exit, ~600 ms later, would cut the
+    //   sweep short inside its SIGTERM grace.
     //
-    // User-owned runners (primary, named, external) genuinely survive this
-    // restart: `process::job::should_assign_to_ephemeral_job` never assigns
-    // them to that job. Before 2026-07-28 they did NOT survive — this
-    // endpoint is spawn-and-exit, so it reaped them exactly like the
-    // `restart-supervisor.ps1` path did, while the comment here claimed the
-    // opposite.
+    // User-owned runners (primary, named, external) survive this restart on
+    // every platform: `process::job::should_assign_to_ephemeral_job` never
+    // assigns them to that job, the sweep never selects them, and on Linux
+    // they run in their own transient scopes. Before 2026-07-28 they did NOT
+    // survive — this endpoint is spawn-and-exit, so it reaped them exactly
+    // like the `restart-supervisor.ps1` path did, while the comment here
+    // claimed the opposite.
 
     // Spawn replacement process.
     //
@@ -1398,6 +1589,16 @@ pub async fn supervisor_restart(
             // already-latched shutdown would then take it down anyway.
             state.signal_shutdown();
 
+            // Off Windows, stop the temp runners before the hard exit below is
+            // armed (see the platform note above). The same one-shot sweep
+            // `shutdown_signal` runs, so the two never overlap.
+            #[cfg(not(windows))]
+            crate::process::shutdown_sweep::sweep_temp_runners_at_shutdown(
+                &state,
+                crate::process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,
+            )
+            .await;
+
             // Give the new process a moment to start
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -1425,6 +1626,66 @@ pub async fn supervisor_restart(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What both answers to a failed wait carry, the detached rebuild's included.
+    #[test]
+    fn an_unhealthy_answer_says_how_the_wait_ended() {
+        let body = unhealthy_after_start_body(
+            "primary",
+            &HealthProbeFailure {
+                elapsed_ms: 7,
+                ended: crate::process::health_probe::HealthWaitEnd::BootEnded,
+                recent_logs: vec!["last".to_string()],
+            },
+        );
+        assert_eq!(body["error"], "runner_unhealthy_after_start");
+        assert_eq!(body["runner_id"], "primary");
+        assert_eq!(body["elapsed_ms"], 7);
+        assert_eq!(body["ended"], "boot_ended");
+        assert_eq!(body["recent_logs"][0], "last");
+    }
+
+    /// The detached rebuild's body carries `status`, which only it adds: a
+    /// poller of `GET /build/{id}/status` branches on it. Pinned beside the
+    /// shared fields so dropping either half turns this red.
+    #[test]
+    fn the_detached_unhealthy_body_carries_its_status() {
+        let body = detached_unhealthy_after_start_body(
+            "primary",
+            &HealthProbeFailure {
+                elapsed_ms: 90_000,
+                ended: crate::process::health_probe::HealthWaitEnd::BootEnded,
+                recent_logs: vec![],
+            },
+        );
+        assert_eq!(body["status"], "unhealthy_after_start");
+        assert_eq!(body["error"], "runner_unhealthy_after_start");
+        assert_eq!(body["runner_id"], "primary");
+        assert_eq!(body["elapsed_ms"], 90_000);
+        assert_eq!(body["ended"], "boot_ended");
+    }
+
+    #[test]
+    fn restart_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<RestartRequest>(
+            r#"{"rebuild":true,"trigger_auto_continue":true}"#,
+        )
+        .err()
+        .expect("an unknown key must be refused");
+        assert!(err.to_string().contains("trigger_auto_continue"), "{err}");
+        let ok: RestartRequest = serde_json::from_str(r#"{"rebuild":true,"force":true}"#).unwrap();
+        assert!(ok.rebuild && ok.force);
+        assert_eq!(ok.close_intent(), manager::CloseIntent::Kill);
+    }
+
+    /// The legacy primary restart door carries the same `handoff` option as
+    /// `POST /runners/{id}/restart`, default off.
+    #[test]
+    fn restart_request_handoff_selects_the_intent() {
+        let opted: RestartRequest = serde_json::from_str(r#"{"handoff":true}"#).unwrap();
+        assert_eq!(opted.close_intent(), manager::CloseIntent::HandoffHolders);
+        assert!(!opted.force);
+    }
     use crate::build_submissions::{BuildKind, BuildStatus, BuildSubmission};
     use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
     use crate::state::{SharedState, SupervisorState};
@@ -1439,16 +1700,15 @@ mod tests {
 
     /// Serializes the tests that drive a real [`crate::build_monitor::run_cargo_build`].
     ///
-    /// Both of them close the build-pool semaphore so the build itself fails
-    /// fast — but the PRE-permit guards still run, and `check_ram_guard`'s
+    /// Each closes the build-pool semaphore so the build itself fails fast —
+    /// but the PRE-permit guards still run, and `check_ram_guard`'s
     /// `available_commit_bytes()` is a whole-machine memory/process query.
     /// Two of those in flight at once cost ~3.3s wall-clock apiece on a loaded
-    /// box, which is enough to trip
-    /// `restart_rebuild_true_detaches_returns_202_and_registers_build`'s 2s
-    /// latency pin — a pin about the HANDLER detaching, not about how busy the
-    /// machine running the suite is. Serializing the two keeps that pin
-    /// measuring what it was written to measure. Measured before/after: 1 in 4
-    /// full-suite runs failed, then 0 in 8.
+    /// box. That once tripped a 2s latency pin in
+    /// `restart_rebuild_true_detaches_returns_202_and_registers_build` (1 in 4
+    /// full-suite runs failed, then 0 in 8 serialized); the pin is gone, and
+    /// serializing still keeps each test's backstops measuring its own build
+    /// rather than a peer's.
     static BUILDING_TESTS: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1470,9 +1730,13 @@ mod tests {
     }
 
     fn test_state_on_port(root: &std::path::Path, runner_port: u16) -> SharedState {
+        Arc::new(SupervisorState::new(test_config(root, runner_port)))
+    }
+
+    fn test_config(root: &std::path::Path, runner_port: u16) -> SupervisorConfig {
         let mut primary = RunnerConfig::default_primary();
         primary.port = runner_port;
-        let config = SupervisorConfig {
+        SupervisorConfig {
             project_dir: root.join("src-tauri"),
             watchdog_enabled_at_start: false,
             auto_start: false,
@@ -1485,12 +1749,14 @@ mod tests {
             expo_dir: None,
             expo_port: 8081,
             runners: vec![primary],
-            build_pool: BuildPoolConfig { pool_size: 1 },
+            build_pool: BuildPoolConfig::fixed(1),
             no_prewarm: true,
             no_webview: true,
             temp_runner_display: None,
-        };
-        Arc::new(SupervisorState::new(config))
+            ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+            ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
+        }
     }
 
     fn queued_submission(id: uuid::Uuid) -> BuildSubmission {
@@ -1517,14 +1783,126 @@ mod tests {
         }
     }
 
-    async fn body_json(resp: axum::response::Response) -> (u16, serde_json::Value) {
-        let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+    use crate::dev_action::test_support::response_json as body_json;
+
+    /// The primary mint site hands the watcher the primary's registry entry:
+    /// the same `Arc` the restart starts again in place, which is where the
+    /// restart's spawn records its ring entry, its early log and its panic-log
+    /// dir. Handed `None` (or another entry), the watcher would never see that
+    /// spawn and would read no boot of it at all.
+    #[tokio::test]
+    async fn the_primary_mint_site_hands_the_watcher_the_primarys_registry_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let primary = state
+            .get_primary()
             .await
-            .expect("collect body");
-        let v: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("response body must be JSON");
-        (status, v)
+            .expect("the test state registers a primary");
+
+        let targets = primary_attribution_targets(&state).await;
+        let managed = targets
+            .managed
+            .expect("the primary's registry entry, not None");
+        assert!(
+            Arc::ptr_eq(&managed, &primary),
+            "the watcher must read the entry the restart starts"
+        );
+        assert_eq!(
+            targets.runner_id.as_deref(),
+            Some(primary.config.id.as_str())
+        );
+
+        state.runners.write().await.clear();
+        let targets = primary_attribution_targets(&state).await;
+        assert!(targets.managed.is_none() && targets.runner_id.is_none());
+    }
+
+    /// The mint reads the coord its config names, and its `risk` reads every row
+    /// that coord served before the ACK cuts `predicted` to five. `risk` is null
+    /// when the fetch goes anywhere else, or when the cut comes first and drops
+    /// the sixth-ranked boot row. The dead port and the closed pool keep the
+    /// detached restart from reaching a runner or a build.
+    #[tokio::test]
+    async fn restart_202_risk_reads_every_planted_row_and_the_ack_keeps_five() {
+        use crate::dev_action::test_support::{
+            assert_the_ack_read_every_planted_row, five_rows_and_a_sixth_boot_row,
+            serve_planted_expectations,
+        };
+        let _building = BUILDING_TESTS.lock().await;
+        let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+        let tmp = TempDir::new().expect("tempdir");
+        let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+        config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+        let state = Arc::new(SupervisorState::new(config));
+        state.build_pool.permits.close();
+
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+                from_working_tree: true,
+                use_lkg: None,
+                handoff: false,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202, "{body}");
+        assert_the_ack_read_every_planted_row(&coord, "build", &body);
+    }
+
+    /// With no primary registered the ACK names no tree: the detached restart
+    /// fails on the missing primary at once, and a label would describe a
+    /// build that never runs.
+    #[tokio::test]
+    async fn restart_202_build_source_is_null_when_no_primary_is_configured() {
+        let _building = BUILDING_TESTS.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        state.build_pool.permits.close();
+        state.runners.write().await.clear();
+        assert!(state.get_primary().await.is_none());
+
+        let resp = restart_runner(
+            State(state.clone()),
+            Query(StartWaitQuery { wait: false }),
+            Json(RestartRequest {
+                rebuild: true,
+                force: false,
+                from_working_tree: false,
+                use_lkg: None,
+                handoff: false,
+            }),
+        )
+        .await
+        .expect("handler ok")
+        .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202);
+        assert!(body["build_source"].is_null(), "{body}");
+    }
+
+    /// The deferred rebuild names its tree in the 202 like the two restart
+    /// doors do. The dead port keeps the background watcher from ever seeing a
+    /// drained primary, so it waits and never builds.
+    #[tokio::test]
+    async fn rebuild_when_idle_202_echoes_origin_main_build_source() {
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state_dead_runner_port(tmp.path());
+
+        let resp = rebuild_when_idle(State(state.clone()), OptionalJson(None))
+            .await
+            .expect("handler ok")
+            .into_response();
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, 202);
+        assert_eq!(body["status"], "watching");
+        assert_eq!(body["build_source"], "origin_main", "{body}");
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
     }
 
     /// A second fix-and-rebuild while one is still in flight is an idempotent
@@ -1542,7 +1920,11 @@ mod tests {
             .build_submissions
             .insert(queued_submission(existing_id))
             .await;
-        *state.fix_and_rebuild_inflight.write().await = Some(existing_id);
+        let action = crate::dev_action::test_support::minted_action();
+        *state.fix_and_rebuild_inflight.write().await = Some(crate::state::FixAndRebuildInflight {
+            submission_id: existing_id,
+            action: action.clone(),
+        });
 
         let resp = fix_and_rebuild(State(state.clone()))
             .await
@@ -1553,21 +1935,91 @@ mod tests {
         assert_eq!(status, 202, "idempotent accept must be 202");
         assert_eq!(body["status"], "accepted");
         assert_eq!(body["deduplicated"], true);
+        assert_eq!(body["build_source"], "live_tree", "{body}");
         assert_eq!(
             body["build_id"],
             existing_id.to_string(),
             "must return the EXISTING submission id, not a fresh one"
         );
+        // The joiner minted nothing, and names the action it joined: it is
+        // usually a retry whose caller never read the first answer.
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
+        assert_eq!(body["action_id"], action.record.action_id.to_string());
+        assert!(
+            state.dev_actions.read().await.recent(10).is_empty(),
+            "joining must not mint a second trial"
+        );
         // The tracker is unchanged — still the original submission.
         assert_eq!(
-            *state.fix_and_rebuild_inflight.read().await,
+            state
+                .fix_and_rebuild_inflight
+                .read()
+                .await
+                .as_ref()
+                .map(|inflight| inflight.submission_id),
             Some(existing_id)
         );
     }
 
+    /// Two concurrent calls start ONE build: the dedupe check and the record
+    /// are under one guard. The first call is parked between them, at its
+    /// mint's `dev_actions.write()`, which this test holds a read guard on; the
+    /// second call is then running. Releasing the dedupe lock between the check
+    /// and the record (as it once was) lets the second pass the check before
+    /// the first records, and both build. The first build is held in flight at
+    /// its disk guard, whose floor reads `state.footprint` first, by a write
+    /// guard on it: holding pool permits is not enough, since the disk guard
+    /// runs before the permit and on a box short of disk would end the build at
+    /// once. The pool is closed before release so neither call runs cargo.
+    #[tokio::test]
+    async fn fix_and_rebuild_concurrent_calls_start_one_build() {
+        let _building = BUILDING_TESTS.lock().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let footprint = state.footprint.write().await;
+
+        let parked = state.dev_actions.read().await;
+        let call = |state: SharedState| {
+            tokio::spawn(async move {
+                let resp = fix_and_rebuild(State(state))
+                    .await
+                    .expect("handler ok")
+                    .into_response();
+                body_json(resp).await
+            })
+        };
+        let first = call(state.clone());
+        let second = call(state.clone());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        drop(parked);
+
+        let backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
+        let (status_a, a) = tokio::time::timeout(backstop, first)
+            .await
+            .expect("the first call returned")
+            .expect("the first call did not panic");
+        let (status_b, b) = tokio::time::timeout(backstop, second)
+            .await
+            .expect("the second call returned")
+            .expect("the second call did not panic");
+        state.build_pool.permits.close();
+        drop(footprint);
+
+        assert_eq!((status_a, status_b), (202, 202), "{a} {b}");
+        let deduplicated = [&a, &b]
+            .iter()
+            .filter(|body| body["deduplicated"] == true)
+            .count();
+        assert_eq!(deduplicated, 1, "exactly one call must join: {a} {b}");
+        assert_eq!(a["build_id"], b["build_id"], "both must name one build");
+        assert_eq!(a["action_id"], b["action_id"], "both must name one trial");
+    }
+
     /// `POST /runner/restart {"rebuild": true}` must DETACH: the handler returns
     /// 202 quickly (without awaiting the ~10-20min build) and registers a build
-    /// submission so progress is observable via `GET /builds`. The detached task
+    /// submission so progress is observable via `GET /build/{id}/status`. The detached task
     /// owns its own state clone, so it survives the handler future being dropped
     /// — the whole point of the change. We close the build-pool semaphore up
     /// front so the detached `run_cargo_build` fails fast (semaphore closed)
@@ -1591,17 +2043,26 @@ mod tests {
         // AWAITED it would also have returned in milliseconds. The clock could
         // not distinguish the two states it was there to separate.
         //
-        // The submission store's write lock can. It is the detached task's
-        // first instruction (`build_submissions::submit_detached` → `spawn` →
-        // `submissions.write()`), and `restart_runner` itself never touches it,
-        // so holding it here pins the detached task at instruction one while
-        // leaving the handler free. A handler that awaited the detached body
-        // could not return; a detached one returns anyway. Plan
+        // The submission's status can. `submit_detached` registers it `Queued`
+        // and the detached task moves it on, and on this current-thread runtime
+        // that task cannot run until the test yields. So straight after the 202
+        // a detached body has not started, while a handler that awaited it would
+        // have left the submission terminal, read below. Plan
         // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
-        let registration_gate = state.build_submissions.submissions.write().await;
+        //
         // Not a speed budget: it turns "wedged forever" into a red instead of a
         // hang, so it is sized against forever, not against a measured idle run.
+        //
+        // The `Queued` read alone holds only until the task is first polled, so
+        // a coop-budget yield inside the handler would fail it. Holding the
+        // diagnostics lock is the stronger proof: `manager::admit_restart`'s
+        // `diagnostics.write()` is the first lock the detached body contends on
+        // (its write of `Running` to its own submission is uncontended), and
+        // this handler never takes it. So while the guard is held a handler that
+        // awaited the body could not return, and the body cannot reach a
+        // terminal status.
         let wedge_backstop = crate::test_clock::backstop(std::time::Duration::from_secs(60));
+        let diagnostics_guard = state.diagnostics.read().await;
         let resp = tokio::time::timeout(
             wedge_backstop,
             restart_runner(
@@ -1615,22 +2076,19 @@ mod tests {
                     // origin/main worktree materialization in the sandbox.
                     from_working_tree: true,
                     use_lkg: None,
+                    handoff: false,
                 }),
             ),
         )
         .await
         .unwrap_or_else(|_| {
             panic!(
-                "the handler did not return while the detached task was pinned at its \
-                 registration lock — rebuild:true is AWAITING the build, not detaching \
-                 (waited {wedge_backstop:?})"
+                "the handler did not return, so rebuild:true is AWAITING the build, not \
+                 detaching (waited {wedge_backstop:?})"
             )
         })
         .expect("handler ok")
         .into_response();
-        // Release the detached task now that the handler has demonstrably
-        // returned without it.
-        drop(registration_gate);
         let (status, body) = body_json(resp).await;
 
         assert_eq!(status, 202, "rebuild:true must return 202 (detached)");
@@ -1639,39 +2097,41 @@ mod tests {
         // claim "rebuilding" for a restart the gate refused 1.4s later.
         assert_eq!(body["status"], "submitted");
         assert_eq!(body["poll"], "/builds");
+        // The fixture registers a primary and the request asks for the escape
+        // hatch, so the ACK must name the live tree: the build decision is
+        // echoed before any build runs, not discovered after one finishes.
+        assert_eq!(
+            body["build_source"], "live_tree",
+            "the 202 must echo the tree the rebuild selects"
+        );
         assert!(
             body["build_id"].is_string(),
             "must carry a submission id for /builds correlation"
         );
-        // submit_detached registers the submission on a spawned task; give it a
-        // beat to insert, then confirm a new build is observable via the store
-        // that backs GET /builds / GET /build/{id}/status.
+        // The new build is observable through the submission store that backs
+        // GET /build/{id}/status as soon as the 202 names it.
         let build_id = body["build_id"].as_str().unwrap().to_string();
         let target = uuid::Uuid::parse_str(&build_id).expect("build_id is a uuid");
-        // Give-up budgets on poll-until-true loops, not speed assertions: each
-        // exits the instant its property holds, so a generous budget costs a
-        // passing run nothing and only delays a genuine failure. The old fixed
-        // 100 x 20ms was a 2s ceiling sized against a quiet box.
-        let register_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
-        let register_deadline = std::time::Instant::now() + register_budget;
-        let mut arc = None;
-        while std::time::Instant::now() < register_deadline {
-            if let Some(a) = state.build_submissions.get(&target).await {
-                arc = Some(a);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let arc = arc.unwrap_or_else(|| {
-            panic!(
-                "the detached rebuild must register a build submission (waited {register_budget:?})"
-            )
-        });
+        let arc = state
+            .build_submissions
+            .get(&target)
+            .await
+            .expect("the 202 names a registered submission");
+        // The body is held at its first exclusive lock, which this test holds.
+        assert!(
+            !arc.read().await.status.is_terminal(),
+            "the handler returned with the body already run, so rebuild:true AWAITED the build"
+        );
+        drop(diagnostics_guard);
 
         // The detached task runs independently of this (already-returned)
         // handler. With the pool semaphore closed it fails fast and the
         // submission reaches a terminal status — proving the task ran to
         // completion on its own.
+        //
+        // A give-up budget on a poll-until-true loop, not a speed assertion: it
+        // exits the instant the property holds, so a generous budget costs a
+        // passing run nothing and only delays a genuine failure.
         let terminal_budget = crate::test_clock::poll_budget(std::time::Duration::from_secs(30));
         let terminal_deadline = std::time::Instant::now() + terminal_budget;
         let mut terminal = false;
@@ -1739,41 +2199,142 @@ mod tests {
         }
     }
 
-    /// The readiness gate's refusal maps to `Refused`, carrying the
-    /// `restart_refused_unsafe` token verbatim — everything else to `Errored`.
-    /// Both classify to `Failure`; §5 rejects a sixth `D3Category`.
+    /// Plan `2026-11-03-supervisor-dev-action-residuals-…` Phase 4.5. A
+    /// rebuild whose post-rebuild health wait failed answers
+    /// `"rebuilt_unhealthy"` with the wait's error, not `"rebuilt"`, and the
+    /// route's success path builds its body from the verdict it recorded.
     #[test]
-    fn run_result_for_maps_the_readiness_refusal_to_refused() {
-        let detail = crate::restart_readiness::RefusalDetail {
-            cause: "sessions_live",
-            message: "restart_refused_unsafe: runner 'primary' (port 9876) reports it is NOT \
-                      safe to restart."
-                .to_string(),
-            payload: serde_json::json!({"error": "restart_refused_unsafe"}),
-        };
-        let refused = run_result_for(&SupervisorError::RestartUnsafe(Box::new(detail)));
-        match &refused {
-            crate::dev_action::ActionRunResult::Refused { reason } => {
-                assert!(
-                    reason.contains("restart_refused_unsafe"),
-                    "reason: {reason}"
-                );
-            }
-            other => panic!("expected Refused, got {other:?}"),
-        }
+    fn rebuild_when_idle_reports_unhealthy_after_failed_health_wait() {
+        let wait_error = "runner_unhealthy_after_start: runner 'primary' did not become \
+                          healthy within 90000ms of rebuild-when-idle";
+        let unhealthy = rebuild_when_idle_result(
+            &Ok(()),
+            SyncProbe::Unhealthy {
+                reason: wait_error.to_string(),
+            },
+        );
+        let (code, body) = rebuilt_body(&unhealthy, 42, 3, "drained");
+        assert_eq!(code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(body["status"], "rebuilt_unhealthy");
+        assert_eq!(body["error"], wait_error);
+        assert_eq!(body["waited_secs"], 42);
+
+        // The primary gone when the health check ran is unhealthy too.
+        let gone = rebuild_when_idle_result(&Ok(()), SyncProbe::NotProbed);
+        let (code, body) = rebuilt_body(&gone, 1, 0, "drained");
+        assert_eq!(code, StatusCode::BAD_GATEWAY.as_u16());
+        assert_eq!(body["status"], "rebuilt_unhealthy");
+        assert!(body["error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("runner_unhealthy_after_start")));
+
+        let healthy = rebuild_when_idle_result(&Ok(()), SyncProbe::Healthy);
+        let (code, body) = rebuilt_body(&healthy, 42, 3, "drained");
+        assert_eq!(code, StatusCode::OK.as_u16());
+        assert_eq!(body["status"], "rebuilt");
+        assert!(body.get("error").is_none());
+
+        // The operator log says so, naming the runner and the wait's error,
+        // and says nothing for a rebuilt primary that answered.
         assert_eq!(
-            crate::dev_action::attribution::classify(Some(&refused), &[]),
-            crate::dev_action::record::D3Category::Failure
+            unhealthy_rebuild_log(&unhealthy, "primary").as_deref(),
+            Some(
+                "Rebuild-when-idle: 'primary' rebuilt, but that boot was not confirmed healthy: \
+                 runner_unhealthy_after_start: runner 'primary' did not become healthy \
+                 within 90000ms of rebuild-when-idle"
+            )
+        );
+        assert_eq!(unhealthy_rebuild_log(&healthy, "primary"), None);
+
+        let route = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn rebuild_when_idle(",
+        )
+        .expect("rebuild_when_idle exists")
+        .to_string();
+        assert!(
+            route.contains("rebuilt_body(&result"),
+            "rebuild_when_idle's success path must answer from its recorded verdict"
+        );
+        assert!(
+            route.contains("unhealthy_rebuild_log(&result, &exec_runner_name)")
+                && route.contains(".emit(LogSource::Supervisor, LogLevel::Error, line)"),
+            "an unhealthy rebuild must reach the operator log at Error, as its error sibling does"
+        );
+        assert!(
+            !route.contains("\"status\": \"rebuilt\""),
+            "rebuild_when_idle answers a hard-coded \"rebuilt\" again"
+        );
+    }
+
+    /// T1-15 (D16). `rebuild_when_idle` records its rebuild's verdict on
+    /// success too (`Ran` once the rebuilt primary answered), and its window's
+    /// backstop covers a 24-hour deadline: still open past the 2-hour build
+    /// backstop.
+    #[tokio::test(start_paused = true)]
+    async fn rebuild_when_idle_records_ran_and_its_backstop_covers_its_deadline() {
+        assert_eq!(
+            rebuild_when_idle_result(&Ok(()), SyncProbe::Healthy),
+            ActionRunResult::Ran
+        );
+        assert!(matches!(
+            rebuild_when_idle_result(
+                &Ok(()),
+                SyncProbe::Unhealthy {
+                    reason: "runner_unhealthy_after_start: x".to_string()
+                }
+            ),
+            ActionRunResult::Errored { .. }
+        ));
+        assert!(matches!(
+            rebuild_when_idle_result(
+                &Err(SupervisorError::RunnerNotRunning),
+                SyncProbe::NotProbed
+            ),
+            ActionRunResult::Errored { .. }
+        ));
+        // The detached task records whatever the restart did, success included.
+        let body = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn rebuild_when_idle(",
+        )
+        .expect("rebuild_when_idle exists")
+        .to_string();
+        // A statement of its own, not under an `if`: every outcome records.
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        assert!(
+            lines.contains(&"let result = rebuild_when_idle_result(&restart, health);")
+                && lines.contains(&"exec_record.record_run_result(result.clone());"),
+            "rebuild_when_idle must record its rebuild's result on every outcome"
+        );
+        // And the mint hands the watcher the deadline-sized backstop.
+        assert!(
+            lines.contains(&"Some(rebuild_when_idle_backstop(deadline_secs)),"),
+            "rebuild_when_idle must mint with its deadline's backstop"
         );
 
-        let errored = run_result_for(&SupervisorError::RunnerNotRunning);
-        assert!(matches!(
-            errored,
-            crate::dev_action::ActionRunResult::Errored { .. }
-        ));
-        assert_eq!(
-            crate::dev_action::attribution::classify(Some(&errored), &[]),
-            crate::dev_action::record::D3Category::Failure
+        let tmp = TempDir::new().expect("tempdir");
+        let state = test_state(tmp.path());
+        let record = state
+            .dev_actions
+            .write()
+            .await
+            .insert(crate::dev_action::ActionRecord::new(
+                ActionKind::Build,
+                None,
+                "rebuild_when_idle".to_string(),
+                &[],
+            ));
+        crate::dev_action::spawn_attribution_watcher(
+            state.clone(),
+            record.clone(),
+            AttributionTargets::default(),
+            Some(rebuild_when_idle_backstop(24 * 60 * 60)),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2 * 60 * 60 + 60)).await;
+        assert!(
+            record.outcome.read().unwrap().is_none(),
+            "a 24-hour wait's window closed on the 2-hour build backstop"
         );
     }
 
@@ -1803,7 +2364,7 @@ mod tests {
         // The gate therefore refuses — the same 409 `RestartUnsafe` the
         // observed incident produced, reached deterministically and without a
         // live runner anywhere in the loop.
-        let result = restart_runner(
+        let resp = restart_runner(
             State(state.clone()),
             Query(StartWaitQuery { wait: false }),
             Json(RestartRequest {
@@ -1811,20 +2372,34 @@ mod tests {
                 force: false,
                 from_working_tree: false,
                 use_lkg: None,
+                handoff: false,
             }),
         )
-        .await;
-        let err = result.expect_err("a refused restart must not report success");
-        assert!(
-            matches!(err, SupervisorError::RestartUnsafe(_)),
-            "expected the readiness gate's refusal, got {err:?}"
+        .await
+        .expect("the refusal renders its action");
+        let (status, body) = body_json(resp).await;
+        assert_eq!(
+            status, 409,
+            "a refused restart must not report success: {body}"
         );
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|error| error.starts_with("restart_refused")),
+            "expected the readiness gate's refusal, got {body}"
+        );
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
 
         let recent = state.dev_actions.read().await.recent(10);
         let record = recent
             .first()
             .cloned()
             .expect("the handler mints a dev-action before the restart runs");
+        assert_eq!(
+            body["action_id"],
+            record.action_id.to_string(),
+            "the refusal names the action it closed"
+        );
         let run = record
             .run_result()
             .expect("the failure must be recorded on the action");
@@ -1834,7 +2409,7 @@ mod tests {
             // no verdict could be obtained (this test's arm — and the arm the
             // gate's "every unknown refuses" rule exists for). Both are
             // `RestartUnsafe`; the verbatim carry of the `_unsafe` spelling is
-            // pinned by `run_result_for_maps_the_readiness_refusal_to_refused`.
+            // pinned by `dev_action::run_result`'s `run_result_for_maps_the_readiness_refusal_to_refused`.
             crate::dev_action::ActionRunResult::Refused { reason } => assert!(
                 reason.starts_with("restart_refused_"),
                 "the gate's refusal must be carried verbatim; got {reason}"
@@ -1845,6 +2420,283 @@ mod tests {
             crate::dev_action::attribution::classify(Some(&run), &[]),
             crate::dev_action::record::D3Category::Confirmed,
             "a clean window behind a failed restart must not classify Confirmed"
+        );
+    }
+
+    /// S3 through the door: `POST /runner/restart` without a rebuild stamps the
+    /// `route_lkg` shadow on its `restart` trial from the rows coord served
+    /// (here the sixth-ranked 4-of-4 boot row, so both rules route), and
+    /// fetches expectations for `restart`. A restart the readiness gate refuses
+    /// ran no exe, so it stays a `restart` even when its start was pointed at
+    /// an LKG exe that exists: fails if the re-key moves back ahead of
+    /// `restart_runner`. The success arm, which a unit test cannot reach
+    /// without starting a runner, is [`record_lkg_treatment`]'s test below.
+    /// The gate refuses on the dead port, so no runner is stopped or started.
+    #[tokio::test]
+    async fn a_refused_restart_carries_its_shadow_and_stays_a_restart() {
+        use crate::dev_action::policy::Route;
+        use crate::dev_action::test_support::{
+            five_rows_and_a_sixth_boot_row, serve_planted_expectations,
+        };
+
+        // (use_lkg, LKG exe on disk): every combination that pins and that does not.
+        let cases = [
+            (None, true),
+            (Some(true), true),
+            (None, false),
+            (Some(false), true),
+        ];
+        for (use_lkg, lkg_on_disk) in cases {
+            let coord = serve_planted_expectations(five_rows_and_a_sixth_boot_row()).await;
+            let tmp = TempDir::new().expect("tempdir");
+            let mut config = test_config(tmp.path(), DEAD_RUNNER_PORT);
+            config.ambient_coord = crate::config::AmbientCoord::At(coord.base.clone());
+            if lkg_on_disk {
+                let lkg = config.lkg_exe_path();
+                std::fs::create_dir_all(lkg.parent().expect("an lkg dir")).expect("mkdir");
+                std::fs::write(&lkg, b"stub").expect("write the lkg exe");
+            }
+            let state = Arc::new(SupervisorState::new(config));
+            let primary = state.get_primary().await.expect("primary");
+            // Evidence of life on a dead port: the gate's UNKNOWN, which refuses.
+            primary.runner.write().await.running = true;
+
+            let resp = restart_runner(
+                State(state.clone()),
+                Query(StartWaitQuery { wait: false }),
+                Json(RestartRequest {
+                    rebuild: false,
+                    force: false,
+                    from_working_tree: false,
+                    use_lkg,
+                    handoff: false,
+                }),
+            )
+            .await
+            .expect("the refusal renders its action");
+            let (status, body) = body_json(resp).await;
+            assert_eq!(status, 409, "{use_lkg:?} {lkg_on_disk}: {body}");
+
+            let record = state
+                .dev_actions
+                .read()
+                .await
+                .recent(10)
+                .first()
+                .cloned()
+                .expect("a minted trial");
+            assert_eq!(
+                record.kind(),
+                ActionKind::Restart,
+                "a refused restart ran no exe: {use_lkg:?} {lkg_on_disk}"
+            );
+            let shadow = record
+                .route_lkg_shadow
+                .as_ref()
+                .expect("a restart coord answered carries the shadow");
+            assert_eq!(shadow.live_route, Route::Lkg);
+            assert_eq!(shadow.shadow_route, Route::Lkg);
+            assert_eq!(
+                shadow.top_signature.as_deref(),
+                Some("DEV-TAURI-ASSET-MISSING")
+            );
+            assert_eq!(shadow.expected_loss_fresh, Some(4.4 / 8.0));
+            let seen = coord.seen();
+            assert!(
+                seen[0].query.split('&').any(|p| p == "action_kind=restart"),
+                "expectations are fetched for restart: {}",
+                seen[0].query
+            );
+            assert!(
+                primary.source_exe_override.read().await.is_none(),
+                "the LKG pin is scoped to this restart"
+            );
+        }
+    }
+
+    /// The re-key the door applies after `restart_runner`: only a restart that
+    /// was pinned to the LKG exe AND started is a `restart_lkg`. Fails if a
+    /// refused or failed restart, or one that ran the fresh exe, is re-keyed,
+    /// or if a pinned restart that started is not.
+    #[test]
+    fn only_a_started_lkg_pinned_restart_is_rekeyed() {
+        for (lkg_pinned, restarted, want) in [
+            (true, true, ActionKind::RestartLkg),
+            (true, false, ActionKind::Restart),
+            (false, true, ActionKind::Restart),
+            (false, false, ActionKind::Restart),
+        ] {
+            let record = ActionRecord::new(ActionKind::Restart, None, "p".to_string(), &[]);
+            assert_eq!(
+                record_lkg_treatment(&record, lkg_pinned, restarted),
+                want == ActionKind::RestartLkg
+            );
+            assert_eq!(
+                record.kind(),
+                want,
+                "pinned={lkg_pinned} restarted={restarted}"
+            );
+        }
+    }
+
+    /// The LKG guard waits out a start that holds the primary's lifecycle lock only
+    /// when it is dropped (a client hanging up, so the cleanup runs on its own task
+    /// while the restart's start may still be resolving its exe). The test's lock
+    /// stands in for that start; cleared before it lets go, the start would launch
+    /// the fresh exe. Through `run_now` the restart has returned, so the override
+    /// comes off at once whoever holds the lock: the lock then stands in for a stop
+    /// queued behind the restart's start, which the route must not wait out.
+    #[tokio::test]
+    async fn the_lkg_override_waits_out_a_start_only_when_its_guard_is_dropped() {
+        let lkg = PathBuf::from("/lkg/qontinui-runner");
+        let primary = Arc::new(crate::state::ManagedRunner::new(
+            RunnerConfig::default_primary(),
+            false,
+        ));
+        let pinned = || async { primary.source_exe_override.read().await.clone() };
+
+        // Dropped: the override stays while the lock is held, and comes off after.
+        *primary.source_exe_override.write().await = Some(lkg.clone());
+        let start = primary.lifecycle.lock().await;
+        drop(lkg_override_guard(primary.clone()));
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            pinned().await,
+            Some(lkg.clone()),
+            "dropped: the override came off while a start held the lock"
+        );
+        drop(start);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while pinned().await.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dropped: the override never came off"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // `run_now`: the override comes off at once, with the lock still held.
+        *primary.source_exe_override.write().await = Some(lkg.clone());
+        let queued_stop = primary.lifecycle.lock().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            lkg_override_guard(primary.clone()).run_now(),
+        )
+        .await
+        .expect("run_now waited on the lifecycle lock a queued stop holds");
+        assert_eq!(pinned().await, None, "run_now left the override in place");
+        drop(queued_stop);
+    }
+
+    /// The success arm of the S3 re-key, pinned at source level because no
+    /// route test reaches a started primary: the no-rebuild restart re-keys
+    /// through `record_lkg_treatment(&action_record, lkg_pinned,
+    /// restart_result.is_ok())`, exactly once, after `manager::restart_runner`
+    /// and before the first thing on that path that records the action's run
+    /// result (`answer_failure`, `record_run_result`, `record_start_verdict`):
+    /// the watcher's window closes on that result, and a re-key after it could
+    /// reach coord as `restart`. `lkg_pinned` must be derived from
+    /// `lkg_override`, the guard armed only where the LKG override is written,
+    /// which takes the override off again on every exit, a client hanging up
+    /// included. Fails if the call is removed, passes a constant, or moves after
+    /// a result is recorded, if `lkg_pinned` stops tracking the override, or if
+    /// the override is cleared other than through that guard.
+    #[test]
+    fn the_restart_handler_rekeys_a_started_lkg_restart_before_recording_its_result() {
+        let squeezed: String = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "pub async fn restart_runner(",
+        )
+        .expect("restart_runner exists")
+        .split_whitespace()
+        .collect();
+
+        // `lkg_pinned` is set exactly where the override is written to the LKG
+        // exe, by the guard that clears it again.
+        let write = "*primary.source_exe_override.write().await=Some(lkg_exe.clone());";
+        let pinned = "lkg_override=Some(lkg_override_guard(primary));";
+        let write_at = squeezed.find(write).expect("the LKG override is written");
+        let pinned_at = squeezed
+            .find(pinned)
+            .expect("lkg_override records the pin and clears it");
+        assert_eq!(
+            squeezed.matches(pinned).count(),
+            1,
+            "one place records the pin"
+        );
+        assert_eq!(
+            squeezed.matches("lkg_override=").count(),
+            1,
+            "lkg_override is assigned only where the override is written"
+        );
+        assert_eq!(
+            squeezed.matches("source_exe_override.write()").count(),
+            1,
+            "the override is written once and cleared only by its guard"
+        );
+        let guard: String = crate::source_scan::fn_body(
+            crate::source_scan::production_span(include_str!("runner.rs")),
+            "fn lkg_override_guard(",
+        )
+        .expect("lkg_override_guard exists")
+        .split_whitespace()
+        .collect();
+        let now = guard
+            .find("CleanupIfDropped::new(asyncmove{*now.source_exe_override.write().await=None;})")
+            .unwrap_or_else(|| panic!("run_now must clear the override at once: {guard}"));
+        let if_dropped = guard
+            .find(".if_dropped_run(asyncmove{let_lifecycle=if_dropped.lifecycle.lock().await;*if_dropped.source_exe_override.write().await=None;})")
+            .expect("a dropped guard clears the override only once it holds the lifecycle lock");
+        assert!(now < if_dropped, "{guard}");
+        assert!(
+            write_at < pinned_at,
+            "the pin is recorded after the override is written"
+        );
+        assert!(
+            squeezed.contains("letlkg_pinned=lkg_override.is_some();"),
+            "lkg_pinned must be derived from the override being written"
+        );
+        let restarted_at = squeezed
+            .find("letrestart_result=manager::restart_runner(")
+            .expect("the synchronous restart");
+        let cleared_at = squeezed
+            .find("lkg_override.run_now().await;")
+            .expect("the guard runs on the normal path");
+        assert!(
+            restarted_at < cleared_at,
+            "the override comes off once the restart has returned"
+        );
+
+        // On the synchronous path: the re-key follows the start and precedes
+        // every recording of the action's result.
+        let sync_path = squeezed
+            .split("letrestart_result=manager::restart_runner(")
+            .nth(1)
+            .expect("the synchronous restart calls manager::restart_runner");
+        let call = "record_lkg_treatment(&action_record,lkg_pinned,restart_result.is_ok());";
+        assert_eq!(
+            squeezed.matches("record_lkg_treatment(").count(),
+            1,
+            "the handler re-keys in exactly one place"
+        );
+        let rekey_at = sync_path
+            .find(call)
+            .unwrap_or_else(|| panic!("the restart handler must call {call}"));
+        let first_result = [
+            "answer_failure(",
+            "record_run_result(",
+            "record_start_verdict(",
+        ]
+        .iter()
+        .filter_map(|marker| sync_path.find(marker))
+        .min()
+        .expect("the synchronous path records a result");
+        assert!(
+            rekey_at < first_result,
+            "the re-key must precede the first recorded result on the synchronous path"
         );
     }
 
@@ -1866,6 +2718,8 @@ mod tests {
             .into_response();
         let (status, body) = body_json(resp).await;
         assert_eq!(status, 202);
+        assert_eq!(body["build_source"], "live_tree", "{body}");
+        crate::dev_action::test_support::assert_the_ack_carries_its_action_fields(&body);
         let action_id = uuid::Uuid::parse_str(body["action_id"].as_str().expect("action_id"))
             .expect("action_id is a uuid");
 
@@ -1910,14 +2764,11 @@ mod tests {
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
 
-        let body = this_file
-            .split_once("pub async fn supervisor_restart(")
-            .map(|(_, after)| after)
+        // Bounded to supervisor_restart's own body (brace matching): before,
+        // this ran to the test module, so the `rfind` below could have landed
+        // on an `exit(0)` in a LATER function.
+        let body = crate::source_scan::fn_body(&this_file, "pub async fn supervisor_restart(")
             .expect("supervisor_restart must exist — did it get renamed?");
-        let body = body
-            .find("\n#[cfg(test)]")
-            .map(|end| &body[..end])
-            .unwrap_or(body);
 
         let latch = body.find("state.signal_shutdown()").unwrap_or_else(|| {
             panic!(
@@ -1946,6 +2797,39 @@ mod tests {
             latch < exit,
             "the shutdown must be latched BEFORE the hard exit, or in-flight handlers get no \
              window in which to answer"
+        );
+
+        // Off Windows nothing reaps temp runners on this exit, so the
+        // one-shot shutdown sweep runs between the latch and the hard exit;
+        // and a supervisor that is its own unit's main process is refused
+        // BEFORE it spawns a replacement that would die with that unit. Plan
+        // 2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners.
+        // The attribute line too: `cfg(windows)` would compile the sweep out
+        // of exactly the platforms it exists for, leaving its text in place.
+        let sweep = body
+            .find(
+                "#[cfg(not(windows))]\n            \
+                 crate::process::shutdown_sweep::sweep_temp_runners_at_shutdown(",
+            )
+            .expect("supervisor_restart must run the off-Windows temp-runner sweep");
+        assert!(
+            latch < sweep && sweep < exit,
+            "the sweep must run after the latch and before the hard exit is armed, or the exit \
+             cuts it short inside its SIGTERM grace (latch {latch}, sweep {sweep}, exit {exit})"
+        );
+        let refusal = body
+            .find("self_restart_refusal(")
+            .expect("supervisor_restart must refuse when it is its own unit's main process");
+        assert!(
+            refusal < spawn,
+            "the own-unit refusal must come BEFORE the replacement is spawned"
+        );
+        assert!(
+            body.contains(
+                "sweep_temp_runners_at_shutdown(\n                &state,\n                \
+                 crate::process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,"
+            ),
+            "the self-restart sweep runs with its named kill bound, not an ad-hoc one"
         );
     }
 }

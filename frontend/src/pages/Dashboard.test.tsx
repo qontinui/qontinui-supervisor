@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import Dashboard from './Dashboard';
 import { api } from '../lib/api';
@@ -41,21 +41,7 @@ vi.mock('../lib/api', () => {
   return {
     api: {
       health: vi.fn().mockResolvedValue(healthResponse),
-      devStartStatus: vi.fn().mockResolvedValue({
-        services: [
-          { name: 'backend', port: 8000, available: true },
-          { name: 'frontend', port: 3001, available: true },
-        ],
-      }),
       expoStatus: vi.fn().mockResolvedValue({ running: false, configured: true }),
-      devStartAction: vi.fn().mockResolvedValue({
-        status: 'ok',
-        flag: 'backend',
-        stdout: 'Started',
-        stderr: '',
-        exit_code: 0,
-      }),
-      logFile: vi.fn().mockResolvedValue({ content: '', lines: 0 }),
       expoStart: vi.fn().mockResolvedValue({}),
       expoStop: vi.fn().mockResolvedValue({}),
       listRunners: vi.fn().mockResolvedValue([]),
@@ -74,7 +60,6 @@ vi.mock('../lib/api', () => {
       }),
     },
     HealthResponse: {},
-    DevStartResponse: {},
   };
 });
 
@@ -327,6 +312,36 @@ describe('Dashboard', () => {
     expect(screen.queryByText(/Runner: stopped/)).not.toBeInTheDocument();
   });
 
+  it('reports a primary whose spawn is up but unbound as starting, not stopped', async () => {
+    vi.mocked(api.health).mockResolvedValueOnce({
+      status: 'degraded',
+      runner: {
+        running: false,
+        pid: 148320,
+        api_responding: false,
+        spawn_up: true,
+        answered_this_boot: false,
+        liveness: { state: 'unknown', unresponsive_since: null },
+        last_seen_responding_at: null,
+      },
+      ports: { api_port: { port: 9876, in_use: false } },
+      watchdog: {
+        enabled: true,
+        restart_attempts: 0,
+        crash_count: 0,
+        crash_restart_armed: true,
+      },
+      build: { in_progress: false, available_slots: 3, error_detected: false },
+      expo: { running: false, port: 8081, configured: true },
+      supervisor: { version: '0.1.0', project_dir: '/test' },
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+    renderDashboard();
+
+    expect(await screen.findByText(/starting \(alive, port not bound\)/)).toBeInTheDocument();
+    expect(screen.queryByText(/Runner: stopped/)).not.toBeInTheDocument();
+  });
+
   it('is unchanged for a healthy primary from a supervisor that omits liveness', async () => {
     // Default mock carries no `liveness` field at all (an older supervisor).
     // An absent verdict must never change what the header says.
@@ -398,7 +413,7 @@ describe('Dashboard — build staleness', () => {
       .filter(([, fn]) => vi.isMockFunction(fn) && fn.mock.calls.length > 0)
       .map(([name]) => name)
       .sort();
-    expect(opened).toEqual(['builds', 'devStartStatus', 'expoStatus', 'health', 'listRunners']);
+    expect(opened).toEqual(['builds', 'expoStatus', 'health', 'listRunners']);
   });
 
   it('shows the build-behind badge on the primary row and amends the Rebuild tooltip', async () => {
@@ -421,5 +436,54 @@ describe('Dashboard — build staleness', () => {
     await vi.waitFor(() => expect(api.builds).toHaveBeenCalled());
     expect(screen.queryByTestId('build-staleness-badge-primary')).not.toBeInTheDocument();
     expect(rebuild.getAttribute('title')).not.toContain('origin/main');
+  });
+});
+
+// ─── A spawn that has not bound its port (plan 2026-11-04-a-runner-boot-that-never-answers…, D3) ──
+
+describe('Dashboard — a live spawn with no port', () => {
+  const PREBIND_NAMED = {
+    id: 'named-prebind',
+    name: 'named-prebind',
+    port: 9890,
+    // An external runner's `running` is lowered by the probe, so this is the
+    // shape the backend actually produces for a pre-bind spawn.
+    kind: { type: 'external' },
+    protected: true,
+    running: false,
+    pid: 4242,
+    api_responding: false,
+    port_open: false,
+    liveness: { state: 'unknown', unresponsive_since: null },
+  };
+
+  afterEach(() => {
+    vi.mocked(api.listRunners).mockResolvedValue([] as never);
+  });
+
+  /// The runner's own table row, so the panel's other Start/Stop buttons
+  /// (Expo) cannot answer for it.
+  async function prebindRow(): Promise<HTMLElement> {
+    const cells = await screen.findAllByText('named-prebind');
+    const row = cells.map((c) => c.closest('tr')).find((r) => r !== null);
+    if (!row) throw new Error('no table row for named-prebind');
+    return row as HTMLElement;
+  }
+
+  it('offers no Start for a runner whose newest spawn is up', async () => {
+    vi.mocked(api.listRunners).mockResolvedValue([{ ...PREBIND_NAMED, spawn_up: true }] as never);
+    renderDashboard();
+    const row = within(await prebindRow());
+    expect(row.getByRole('button', { name: 'Stop' })).toBeInTheDocument();
+    expect(row.getByRole('button', { name: 'Restart' })).toBeInTheDocument();
+    expect(row.queryByRole('button', { name: 'Start' })).not.toBeInTheDocument();
+  });
+
+  it('still offers Start when the spawn is not up', async () => {
+    vi.mocked(api.listRunners).mockResolvedValue([{ ...PREBIND_NAMED, spawn_up: false }] as never);
+    renderDashboard();
+    const row = within(await prebindRow());
+    expect(row.getByRole('button', { name: 'Start' })).toBeInTheDocument();
+    expect(row.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument();
   });
 });

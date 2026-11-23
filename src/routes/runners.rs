@@ -4,7 +4,7 @@
 
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -17,11 +17,12 @@ use tokio_stream::StreamExt;
 
 use crate::config::RunnerConfig;
 use crate::dev_action::{
-    assess_action_risk, evaluate_all, fetch_expectations, spawn_attribution_watcher, ActionKind,
-    ActionRecord, ActionRisk, AttributionTargets, PredictedSignature, SlotResolution,
+    mint_action, record_start_verdict, run_result_for, spawn_run_result, start_verdict, ActionKind,
+    ActionRunResult, AttributionTargets, MintedAction, RunResultGuard, StartVerdict, SyncProbe,
 };
 use crate::error::SupervisorError;
 use crate::log_capture::{LogLevel, LogSource};
+use crate::loopback::{runner_loopback_base, runner_ui_bridge_base};
 use crate::process::manager;
 use crate::routes::optional_json::OptionalJson;
 use crate::settings;
@@ -95,17 +96,38 @@ pub struct RestartRunnerRequest {
     /// typecheck.
     #[serde(default)]
     pub from_working_tree: bool,
+    /// Restart with the HANDOFF intent: holder-backed panes are detached and
+    /// left running for the successor runner to adopt, instead of killed. Plan
+    /// `2026-10-21-graceful-runner-restart-detaches-holder-panes-instead-of-killing-them`,
+    /// D7. Defaults to `false`, which is the restart this route always did.
+    ///
+    /// With `true` the supervisor only FORWARDS the intent — the runner decides
+    /// which panes survive:
+    ///
+    /// - the close-request it POSTs carries `{"handoff":"holders"}`;
+    /// - the readiness gate reads the runner's `safe_with_handoff` instead of
+    ///   `safe_to_restart`, and refuses with
+    ///   `409 restart_refused_unsafe_for_handoff` when it is `false` OR absent
+    ///   (an older runner is UNKNOWN, never safe);
+    /// - the graceful wait before the PID kill is extended to cover the
+    ///   runner's teardown budget.
+    ///
+    /// `force` keeps its meaning under either value. Read it through
+    /// [`RestartRunnerRequest::close_intent`].
+    #[serde(default)]
+    pub handoff: bool,
 }
 
 impl RestartRunnerRequest {
     /// The build source this request selects, as the typed value every layer
     /// below the wire takes.
     pub fn build_tree(&self) -> manager::BuildTree {
-        if self.from_working_tree {
-            manager::BuildTree::LiveWorkingTree
-        } else {
-            manager::BuildTree::OriginMain
-        }
+        manager::BuildTree::from_working_tree(self.from_working_tree)
+    }
+
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
     }
 }
 
@@ -136,9 +158,14 @@ pub struct PurgeStaleRequest {
 ///
 /// The rebuild-and-restart cycle is one round-trip for callers that today
 /// have to combine `POST /runners/{id}/stop` + a build + `POST .../start`
-/// manually. Refuses to operate on the primary or any user-managed runner
-/// (the supervisor never starts/stops those unprompted).
+/// manually. Refuses to operate on the primary; any other registered runner
+/// is accepted.
+///
+/// Unknown fields are REJECTED (422): a misspelled `handoff` must never
+/// silently become a kill-every-pane restart. No in-repo caller sends extra
+/// keys (the dashboard has no client for this route).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RebuildAndRestartRequest {
     /// Optional source label, recorded in diagnostic events.
     #[serde(default)]
@@ -150,6 +177,12 @@ pub struct RebuildAndRestartRequest {
     /// gate existed to give it something to override.
     #[serde(default)]
     pub force: bool,
+    /// Stop with the HANDOFF intent — same meaning as
+    /// [`RestartRunnerRequest::handoff`]: the close-request carries
+    /// `{"handoff":"holders"}`, the gate reads `safe_with_handoff` (absent
+    /// refuses), and the graceful wait is extended. Defaults to `false`.
+    #[serde(default)]
+    pub handoff: bool,
     /// If true, after starting the runner block until its `/health` returns
     /// 200 OK or `wait_timeout_secs` elapses.
     #[serde(default)]
@@ -157,6 +190,13 @@ pub struct RebuildAndRestartRequest {
     /// Maximum seconds to wait when `wait` is true. Defaults to 120s.
     #[serde(default)]
     pub wait_timeout_secs: Option<u64>,
+}
+
+impl RebuildAndRestartRequest {
+    /// The close intent this request selects. See [`manager::CloseIntent`].
+    pub fn close_intent(&self) -> manager::CloseIntent {
+        manager::CloseIntent::from_handoff(self.handoff)
+    }
 }
 
 fn default_source_manual() -> String {
@@ -291,7 +331,7 @@ fn copy_paired_state_files(
 /// Both root paths are injected (not pulled from `dirs::*`) so unit tests
 /// can drive the helper hermetically against tempdirs. The HTTP handler
 /// passes `dirs::home_dir().unwrap().join(".qontinui").join("profiles")`
-/// and `crate::process::instance_config_dir(<runner id>).unwrap()`
+/// and `crate::process::instance_root::instance_secure_storage_dir(<runner id>)`
 /// respectively.
 ///
 /// Returns `Ok(applied_files)` on success — the list of basenames copied,
@@ -436,7 +476,29 @@ pub(crate) fn apply_spawn_paired_state(
     }
 }
 
-/// HTTP-level wrapper around [`apply_spawn_paired_state`] that resolves the
+/// [`apply_spawn_paired_state`], gated on the subject's device identity (plan
+/// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b): a
+/// [`crate::process::instance_root::DeviceIdentity::Fresh`] subject gets NO
+/// paired state — nothing is read from `profiles_root` or `primary_dir` and
+/// nothing is written to `dest_dir` — and the report says
+/// `status: "fresh_device_identity"`. The `Harness` arm is
+/// [`apply_spawn_paired_state`] unchanged.
+pub(crate) fn apply_spawn_paired_state_for_identity(
+    identity: crate::process::instance_root::DeviceIdentity,
+    paired_profile_id: Option<&str>,
+    profiles_root: &std::path::Path,
+    primary_dir: Option<&std::path::Path>,
+    dest_dir: &std::path::Path,
+) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
+    match identity {
+        crate::process::instance_root::DeviceIdentity::Fresh => Ok(fresh_identity_paired_state()),
+        crate::process::instance_root::DeviceIdentity::Harness => {
+            apply_spawn_paired_state(paired_profile_id, profiles_root, primary_dir, dest_dir)
+        }
+    }
+}
+
+/// HTTP-level wrapper around [`apply_spawn_paired_state_for_identity`] that resolves the
 /// production roots — `~/.qontinui/profiles`, the primary's secure-storage dir
 /// ([`crate::process::primary_paired_state_dir`]) and the destination from
 /// [`crate::process::instance_config_dir`] — and surfaces failures as
@@ -455,6 +517,7 @@ pub(crate) fn apply_spawn_paired_state(
 /// An unresolvable config dir FAILS the spawn. There is deliberately no
 /// fallback to the shared dir — a silent fallback is the original bug.
 fn apply_paired_state_for_spawn(
+    identity: crate::process::instance_root::DeviceIdentity,
     paired_profile_id: Option<&str>,
     runner_id: &str,
 ) -> Result<serde_json::Value, (axum::http::StatusCode, serde_json::Value)> {
@@ -467,24 +530,65 @@ fn apply_paired_state_for_spawn(
             }),
         )
     })?;
-    let dest_dir = crate::process::instance_config_dir(runner_id).ok_or_else(|| {
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            json!({
-                "error": "config_dir_unresolved",
-                "message": "could not resolve config_dir for the runner's instance dir",
-                "runner_id": runner_id,
-            }),
-        )
-    })?;
+    // The CHILD's secure-storage dir — resolved through the same helper the
+    // spawn's env block exports as `QONTINUI_SECURE_STORAGE_DIR`, so the two
+    // cannot drift (plan
+    // `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`
+    // Phase 4: "writes into the subject's own secure dir").
+    let dest_dir = crate::process::instance_root::instance_secure_storage_dir(runner_id)
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                json!({
+                    "error": "config_dir_unresolved",
+                    "message": "could not resolve config_dir for the runner's instance dir",
+                    "runner_id": runner_id,
+                }),
+            )
+        })?;
     let profiles_root = home.join(".qontinui").join("profiles");
     let primary_dir = crate::process::primary_paired_state_dir();
-    apply_spawn_paired_state(
+    apply_spawn_paired_state_for_identity(
+        identity,
         paired_profile_id,
         &profiles_root,
         primary_dir.as_deref(),
         &dest_dir,
     )
+}
+
+/// A runner registered here is non-primary, so it runs under an instance root
+/// and refuses to start on `0` or the primary's `9876` — refuse that port at
+/// registration rather than persist a runner that can never start.
+fn refuse_reserved_non_primary_port(port: u16) -> Result<(), SupervisorError> {
+    if port == 0 || port == crate::config::DEFAULT_RUNNER_API_PORT {
+        return Err(SupervisorError::Validation(format!(
+            "Port {port} is reserved: a non-primary runner runs under an instance root and \
+             refuses to start on 0 or the primary's {}",
+            crate::config::DEFAULT_RUNNER_API_PORT
+        )));
+    }
+    Ok(())
+}
+
+/// The spawned runner's instance root and where an external client finds what
+/// it publishes there — `null` only when the root cannot be resolved (the
+/// spawn itself refuses that case, so a live response always carries it).
+///
+/// D5 of plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`:
+/// the launcher owns the root and passes it to any client. A subject keeps its
+/// `~/.qontinui` — the loopback handshake key, its port breadcrumb, session
+/// names — under `home`, NOT under the harness's `~/.qontinui`, so a client that
+/// reads those files must read them from here.
+pub(crate) fn instance_root_json(runner_id: &str) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        Some(root) => json!({
+            "path": root.path().display().to_string(),
+            "home": root.home_dir().display().to_string(),
+            "logs": root.logs_dir().display().to_string(),
+        }),
+        None => serde_json::Value::Null,
+    }
 }
 
 /// The spawned child's `coordCredential` block, read from a `/health` body
@@ -604,15 +708,32 @@ pub async fn list_runners(
         // refresher as `RUNNER WEDGED`) — the classification simply never
         // reached this response.
         //
-        // Both inputs come from `managed.cached_health`, i.e. the SAME
+        // All three inputs come from `managed.cached_health`, i.e. the SAME
         // refresher tick that produced `api_responding` above, so this is not
         // a second liveness system and cannot disagree with the escalation
         // log. A runner the refresher has not reached yet reads
         // `port_open: false, responding: false` and classifies as `unknown`,
         // which is the honest answer.
-        let liveness = runner.liveness(cached.runner_port_open, cached.runner_responding);
+        let liveness = runner.liveness(
+            cached.runner_port_open,
+            cached.runner_responding,
+            cached.spawn_up,
+        );
 
-        result.push(json!({
+        // Linux spawn isolation (plan 2026-11-04-linux-dev-supervisor-dies-with-
+        // its-launcher-and-orphans-its-temp-runners, Phase 1b). `isolation_unit`
+        // is the RUNNING runner's own transient systemd scope (the full unit
+        // name, `.scope` included — `systemctl --user stop <unit>` stops it),
+        // or null; a stopped runner's scope has already been collected.
+        // `isolation` carries the last spawn's verdict and its reason, null
+        // when this supervisor never started the runner.
+        let isolation = managed.isolation.read().await.clone();
+        let is_running = managed.runner.read().await.running;
+        let isolation_unit =
+            crate::process::systemd_scope::isolation_unit_for(isolation.as_ref(), is_running);
+        let isolation_json = isolation.as_ref().map(|i| i.to_json());
+
+        let mut entry = json!({
             "id": managed.config.id,
             "name": managed.config.name,
             "port": managed.config.port,
@@ -631,11 +752,21 @@ pub async fn list_runners(
             // `{"state": "responding"|"wedged"|"stopped"|"unknown",
             //   "unresponsive_since": <rfc3339>|null}`.
             "liveness": liveness,
+            // Whether the API has answered during THIS boot (since
+            // `started_at`). `null` = UNKNOWN (no boot recorded), never false.
+            // `wedged` with `false` here is a boot that never answered, whose
+            // `last_seen_responding_at` is a previous boot's.
+            "answered_this_boot": runner.answered_this_boot(),
             // The T behind "unresponsive since T", also present for the
             // non-wedged states so a caller can age any verdict. `null` =
             // never observed responding, which is UNKNOWN, not "never ran".
             "last_seen_responding_at": runner.last_seen_responding_at.map(|t| t.to_rfc3339()),
             "port_open": cached.runner_port_open,
+            // Whether the newest spawn is alive while the port is free and the
+            // API silent: a runner that has not bound its listener (yet). It is
+            // why `liveness` reads `unknown` rather than `stopped` there, and
+            // why a Start would be refused (`RunnerAlreadyRunning`).
+            "spawn_up": cached.spawn_up,
             "pid": runner.pid,
             "started_at": runner.started_at.map(|t| t.to_rfc3339()),
             "api_responding": cached.runner_responding,
@@ -664,8 +795,28 @@ pub async fn list_runners(
                 "serving_restart_attempts": watchdog.serving_restart_attempts,
                 "last_serving_restart_at": watchdog.last_serving_restart_at.map(|t| t.to_rfc3339()),
                 "serving_disabled_reason": watchdog.serving_disabled_reason.clone(),
+                "last_prebind_alert_at": watchdog.last_prebind_alert.map(|(_, at)| at.to_rfc3339()),
+                "last_prebind_alert_spawn_started_at": watchdog.last_prebind_alert.map(|(spawn, _)| spawn.to_rfc3339()),
             }
-        }));
+        });
+        // Set after the literal: one more key inside `json!` above exceeds the
+        // macro's recursion limit.
+        entry["isolation_unit"] = json!(isolation_unit);
+        // Live, not historical: the spawn a first-healthy watchdog tracks right
+        // now, which holds a serving restart while it names the current spawn.
+        // Same key and meaning as `WatchdogHealth` on `GET /health`.
+        entry["watchdog"]["first_healthy_tracked_spawn_started_at"] = json!(watchdog
+            .first_healthy_tracked_spawn_at()
+            .map(|spawn| spawn.to_rfc3339()));
+        entry["isolation"] = json!(isolation_json);
+        // Phase 8b: a `fresh_device_identity` runner's own device id, read
+        // lazily from `<root>/home/machine.json` — the observable for an id
+        // minted after the spawn response was sent. Absent for every
+        // unflagged runner, whose entry is unchanged.
+        if managed.config.fresh_device_identity {
+            entry["device_identity"] = device_identity_report(&managed.config.id);
+        }
+        result.push(entry);
     }
     drop(cached_snapshots);
 
@@ -741,7 +892,7 @@ pub async fn runners_by_unit(
         result.push(json!({
             "runner_id": managed.config.id,
             "port": port,
-            "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+            "ui_bridge_url": runner_ui_bridge_base(port),
             "git_sha": b.git_sha,
             "attempt_id": b.attempt_id,
         }));
@@ -772,6 +923,7 @@ pub async fn add_runner(
             "Port must be >= 1024".to_string(),
         ));
     }
+    refuse_reserved_non_primary_port(body.port)?;
 
     // Generate a unique ID
     let id = format!("runner-{}", uuid_simple());
@@ -820,6 +972,7 @@ pub async fn add_runner(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: Default::default(),
+            fresh_device_identity: false,
         };
 
         // External runners are never crash-auto-restarted (the supervisor
@@ -869,6 +1022,12 @@ pub async fn remove_runner(
             "Cannot remove the primary runner".to_string(),
         ));
     }
+
+    // Held through the teardown below. Mid-start, `running` still reads false, so
+    // this would otherwise remove the entry of a process about to be spawned.
+    let Some(_lifecycle) = manager::try_lock_registered(&state, &managed).await else {
+        return Err(SupervisorError::RunnerLifecycleBusy(id));
+    };
 
     {
         let runner = managed.runner.read().await;
@@ -1040,6 +1199,18 @@ pub async fn purge_stale_test_runners_core(
                 continue;
             }
         }
+        // Ordered against this runner's starts and stops, through the removal
+        // below, as the max-age sweep is. Never waits: a runner a start or a stop
+        // holds is left for the next purge. `runners` is a snapshot, so this also
+        // skips an entry something removed since.
+        let Some(_lifecycle) = manager::try_lock_registered(state, managed).await else {
+            tracing::debug!(
+                "purge-stale: skipping temp runner '{}' — a start or a stop holds it, or it \
+                 is gone",
+                managed.config.id
+            );
+            continue;
+        };
         let is_running = {
             let runner = managed.runner.read().await;
             runner.running
@@ -1050,6 +1221,24 @@ pub async fn purge_stale_test_runners_core(
         // a healthy runner. Only zombies (`running=true` with a dead port)
         // continue to fall through.
         if respect_active_builds && !is_running && any_build_active {
+            continue;
+        }
+        // Startup-window grace — decided once, here. A runner a spawn handler
+        // still owns (or one started moments ago) whose port is not listening
+        // YET is starting, not crashed; a `running=false` placeholder carrying
+        // the spawn-in-flight marker is in the post-build / pre-start window.
+        // Both are skipped on every caller, the operator path
+        // (`respect_active_builds=false`) included. A listening runner falls
+        // through unchanged.
+        if manager::skip_for_startup_window(managed, is_running).await {
+            tracing::debug!(
+                "purge-stale: skipping temp runner '{}' (port {}) — inside its startup window \
+                 (running={}: a not-yet-started placeholder, or started with its port not \
+                 listening yet)",
+                managed.config.id,
+                managed.config.port,
+                is_running
+            );
             continue;
         }
         if is_running {
@@ -1124,44 +1313,111 @@ pub async fn purge_stale_test_runners_core(
 /// this endpoint polls the runner's `/health` for up to 30s (500ms cadence)
 /// before returning 200. If the runner stays alive but never binds the API
 /// port within the budget, the response is **503** with body
-/// `{error: "runner_unhealthy_after_start", elapsed_ms, recent_logs}`.
+/// `{error: "runner_unhealthy_after_start", runner_id, elapsed_ms, ended, recent_logs}`
+/// plus the action's fields.
 ///
 /// Pass `?wait=false` to opt out and get the legacy fire-and-forget 200
 /// response the moment the process spawns (for callers that do their own
-/// readiness probing).
+/// readiness probing); the action's result then comes from a detached health
+/// wait.
+///
+/// **A start is a `spawn` trial.** It mints one ([`mint_action`]) targeting
+/// the named runner before it acts, threads the action id into the start so
+/// the spawn's ring entry names it, records the start's terminal result on it,
+/// and carries its fields in every response after the mint, a failed start's
+/// included. An id naming no registered runner is a 404 before anything is
+/// minted: there is no lifecycle act to measure.
 pub async fn start_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Query(wait_q): Query<crate::routes::runner::StartWaitQuery>,
 ) -> Result<axum::response::Response, SupervisorError> {
-    manager::start_runner_by_id(&state, &id).await?;
+    let managed = state
+        .get_runner(&id)
+        .await
+        .ok_or_else(|| SupervisorError::RunnerNotFound(id.clone()))?;
+    let minted = mint_action(
+        &state,
+        ActionKind::Spawn,
+        format!("start;wait={}", wait_q.wait),
+        None,
+        AttributionTargets::for_runner(managed.clone()),
+        None,
+    )
+    .await;
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "POST /runners/{id}/start");
 
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(minted.record.action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
+        return Ok(minted.answer_failure(&e));
+    }
+
+    let mut probe = SyncProbe::NotProbed;
     if wait_q.wait {
         if let Err(failure) =
             crate::process::health_probe::wait_for_runner_healthy_default(&state, &id).await
         {
+            let reason = crate::dev_action::run_result::unhealthy_after_start_reason(
+                &id,
+                &failure,
+                "the start",
+            );
             state
                 .logs
-                .emit(
-                    LogSource::Supervisor,
-                    LogLevel::Warn,
-                    format!(
-                        "Runner '{}' did not become healthy {}ms after start",
-                        id, failure.elapsed_ms
-                    ),
-                )
+                .emit(LogSource::Supervisor, LogLevel::Warn, reason.clone())
                 .await;
+            minted
+                .record
+                .record_run_result(ActionRunResult::Errored { reason });
             return Ok(crate::routes::runner::unhealthy_after_start_response(
-                &id, failure,
+                &id, failure, &minted,
             ));
         }
+        probe = SyncProbe::Healthy;
     }
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            minted.record.action_id,
+            start_verdict(probe),
+            chrono::Utc::now(),
+        )
+        .await,
+        run_guard,
+    );
 
-    Ok(Json(json!({
+    Ok(Json(minted.stamp(json!({
         "status": "started",
         "message": format!("Runner '{}' started", id)
-    }))
+    })))
     .into_response())
+}
+
+/// Merge a minted action's ACK fields ([`MintedAction::ack_fields`]) into a
+/// lifecycle door's response body. With no action (the door minted none,
+/// because the id names no runner it could act on) `action_id` is `null`, so
+/// a body built here always carries the key and its absence never has to be
+/// interpreted.
+fn with_action_fields(
+    mut body: serde_json::Value,
+    minted: Option<&MintedAction>,
+) -> serde_json::Value {
+    if let Some(minted) = minted {
+        return minted.stamp(body);
+    }
+    if let Some(body) = body.as_object_mut() {
+        body.insert("action_id".to_string(), serde_json::Value::Null);
+    }
+    body
 }
 
 /// POST /runners/{id}/stop — stop a specific runner.
@@ -1175,28 +1431,12 @@ pub async fn stop_runner(
 ) -> Result<impl IntoResponse, SupervisorError> {
     let force = body.into_inner_or_default().force;
 
-    // Capture the early-log path BEFORE stopping — for test-* runners the
-    // stop also removes them from the registry, after which we can no longer
-    // look up the path. We delete the file AFTER stop succeeds because the
-    // stop is the explicit "user is done diagnosing" signal.
-    let early_log_path = if let Some(managed) = state.get_runner(&id).await {
-        managed.early_log_path.read().await.clone()
-    } else {
-        None
-    };
-
-    manager::stop_runner_by_id(&state, &id, force).await?;
-
-    // Explicit user-facing /stop is the only path that deletes the
-    // early-log file. The spawn-test failed-probe cleanup path also calls
-    // stop_runner_by_id, but it does NOT route through here — it goes
-    // directly through the manager — so the early-log file is preserved
-    // there (which is what we want for post-mortem debugging). Files for
-    // runners that died on their own and were reaped also persist. Best
-    // effort: missing-file errors are silently swallowed by delete_early_log.
-    if let Some(path) = early_log_path {
-        crate::process::early_log::delete_early_log(&path);
-    }
+    // The stopped spawn's early-log file is kept: its ring entry names it, and
+    // the dev-action attribution watcher reads it only when a window over that
+    // spawn closes, which can be up to `dev_action::attribution::LONGEST_BACKSTOP`
+    // after the spawn. The max-age sweep (`process::manager::reap_stale_test_runners`)
+    // prunes early logs once they are older than that, plus a margin.
+    manager::stop_runner_by_id(&state, &id, force, manager::CloseIntent::Kill).await?;
 
     Ok(Json(json!({
         "status": "stopped",
@@ -1235,6 +1475,15 @@ pub async fn stop_runner(
 /// `/runner/fix-and-rebuild` uses). We return **202** + a `build_id` in ~1s;
 /// callers poll `GET /builds` (or `GET /build/{id}/status`) for the terminal
 /// outcome, and the existing detached completion logic triggers the restart.
+///
+/// **Every restart is a dev-action trial** ([`mint_action`]): `build` with
+/// `rebuild: true`, `restart` without, targeting the named runner. Every
+/// response after the mint carries its fields, a failed restart's included. The
+/// rebuild 202 reads `action_id: null` when the id names no registered runner,
+/// which mints nothing; the no-rebuild arm answers that case with a plain 404.
+/// The action id names the restart's spawn ring entry, and the act's terminal
+/// result is recorded on the action, a readiness refusal included. Plan
+/// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows` D2.
 pub async fn restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
@@ -1245,14 +1494,59 @@ pub async fn restart_runner(
     // wire — see `diagnostics::restart_source_from_wire` and its test.
     let source = crate::diagnostics::restart_source_from_wire(&body.source);
 
+    // A restart is a trial: `build` when it rebuilds (its outcome lands after
+    // the build), `restart` otherwise, targeting the named runner, minted
+    // before anything runs. An id naming no registered runner mints nothing:
+    // the restart fails on it at once, and that is not a lifecycle act.
+    let managed = state.get_runner(&id).await;
+    let minted = match &managed {
+        Some(managed) => Some(
+            mint_action(
+                &state,
+                if body.rebuild {
+                    ActionKind::Build
+                } else {
+                    ActionKind::Restart
+                },
+                format!(
+                    "runner={};rebuild={};force={};handoff={}",
+                    id, body.rebuild, body.force, body.handoff
+                ),
+                None,
+                AttributionTargets::for_runner(managed.clone()),
+                None,
+            )
+            .await,
+        ),
+        None => None,
+    };
+
     // ── Rebuild path: DETACH from the HTTP connection. ──────────────────────
     if body.rebuild {
         let exec_state = state.clone();
         let force = body.force;
         let build_tree = body.build_tree();
+        let intent = body.close_intent();
+        // Echoed in the 202 so the build decision is visible before the build
+        // runs. `null` when the id names no registered runner: the detached
+        // restart fails on it, and a label would describe a build that never
+        // happens.
+        let build_source = match &managed {
+            Some(managed) => json!(build_tree.build_source(managed.config.kind().is_primary())),
+            None => serde_json::Value::Null,
+        };
         let runner_id = id.clone();
+        // The detached body owns the record, so the terminal result reaches the
+        // watcher, and the guard, so a panic in it still records one.
+        let exec_record = minted.as_ref().map(|m| m.record.clone());
+        let exec_guard = minted.as_ref().map(|m| {
+            RunResultGuard::arm(
+                m.record.clone(),
+                "POST /runners/{id}/restart's detached task",
+            )
+        });
         let (submission_id, _arc) = crate::build_submissions::submit_detached(
-            state.build_submissions.clone(),
+            &state.build_submissions,
             state.config.project_dir.clone(),
             None,
             async move {
@@ -1273,9 +1567,14 @@ pub async fn restart_runner(
                     source,
                     force,
                     build_tree,
+                    intent,
+                    exec_record.as_ref().map(|record| record.action_id),
                 )
                 .await
                 {
+                    if let Some(record) = &exec_record {
+                        record.record_run_result(run_result_for(&e));
+                    }
                     exec_state
                         .logs
                         .emit(
@@ -1294,6 +1593,17 @@ pub async fn restart_runner(
                     );
                 }
 
+                // The restart answers once the OS process spawns, so whether
+                // the runner came up is the detached health wait's to record.
+                if let Some(guard) = exec_guard {
+                    record_start_verdict(
+                        &exec_state,
+                        &runner_id,
+                        StartVerdict::AfterHealthWait,
+                        guard,
+                    );
+                }
+
                 (
                     axum::http::StatusCode::OK.as_u16(),
                     json!({
@@ -1302,19 +1612,24 @@ pub async fn restart_runner(
                     }),
                 )
             },
-        );
+        )
+        .await;
 
         return Ok((
             axum::http::StatusCode::ACCEPTED,
-            Json(json!({
-                "status": "rebuilding",
-                "build_id": submission_id.to_string(),
-                "submission_id": submission_id.to_string(),
-                "poll": "/builds",
-                "message": "rebuild-restart submitted; the build+restart runs detached from \
-                            this connection — poll GET /builds (or GET /build/{id}/status) \
-                            for the terminal outcome",
-            })),
+            Json(with_action_fields(
+                json!({
+                    "status": "rebuilding",
+                    "build_id": submission_id.to_string(),
+                    "submission_id": submission_id.to_string(),
+                    "poll": "/builds",
+                    "build_source": build_source,
+                    "message": "rebuild-restart submitted; the build+restart runs detached from \
+                                this connection — poll GET /builds (or GET /build/{id}/status) \
+                                for the terminal outcome",
+                }),
+                minted.as_ref(),
+            )),
         )
             .into_response());
     }
@@ -1325,15 +1640,48 @@ pub async fn restart_runner(
     // threaded rather than passed as a literal so both call sites say the same
     // thing, and so a future change that starts building here cannot inherit a
     // hardcoded provenance.
-    manager::restart_runner_by_id(&state, &id, false, source, body.force, body.build_tree())
-        .await?;
+    //
+    // Every exit records a result; the guard covers the handler future being
+    // dropped mid-restart when its client disconnects.
+    let run_guard = minted
+        .as_ref()
+        .map(|m| RunResultGuard::arm(m.record.clone(), "POST /runners/{id}/restart"));
+    let restart = manager::restart_runner_by_id(
+        &state,
+        &id,
+        false,
+        source,
+        body.force,
+        body.build_tree(),
+        body.close_intent(),
+        minted.as_ref().map(|m| m.record.action_id),
+    )
+    .await;
+    if let Err(e) = restart {
+        return match &minted {
+            Some(minted) => Ok(minted.answer_failure(&e)),
+            None => Err(e),
+        };
+    }
+    if let Some(guard) = run_guard {
+        record_start_verdict(&state, &id, StartVerdict::AfterHealthWait, guard);
+    }
 
-    Ok(Json(json!({
-        "status": "restarted",
-        "message": format!("Runner '{}' restarted", id)
-    }))
+    Ok(Json(with_action_fields(
+        json!({
+            "status": "restarted",
+            "message": format!("Runner '{}' restarted", id)
+        }),
+        minted.as_ref(),
+    ))
     .into_response())
 }
+
+/// The tree `POST /runners/{id}/rebuild-and-restart` compiles.
+/// `rebuild_and_restart_by_id` builds through `run_cargo_build_with_requester`,
+/// which takes no build-dir override, so this route always builds the live
+/// working checkout.
+const REBUILD_AND_RESTART_SOURCE: manager::BuildSource = manager::BuildSource::LiveTree;
 
 /// POST /runners/{id}/rebuild-and-restart — stop → cargo build → start, in
 /// one round-trip.
@@ -1351,21 +1699,86 @@ pub async fn restart_runner(
 /// and a `build_id` immediately; callers poll `GET /builds` (or `GET
 /// /build/{id}/status`) for the terminal outcome (which carries the full
 /// `build_result` body the inline path used to return synchronously).
+///
+/// The 202 carries `build_source` like the other detached-rebuild 202s:
+/// `live_tree` (from [`REBUILD_AND_RESTART_SOURCE`]) when the id names a
+/// non-primary runner, `null` when it names no runner or the primary, since
+/// the detached task refuses both and no build runs.
+///
+/// **It is a `build` trial** on that same non-primary runner, minted before the
+/// build is submitted: the 202 carries its `action_id` (`null` where
+/// `build_source` is), the action id names the start's spawn ring entry, and the
+/// detached task records the terminal result on it.
 pub async fn rebuild_and_restart_runner(
     State(state): State<SharedState>,
     Path(id): Path<String>,
     Json(body): Json<RebuildAndRestartRequest>,
 ) -> Result<axum::response::Response, SupervisorError> {
+    // Only a non-primary runner gets a build. The primary and an unknown id are
+    // refused by the detached task before anything runs, so they mint nothing,
+    // and their 202 names no tree.
+    let target = state
+        .get_runner(&id)
+        .await
+        .filter(|managed| !managed.config.kind().is_primary());
+    let build_source = match &target {
+        Some(_) => json!(REBUILD_AND_RESTART_SOURCE),
+        None => serde_json::Value::Null,
+    };
+    // A rebuild-and-restart is a `build` trial on the named runner, minted
+    // before the build is submitted.
+    let minted = match &target {
+        Some(managed) => Some(
+            mint_action(
+                &state,
+                ActionKind::Build,
+                format!(
+                    "rebuild_and_restart;runner={};force={};handoff={}",
+                    id, body.force, body.handoff
+                ),
+                None,
+                AttributionTargets::for_runner(managed.clone()),
+                None,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let exec_state = state.clone();
     let runner_id = id.clone();
+    let exec_record = minted.as_ref().map(|m| m.record.clone());
+    let exec_guard = minted.as_ref().map(|m| {
+        RunResultGuard::arm(
+            m.record.clone(),
+            "POST /runners/{id}/rebuild-and-restart's detached task",
+        )
+    });
     let (submission_id, _arc) = crate::build_submissions::submit_detached(
-        state.build_submissions.clone(),
+        &state.build_submissions,
         state.config.project_dir.clone(),
         None,
         async move {
-            match manager::rebuild_and_restart_by_id(&exec_state, &runner_id, body).await {
-                Ok(outcome) => (axum::http::StatusCode::OK.as_u16(), outcome),
+            let initiated_by = exec_record.as_ref().map(|record| record.action_id);
+            match manager::rebuild_and_restart_by_id(&exec_state, &runner_id, body, initiated_by)
+                .await
+            {
+                Ok(outcome) => {
+                    // The start answered once the process spawned; whether the
+                    // runner came up is the detached health wait's to record.
+                    if let Some(guard) = exec_guard {
+                        record_start_verdict(
+                            &exec_state,
+                            &runner_id,
+                            StartVerdict::AfterHealthWait,
+                            guard,
+                        );
+                    }
+                    (axum::http::StatusCode::OK.as_u16(), outcome)
+                }
                 Err(e) => {
+                    if let Some(record) = &exec_record {
+                        record.record_run_result(run_result_for(&e));
+                    }
                     exec_state
                         .logs
                         .emit(
@@ -1388,19 +1801,24 @@ pub async fn rebuild_and_restart_runner(
                 }
             }
         },
-    );
+    )
+    .await;
 
     Ok((
         axum::http::StatusCode::ACCEPTED,
-        Json(json!({
-            "status": "rebuilding",
-            "build_id": submission_id.to_string(),
-            "submission_id": submission_id.to_string(),
-            "poll": "/builds",
-            "message": "rebuild-and-restart submitted; the build+restart runs detached from \
-                        this connection — poll GET /builds (or GET /build/{id}/status) for the \
-                        terminal outcome",
-        })),
+        Json(with_action_fields(
+            json!({
+                "status": "rebuilding",
+                "build_id": submission_id.to_string(),
+                "submission_id": submission_id.to_string(),
+                "poll": "/builds",
+                "build_source": build_source,
+                "message": "rebuild-and-restart submitted; the build+restart runs detached from \
+                            this connection — poll GET /builds (or GET /build/{id}/status) for the \
+                            terminal outcome",
+            }),
+            minted.as_ref(),
+        )),
     )
         .into_response())
 }
@@ -1536,7 +1954,7 @@ pub async fn proxy_ui_bridge(
     let uri = req.uri().clone();
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
 
-    let target_url = format!("http://127.0.0.1:{}/ui-bridge/{}{}", port, path, query);
+    let target_url = format!("{}/ui-bridge/{}{}", runner_loopback_base(port), path, query);
 
     let content_type = req
         .headers()
@@ -1629,14 +2047,31 @@ pub struct SpawnTestRequest {
     /// Only meaningful when `rebuild: true`. `None` means wait indefinitely
     /// (the default).
     ///
-    /// It bounds only the queue phases — waiting on a cargo build permit and,
-    /// after that, on the serialized frontend (pnpm) lock. **The clock stops
-    /// the moment the build starts doing work**: a build that has its slot and
-    /// is compiling can no longer be 504'd out from under itself, however
-    /// small a value you pass. Until 2026-08-03 this bounded the whole
-    /// build+spawn future despite its name and docs, so a caller asking "don't
-    /// make me queue for more than 60s" also got their compiling build
-    /// abandoned at 60s — losing everything it had compiled.
+    /// It bounds only the queue phases — waiting for the managed container,
+    /// on the pre-permit memory guard, on a cargo build permit and, after
+    /// that, on the serialized frontend (pnpm) lock. **The clock does not run
+    /// while the build is doing work**, and only queue time is summed: a build
+    /// that has its slot and is compiling can no longer be 504'd out from under
+    /// itself, however small a value you pass.
+    ///
+    /// **`0` means "a free slot right now, else a 504 at once".** One that
+    /// would have to queue (a busy pool, or a busy frontend lock) is answered
+    /// 504 immediately, with the message naming the phase it would have waited
+    /// in. A spawn that finds a permit free reaches its build provided nothing
+    /// before the permit yields: the build is polled first and marks itself
+    /// `SlotHeld` the instant the permit is held. **Residual:** the pre-permit
+    /// disk and memory guards read a lock and emit logs while the marker still
+    /// says `AwaitingSlot`, so a contended yield there (or a memory-guard
+    /// deferral) can still 504 a zero budget. That is the guard's wait being
+    /// counted, which is the bound working, but it is not a free-slot
+    /// guarantee. That is not
+    /// `X-Queue-Mode: no-wait`, which answers a busy pool with 503
+    /// `build_pool_full` and its queue position.
+    ///
+    /// Until 2026-08-03 this bounded the whole build+spawn future despite its
+    /// name and docs, so a caller asking "don't make me queue for more than
+    /// 60s" also got their compiling build abandoned at 60s — losing
+    /// everything it had compiled.
     ///
     /// Use `wait_timeout_secs` to bound the post-spawn health wait; there is
     /// deliberately no knob that kills a healthy in-flight compile.
@@ -1645,8 +2080,8 @@ pub struct SpawnTestRequest {
     /// Optional post-spawn health probe window in milliseconds.
     ///
     /// After the child process is spawned, the supervisor polls
-    /// `GET http://localhost:{port}/health` every 200ms until it succeeds or
-    /// this many milliseconds elapse. Defaults to 6000 (6 seconds).
+    /// `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
+    /// this many milliseconds elapse. Defaults to 60000 (60 seconds).
     ///
     /// Set to `0` to skip the probe entirely (legacy behavior — return
     /// immediately after spawn without verifying the child bound its API
@@ -1882,6 +2317,26 @@ pub struct SpawnTestRequest {
     #[serde(default)]
     pub paired_profile_id: Option<String>,
 
+    /// Run the subject under its OWN device identity (plan
+    /// `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b).
+    /// Default `false`, which leaves the spawn exactly as it was.
+    ///
+    /// When `true` the supervisor projects NO `machine.json` and NO paired
+    /// state into the instance root — neither the primary's
+    /// `paired_user.json` / `auth_tokens.enc` snapshot nor a
+    /// `paired_profile_id` one — and removes `QONTINUI_MACHINE_ID` from the
+    /// child env. The runner then mints a new `device_id` into
+    /// `<root>/home/machine.json` at first start, and the response's
+    /// `device_identity` block reports it (`status: "pending"` until the file
+    /// exists; `GET /runners` re-reads it lazily). The response's
+    /// `paired_state` reads `status: "fresh_device_identity"`.
+    ///
+    /// Refused with `400 fresh_device_identity_conflict` together with a
+    /// `paired_profile_id` (a snapshot IS another device's paired state) or an
+    /// `extra_env` `QONTINUI_MACHINE_ID` (which would override the minted id).
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+
     /// Optional autonomous-dev work-unit id this spawn is a *preview* for
     /// (Track 2 UI-Bridge preview-verification). Pure passthrough correlation:
     /// the supervisor stores it on the spawned `ManagedRunner` and echoes it in
@@ -1958,6 +2413,100 @@ pub struct SpawnNamedRequest {
     /// build failures short-circuit with HTTP 500 and no spawn happens.
     #[serde(default)]
     pub allow_stale_fallback: bool,
+    /// Mirror of `SpawnTestRequest::fresh_device_identity`: the named runner
+    /// runs under its own device identity (no projected `machine.json`, no
+    /// `QONTINUI_MACHINE_ID`). Persisted with the runner's config, so a later
+    /// restart never re-projects the harness's identity. `spawn-named`
+    /// projects no paired state either way.
+    #[serde(default)]
+    pub fresh_device_identity: bool,
+    /// Additional environment variables for the named runner — same contract
+    /// as `SpawnTestRequest::extra_env` (applied last), and persisted with the
+    /// runner's settings entry like every named runner's `extra_env`. A
+    /// `DISPLAY` here satisfies the Linux display preflight.
+    ///
+    /// PERSISTED IN PLAINTEXT: unlike a temp runner's, these values are written
+    /// to the supervisor's settings file and survive restarts. Never put a
+    /// token, secret, password or JWT here.
+    #[serde(default)]
+    pub extra_env: std::collections::HashMap<String, String>,
+}
+
+/// Refuse a `fresh_device_identity: true` spawn whose other fields would hand
+/// the subject a device identity anyway — the two contradict, and silently
+/// dropping either side would spawn something other than what was asked for.
+///
+/// - `paired_profile_id` — a snapshot IS another device's paired state;
+/// - `extra_env` naming `QONTINUI_MACHINE_ID` — it would override the id the
+///   runner mints.
+///
+/// Returns the typed `400` body, or `None` when the request is coherent
+/// (always `None` for an unflagged request). Pure, so every arm is tested
+/// without a live `SharedState`.
+pub(crate) fn fresh_device_identity_conflict(
+    fresh_device_identity: bool,
+    paired_profile_id: Option<&str>,
+    extra_env: &std::collections::HashMap<String, String>,
+) -> Option<serde_json::Value> {
+    if !fresh_device_identity {
+        return None;
+    }
+    let mut conflicts = Vec::new();
+    if paired_profile_id.is_some() {
+        conflicts.push("paired_profile_id".to_string());
+    }
+    let machine_id_env = crate::process::instance_root::MACHINE_ID_ENV;
+    // Case-insensitively: Windows env names are, so `qontinui_machine_id`
+    // would still reach the runner's `QONTINUI_MACHINE_ID` read there.
+    for key in extra_env.keys() {
+        if key.eq_ignore_ascii_case(machine_id_env) {
+            conflicts.push(format!("extra_env.{key}"));
+        }
+    }
+    if conflicts.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "error": "fresh_device_identity_conflict",
+        "conflicts_with": conflicts,
+        "message": format!(
+            "fresh_device_identity: true asks for a subject with its OWN device identity, \
+             but {} would give it another one. Send one or the other.",
+            conflicts.join(" and ")
+        ),
+    }))
+}
+
+/// The `paired_state` report of a `fresh_device_identity` spawn: nothing was
+/// projected, by request.
+fn fresh_identity_paired_state() -> serde_json::Value {
+    json!({
+        "source": "none",
+        "status": "fresh_device_identity",
+        "applied": [],
+        "message": "fresh_device_identity: no paired state was projected; the runner \
+                    starts unpaired under the device id it mints",
+    })
+}
+
+/// The `device_identity` block of a `fresh_device_identity` runner — the
+/// `device_id` it minted into `<root>/home/machine.json`, read lazily
+/// ([`crate::process::instance_root::device_identity_json`]). Emitted by the
+/// spawn responses and `GET /runners` for FLAGGED runners only.
+pub(crate) fn device_identity_report(runner_id: &str) -> serde_json::Value {
+    match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+        Some(root) => crate::process::instance_root::device_identity_json(
+            &root.home_dir(),
+            crate::process::instance_root::harness_qontinui_dir().as_deref(),
+        ),
+        None => json!({
+            "fresh": true,
+            "status": "unknown",
+            "device_id": null,
+            "differs_from_harness": null,
+            "message": "the instance root could not be resolved",
+        }),
+    }
 }
 
 /// Paths needed to tear down a prepared spawn container on a downstream
@@ -2279,131 +2828,96 @@ fn reject_known_provenance_aliases(raw: &serde_json::Value) -> Result<(), Superv
 /// accurate to well under a second.
 const QUEUE_PHASE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Resolve only if `timeout` elapses while the build is STILL in a queue phase
-/// (see [`crate::build_monitor::BuildPhase::is_queue_wait`]); returns the phase
-/// that was blocking so the caller can compose a phase-accurate message.
+/// Resolve once the build has spent `timeout` IN QUEUE PHASES (see
+/// [`crate::build_monitor::BuildPhase::is_queue_wait`]) and is still in one;
+/// returns the phase that was blocking so the caller can compose a
+/// phase-accurate message.
 ///
-/// Once the build leaves its queue phases — the cargo permit and, after it, the
-/// frontend lock are both held and real work has started — this future never
-/// resolves, so `queue_timeout_secs` can no longer 504 a build that is
-/// compiling. Phases advance monotonically within one attempt, so "left the
-/// queue" is a latch, not a sample that can flap back.
+/// **Only queue time is charged.** A worktree build waits for its cargo
+/// permit, works under it (`SlotHeld`, the frontend prebuild), and then waits
+/// again for the frontend lock — so the phases are not monotonic, and a
+/// wall-clock budget would charge the work between the two waits to the second
+/// one, 504ing a build whose actual queue time was far under the bound. Each
+/// poll interval is charged only when it began in a queue phase, and the
+/// watcher keeps polling through work phases rather than giving up on them,
+/// because a frontend-lock wait can still follow. Only
+/// [`crate::build_monitor::BuildPhase::ends_the_queue`] (`Compiling`) stops it
+/// for good, so `queue_timeout_secs` can never 504 a build that is compiling.
+///
+/// The charge is per poll interval, so a phase change part-way through one is
+/// charged to whichever phase the interval began in: each transition out of a
+/// queue phase overcharges by up to one [`QUEUE_PHASE_POLL`] (100 ms), and
+/// each transition into one undercharges by as much. Negligible against any
+/// budget measured in seconds.
+///
+/// A zero `timeout` fires on the first poll that reads a queue phase, which is
+/// what `queue_timeout_secs: 0` means: "a free slot now, else a 504". That is
+/// truthful only because the build is polled first
+/// ([`race_build_against_queue_budget`]) and stores `SlotHeld` the moment its
+/// permit is held.
 async fn wait_out_queue_timeout(
     timeout: std::time::Duration,
     marker: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> crate::build_monitor::BuildPhase {
-    let start = std::time::Instant::now();
+    let mut queued_for = std::time::Duration::ZERO;
+    // When the previous poll read a queue phase: the interval since then is
+    // charged against the budget.
+    let mut queued_since: Option<tokio::time::Instant> = None;
     loop {
+        let now = tokio::time::Instant::now();
+        if let Some(since) = queued_since.take() {
+            queued_for += now.saturating_duration_since(since);
+        }
         let phase = crate::build_monitor::BuildPhase::from_u8(
             marker.load(std::sync::atomic::Ordering::Relaxed),
         );
-        if !phase.is_queue_wait() {
-            // Work has started — stop counting, forever.
+        if phase.ends_the_queue() {
+            // Compiling: no queue phase can follow — stop counting, forever.
             std::future::pending::<()>().await;
         }
-        if start.elapsed() >= timeout {
-            return phase;
+        if phase.is_queue_wait() {
+            if queued_for >= timeout {
+                return phase;
+            }
+            queued_since = Some(now);
         }
         tokio::time::sleep(QUEUE_PHASE_POLL).await;
     }
 }
 
-/// Mint a `spawn`-kind dev-action snapshot for a freshly-reserved runner.
+/// Mint a `spawn`-kind dev-action trial for a freshly-reserved runner through
+/// [`mint_action`], targeting the spawned runner's registry entry.
 ///
-/// Evaluates the active dev-state set, stores the record, and spawns the
-/// attribution watcher targeting the spawned runner. The early-log is read
-/// lazily via the managed runner because its path is only set during the
-/// build, after mint.
+/// The watcher reads the runner's spawn ring, and each in-window spawn's early
+/// log and panic, lazily, at window close, because the spawn records them after
+/// the mint, once the build is done. The window stays open until the spawn
+/// route records the spawn's own terminal result (`spawn_run_result`, at the
+/// route's one chokepoint), then a 30 s tail, capped by the 2-hour spawn
+/// backstop, so a `rebuild: true` spawn's build and boot land inside it.
 ///
-/// Returns `(action_id, states_active, predicted, risk)` for stamping into the
-/// spawn ACK. Phase 4: `predicted` is coord's state-conditioned expectations for
-/// this `(spawn, states_active)` — fetched best-effort with a 2s timeout so the
-/// initiating agent is warned BEFORE the spawn completes. Empty vec when coord
-/// is unreachable / has no history (fail-open; never blocks the spawn).
-///
-/// "Act on predictions": `risk` is the pure [`assess_action_risk`] verdict over
-/// `predicted` + `states_active`. spawn-test/named is a *testing* surface, so we
-/// do NOT auto-route it to LKG — we only SURFACE the assessment (stamp it into
-/// the ACK + a loud warn) so the caller sees the risk before the spawn completes.
+/// The route records the spawn's terminal result on the returned record and
+/// stamps the rest into the spawn ACK. spawn-test/named is a *testing* surface, so `risk` is never acted
+/// on here: it is surfaced in the ACK for the caller to act on.
 async fn mint_spawn_action(
     state: &SharedState,
     params_digest: String,
     requester_id: Option<String>,
     managed: Arc<ManagedRunner>,
-) -> (
-    uuid::Uuid,
-    Vec<&'static str>,
-    Vec<PredictedSignature>,
-    ActionRisk,
-) {
-    // Resolve the slot the spawn WOULD reuse (relevant for `rebuild:false`),
-    // so LEGACY_EXE_FALLBACK is a real signal where it applies. A resolution
-    // error ⇒ leave unevaluated so the state surfaces as `Unknown`.
-    let slot_resolution = match manager::resolve_source_exe_with_origin(state).await {
-        Ok((origin, _)) => SlotResolution::Resolved(origin),
-        Err(_) => SlotResolution::NotEvaluated,
-    };
-    let states = evaluate_all(state, slot_resolution).await;
-    let record = ActionRecord::new(ActionKind::Spawn, requester_id, params_digest, &states);
-    let action_id = record.action_id;
-    // Stamp the ACK with the canonical string ids (Phase-2b stores typed
-    // `DevState`; the ACK wire form is the canonical-id array, unchanged).
-    let states_active: Vec<&'static str> =
-        record.states_active.iter().map(|s| s.as_str()).collect();
-
-    // Phase 4: fetch coord's state-conditioned expectations for this
-    // (spawn, states) so the ACK warns the agent before the spawn completes.
-    // Best-effort + 2s timeout; an empty vec on any failure (fail-open).
-    let predicted = fetch_expectations(ActionKind::Spawn.as_str(), &states_active, 5).await;
-
-    // "Act on predictions" (surface-only for spawns): assess the prediction set
-    // and, when high-risk, warn loudly so the caller sees it before the spawn
-    // completes. spawn-test/named is a testing surface — we never auto-route it
-    // to LKG; the ACK `risk` field carries the advisory for the caller to act on.
-    let risk = assess_action_risk(&predicted, &states_active);
-    if let Some(warn) = risk.warn.as_deref() {
-        tracing::warn!(action_id = %action_id, kind = "spawn", "{warn}");
-        state
-            .logs
-            .emit(LogSource::Supervisor, LogLevel::Warn, warn.to_string())
-            .await;
-    }
-
-    let arc = state.dev_actions.write().await.insert(record);
-
-    let runner_id = managed.config.id.clone();
-    spawn_attribution_watcher(
-        state.clone(),
-        arc,
-        AttributionTargets {
-            early_log_path: None,
-            managed: Some(managed),
-            panic_log_path: None,
-            runner_id: Some(runner_id),
-        },
+) -> MintedAction {
+    mint_action(
+        state,
+        ActionKind::Spawn,
+        params_digest,
+        requester_id,
+        AttributionTargets::for_runner(managed),
         None,
-    );
-
-    (action_id, states_active, predicted, risk)
-}
-
-/// Render an [`ActionRisk`] as the spawn ACK's `risk` field: `null` when there
-/// is no actionable risk, otherwise the `route_lkg` advice (always surfaced —
-/// spawns don't auto-route, the caller decides), the human-readable `warning`,
-/// and the `top_signature` evidence.
-fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
-    if !risk.is_actionable() {
-        return serde_json::Value::Null;
-    }
-    json!({
-        "route_lkg": risk.route_lkg,
-        "warning": risk.warn,
-        "top_signature": risk.top_signature,
-    })
+    )
+    .await
 }
 
 /// The git repo root whose object db + refs the spawn-response provenance
-/// compares must be run in: the tree that was ACTUALLY compiled.
+/// compares must be run in: one that holds the tree that was ACTUALLY
+/// compiled.
 ///
 /// `built_root` is `Some(<runner root>)` for a provenance build (`git_ref` /
 /// `worktree_path`) and `None` for a live-tree build. Running an ancestry
@@ -2413,21 +2927,43 @@ fn spawn_risk_ack_json(risk: &ActionRisk) -> serde_json::Value {
 /// guaranteed to exist in the canonical object db, and its `origin/main` is not
 /// guaranteed to be the same ref, so the compare is at best coincidentally
 /// right. Probing the built tree makes the sha always resolvable there.
+///
+/// A managed `.spawn-<ref>` container's runner worktree is the exception: it
+/// is a linked worktree OF the runner repo, sharing that repo's object store
+/// and refs, so the runner repo resolves its sha and its `origin/main` alike —
+/// and the runner repo outlives the container. These compares run after the
+/// spawn has released the container's lock, when a sweep may already have
+/// deleted it, and a compare run in a deleted tree fails quietly
+/// (`not_computable`, a `null` warning) and drops the stale-build warning.
 fn provenance_compare_root(
     state: &SharedState,
     built_root: Option<&std::path::Path>,
 ) -> std::path::PathBuf {
-    match built_root {
-        Some(root) => root.to_path_buf(),
-        // `project_dir` is the runner's `src-tauri`; git resolves upward from
-        // any subdir, but use the repo root for parity with the other drift
-        // call sites.
-        None => state
+    // `project_dir` is the runner's `src-tauri`; git resolves upward from any
+    // subdir, but use the repo root for parity with the other drift call
+    // sites.
+    let live_repo_root = || {
+        state
             .config
             .project_dir
             .parent()
             .unwrap_or(&state.config.project_dir)
-            .to_path_buf(),
+            .to_path_buf()
+    };
+    match built_root {
+        Some(root)
+            if crate::spawn_worktree::is_managed_runner_worktree(
+                &state.config.project_dir,
+                root,
+            ) =>
+        {
+            // The repo `prepare_worktree` added the worktree to. It resolved
+            // then, so a miss now is the live layout itself gone.
+            crate::spawn_worktree::find_repo_root(&state.config.project_dir)
+                .unwrap_or_else(|_| live_repo_root())
+        }
+        Some(root) => root.to_path_buf(),
+        None => live_repo_root(),
     }
 }
 
@@ -2636,6 +3172,16 @@ pub async fn spawn_test(
         body.rebuild,
     )?;
 
+    // Phase 8b: a fresh device identity cannot also carry another device's
+    // identity. Before any port, slot or build is claimed.
+    if let Some(conflict) = fresh_device_identity_conflict(
+        body.fresh_device_identity,
+        body.paired_profile_id.as_deref(),
+        &body.extra_env,
+    ) {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
+
     // Single resolution of "which tree does this spawn compile?", threaded
     // through worktree materialization, provenance classification and the
     // response labels so they cannot disagree. Default (no selector +
@@ -2696,17 +3242,19 @@ pub async fn spawn_test(
                     ),
                 )
                 .await;
+            // Names the action it joined: this request minted none, and it is
+            // usually the retry of a caller who never read the first answer.
             return Ok((
                 axum::http::StatusCode::ACCEPTED,
-                Json(json!({
+                Json(existing.action.stamp(json!({
                     "status": "queued",
                     "deduplicated": true,
                     "build_id": existing_id.to_string(),
                     "submission_id": existing_id.to_string(),
                     "id": existing.runner_id,
                     "port": existing.port,
-                    "api_url": format!("http://localhost:{}", existing.port),
-                    "ui_bridge_url": format!("http://localhost:{}/ui-bridge", existing.port),
+                    "api_url": runner_loopback_base(existing.port),
+                    "ui_bridge_url": runner_ui_bridge_base(existing.port),
                     "poll_url": format!("/build/{}/status", existing_id),
                     "message": format!(
                         "an identical spawn-test build ({}) is already in flight for this \
@@ -2714,7 +3262,7 @@ pub async fn spawn_test(
                          slot — poll GET /build/{}/status for the terminal outcome",
                         existing_id, existing_id
                     ),
-                })),
+                }))),
             )
                 .into_response());
         }
@@ -2744,8 +3292,10 @@ pub async fn spawn_test(
     // would pick the same free port — the second spawn would then collide.
     //
     // We insert the ManagedRunner before the (potentially long) build so
-    // subsequent scanners see the reservation. If the build fails, the
-    // placeholder is removed.
+    // subsequent scanners see the reservation. A `PlaceholderReservation`
+    // owns it from the insert on and gives it back on every outcome that does
+    // not start the runner — every refusal, `Ok` or `Err`, a panic and a
+    // cancelled future alike.
     //
     // We also keep an Arc to the ManagedRunner for the rest of this handler
     // so the eventual start call uses it directly, bypassing an id-based
@@ -2753,7 +3303,7 @@ pub async fn spawn_test(
     // possible when a concurrent path (reaper, stop_all, failed probe on a
     // sibling spawn) removes our id between insertion and start. Smoke tests
     // hit this ~1 in 10 times under load.
-    let (id, port, managed) = {
+    let (id, port, managed, in_flight_guard, reservation) = {
         let mut runners = state.runners.write().await;
         let used_ports: std::collections::HashSet<u16> =
             runners.values().map(|r| r.config.port).collect();
@@ -2800,14 +3350,22 @@ pub async fn spawn_test(
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
             extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
             false,
             state.config.log_dir.as_deref(),
         ));
+        // Arm the spawn-in-flight marker BEFORE the placeholder becomes visible
+        // in the registry, so no sweep can ever observe it unmarked. The guard
+        // is moved into the exec future below and lives until that future ends
+        // (or is dropped); any early `?` return between here and
+        // `submit_spawn` clears the marker through `Drop`.
+        let in_flight_guard = SpawnInFlightGuard::arm(&managed, spawn_in_flight_budget(&body));
         runners.insert(id.clone(), managed.clone());
-        (id, port, managed)
+        let reservation = PlaceholderReservation::new(&state, &id, &managed);
+        (id, port, managed, in_flight_guard, reservation)
     };
 
     // friction-1: stamp the owning requester onto the runner so `GET /runners`
@@ -2838,12 +3396,13 @@ pub async fn spawn_test(
 
     // Mint a `spawn`-kind dev-action snapshot. State eval captures the
     // cause-side context (SLOTS_EMPTY / LEGACY_EXE_FALLBACK / DIST_STALE) at
-    // spawn time; the attribution watcher (30s window) folds the verdict in by
-    // scanning the SPAWNED runner's early-log (read lazily via the managed
-    // runner — its path is set during the build, after this mint) + cached
-    // health. Reuses the request's `requester_id` as the snapshot requester
-    // (Q8 — no new identity system).
-    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    // spawn time; the attribution watcher holds its window open until
+    // `execute_spawn_build` records the spawn's result (then a 30 s tail), and
+    // folds the verdict in by scanning the SPAWNED runner's early-log (read
+    // lazily via the managed runner — its path is set during the build, after
+    // this mint) + cached health. Reuses the request's `requester_id` as the
+    // snapshot requester (Q8 — no new identity system).
+    let minted = mint_spawn_action(
         &state,
         format!(
             "rebuild={};use_lkg={};git_ref={:?}",
@@ -2853,7 +3412,13 @@ pub async fn spawn_test(
         managed.clone(),
     )
     .await;
-    let action_risk_json = spawn_risk_ack_json(&action_risk);
+    // Moved into the exec future and from there into `execute_spawn_build`,
+    // which records the spawn's result; it records the action abandoned if
+    // that future ends first (a panic in the exec task).
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-test's exec future");
+    // The exec future stamps what it stores, so `GET /build/{id}/status` serves
+    // the body the synchronous answer returns.
+    let exec_minted = minted.clone();
 
     // Item 6 — route the build+spawn through the SINGLE build-submissions
     // state machine. `submit_spawn` registers a submission and drives the
@@ -2864,10 +3429,7 @@ pub async fn spawn_test(
     // - sync (default): await the submission's terminal state in-handler and
     //   return the stored outcome. Both paths share one state machine.
     let want_async = body.r#async;
-    let store = state.build_submissions.clone();
     let exec_state = state.clone();
-    let exec_managed = managed.clone();
-    let exec_id = id.clone();
     let agent_id = body.requester_id.clone();
     // S3: label the submission with the build's ACTUAL source root, not the
     // supervisor's live `project_dir`. Derived from the request's provenance
@@ -2881,28 +3443,36 @@ pub async fn spawn_test(
     // Single-flight release. The submission id does not exist until
     // `submit_spawn` returns, so the exec future reads it from this cell — which
     // is filled below while the claim guard is still held, i.e. strictly before
-    // any releaser can take the index lock.
+    // any releaser can take the index lock, and a releaser reads it under that lock.
     let release_key = dedup_key.clone();
     let release_id: Arc<std::sync::OnceLock<uuid::Uuid>> = Arc::new(std::sync::OnceLock::new());
     let exec_release_id = release_id.clone();
     let exec_release_state = state.clone();
     let (submission_id, sub_arc) = crate::build_submissions::submit_spawn(
-        store,
+        &state.build_submissions,
         worktree_label,
         source_label,
         agent_id,
         port,
         async move {
-            let (status, body_json, stderr_tail) =
-                execute_spawn_build(exec_state, body, exec_id, port, exec_managed, no_wait).await;
-            // The build is over (succeeded or failed): free the key so the next
-            // request for it starts a fresh build instead of joining a corpse.
-            if let (Some(key), Some(id)) = (release_key, exec_release_id.get().copied()) {
-                exec_release_state.release_spawn_inflight(&key, id).await;
-            }
-            (status.as_u16(), body_json, stderr_tail)
+            // Owns the spawn-in-flight marker for the whole build → start →
+            // probe → wait pipeline; released when this future completes or
+            // is dropped. Both the sync and `async: true` paths run this future.
+            let _in_flight = in_flight_guard;
+            let runner_id = reservation.id.clone();
+            let (status, body_json, stderr_tail) = finish_spawn_build(
+                &exec_release_state,
+                execute_spawn_build(exec_state, body, reservation, port, no_wait, run_guard),
+                &runner_id,
+                port,
+                release_key,
+                &exec_release_id,
+            )
+            .await;
+            (status, exec_minted.stamp(body_json), stderr_tail)
         },
-    );
+    )
+    .await;
     let _ = release_id.set(submission_id);
     // Publish the claim: from here a duplicate request for this key joins this
     // build. Dropping the guard also releases the index write lock.
@@ -2910,29 +3480,25 @@ pub async fn spawn_test(
         submission_id,
         runner_id: id.clone(),
         port,
+        action: minted.clone(),
     });
 
     if want_async {
         return Ok((
             axum::http::StatusCode::ACCEPTED,
-            Json(json!({
+            Json(minted.stamp(json!({
                 "submission_id": submission_id.to_string(),
                 "status": "queued",
                 "id": id,
                 "port": port,
-                "api_url": format!("http://localhost:{}", port),
-                "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
-                "action_id": action_id.to_string(),
-                "states_active": action_states_active,
-                "predicted": action_predicted,
-                "risk": action_risk_json,
-                "outcome_url": format!("/actions/{}/outcome", action_id),
+                "api_url": runner_loopback_base(port),
+                "ui_bridge_url": runner_ui_bridge_base(port),
                 "poll_url": format!("/build/{}/status", submission_id),
                 "message": format!(
                     "spawn-test build queued (submission {}); poll GET /build/{}/status for the terminal `spawn` outcome",
                     submission_id, submission_id
                 ),
-            })),
+            }))),
         )
             .into_response());
     }
@@ -2972,74 +3538,53 @@ pub async fn spawn_test(
                     LogSource::Supervisor,
                     LogLevel::Warn,
                     format!(
-                        "spawn-test {id} (build {submission_id}) abandoned: supervisor shutdown \
-                         signalled while the build was in flight; answering the caller with its \
-                         reserved id/port instead of dropping the connection"
+                        "spawn-test {id} (build {submission_id}, action {}) abandoned: supervisor \
+                         shutdown signalled while the build was in flight; answering the caller \
+                         with its reserved id/port instead of dropping the connection",
+                        minted.record.action_id
                     ),
                 )
                 .await;
+            // Its `outcome_url` names a record in this exiting process, so the
+            // replacement supervisor answers it 404. The log line above names the
+            // same `action_id`.
             return Ok((
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(spawn_abandoned_body(&id, port, submission_id)),
+                Json(minted.stamp(spawn_abandoned_body(&id, port, submission_id))),
             )
                 .into_response());
         }
     }
-    let outcome = {
-        let sub = sub_arc.read().await;
-        sub.spawn.clone()
-    };
-    match outcome {
-        Some(o) => {
-            let status = axum::http::StatusCode::from_u16(o.http_status)
-                .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            // Back-compat: re-attach the legacy `X-Frontend-Stale: 1` header
-            // when the body flags a stale frontend (the header couldn't ride
-            // the stored submission outcome).
-            let frontend_stale = o
-                .body
-                .get("frontend_stale")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            // Enrich the stored spawn outcome body with the dev-action snapshot
-            // fields so the synchronous ACK carries the action_id + active
-            // dev-state set + outcome readback URL (in-place edit per §6.1; no
-            // new route). The watcher was already spawned at mint time.
-            let mut body = o.body;
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("action_id".to_string(), json!(action_id.to_string()));
-                obj.insert("states_active".to_string(), json!(action_states_active));
-                obj.insert("predicted".to_string(), json!(action_predicted));
-                obj.insert("risk".to_string(), action_risk_json.clone());
-                obj.insert(
-                    "outcome_url".to_string(),
-                    json!(format!("/actions/{}/outcome", action_id)),
-                );
-            }
-            let mut response = (status, Json(body)).into_response();
-            if frontend_stale {
-                response
-                    .headers_mut()
-                    .insert("X-Frontend-Stale", "1".parse().unwrap());
-            }
-            Ok(response)
-        }
-        // Terminal with no stored outcome: an internal error, but the caller
-        // still created a runner and still needs its id to follow or stop it.
-        // Rendering this as a bare `SupervisorError` string threw that away.
-        None => {
-            let mut body = json!({
-                "error": "spawn_outcome_missing",
-                "message": "spawn-test submission reached terminal state without a spawn outcome \
-                            (internal error)",
-                "submission_id": submission_id.to_string(),
-                "build_id": submission_id.to_string(),
-                "poll_url": format!("/build/{submission_id}/status"),
-            });
-            attach_spawn_identity(&mut body, &id, port);
-            Ok((axum::http::StatusCode::INTERNAL_SERVER_ERROR, Json(body)).into_response())
-        }
+    // `submit_spawn` stores the outcome under the same guard as the terminal
+    // status, its panic path included, and nothing else writes a spawn
+    // submission's status, so a terminal one always carries it.
+    let o = sub_arc
+        .read()
+        .await
+        .spawn
+        .clone()
+        .expect("a terminal spawn submission carries its outcome");
+    let status = axum::http::StatusCode::from_u16(o.http_status)
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    // Back-compat: re-attach the legacy `X-Frontend-Stale: 1` header
+    // when the body flags a stale frontend (the header couldn't ride
+    // the stored submission outcome).
+    let frontend_stale = o
+        .body
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // The exec future stamped this body with the dev-action snapshot
+    // fields (in-place edit per §6.1; no new route), so this answer and
+    // `GET /build/{id}/status` carry the same ones. The watcher was
+    // already spawned at mint time.
+    let mut response = (status, Json(o.body)).into_response();
+    if frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
     }
+    Ok(response)
 }
 
 #[derive(Deserialize)]
@@ -3064,6 +3609,9 @@ pub struct SpawnInflightQuery {
 ///
 /// The entries come from the single-flight index, so `build_id` here is the
 /// same token the sync body, the async 202 and `GET /build/{id}/status` all use.
+/// Each carries its action's fields too ([`MintedAction::stamp`]): a caller who
+/// lost the answer lost the action id along with the runner id, and
+/// `GET /actions/{id}/outcome` is where a failed build's verdict is read.
 pub async fn spawn_test_in_flight(
     State(state): State<SharedState>,
     Query(q): Query<SpawnInflightQuery>,
@@ -3074,18 +3622,18 @@ pub async fn spawn_test_in_flight(
     let spawns: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|(key, inflight)| {
-            json!({
+            inflight.action.stamp(json!({
                 "requester_id": key.requester_id,
                 "build_target": key.build_target,
                 "id": inflight.runner_id,
                 "port": inflight.port,
                 "build_id": inflight.submission_id.to_string(),
                 "submission_id": inflight.submission_id.to_string(),
-                "api_url": format!("http://localhost:{}", inflight.port),
+                "api_url": runner_loopback_base(inflight.port),
                 "poll_url": format!("/build/{}/status", inflight.submission_id),
                 "logs_url": format!("/runners/{}/logs", inflight.runner_id),
                 "stop_url": format!("/runners/{}/stop", inflight.runner_id),
-            })
+            }))
         })
         .collect();
     Json(json!({
@@ -3138,21 +3686,39 @@ fn spawn_abandoned_body(id: &str, port: u16, submission_id: uuid::Uuid) -> serde
 ///
 /// Returns `(StatusCode, body)` rather than a `Response` so the result can be
 /// stored on the submission's terminal state and rebuilt into a `Response`
-/// later. On any internal `SupervisorError` the placeholder port reservation
-/// is released (as the inline path did) and the error is rendered to its
-/// canonical `(status, body)` via [`SupervisorError::to_status_body`].
+/// later. An internal `SupervisorError` is rendered to its canonical
+/// `(status, body)` via [`SupervisorError::to_status_body`].
+///
+/// **It releases the placeholder reservation, whatever the inner fn
+/// answered.** The inner fn disarms `reservation` only once
+/// `manager::start_managed_runner` has returned `Ok`; every other outcome — an
+/// `Err`, or an `Ok` with a pre-start refusal such as the frontend 503 — leaves
+/// it armed, and the awaited [`PlaceholderReservation::release`] here gives
+/// the port back before the caller sees the answer.
 ///
 /// `no_wait` mirrors the `X-Queue-Mode: no-wait` header semantics for the
 /// build-pool-full short-circuit.
+///
+/// **The chokepoint of a spawn-test's terminal result.** It is the only caller
+/// of `execute_spawn_build_inner`, so it maps the inner result with
+/// [`spawn_run_result`], before an `Err` is rendered to a body while it still
+/// holds the typed `SupervisorError`, and records it on the action `run_guard`
+/// covers, or hands the guard to the detached health wait when nothing checked
+/// the runner's health ([`record_start_verdict`]).
 async fn execute_spawn_build(
     state: SharedState,
     body: SpawnTestRequest,
-    id: String,
+    mut reservation: PlaceholderReservation,
     port: u16,
-    managed: Arc<ManagedRunner>,
     no_wait: bool,
+    run_guard: RunResultGuard,
 ) -> (axum::http::StatusCode, serde_json::Value, Vec<String>) {
+    let action_id = run_guard.record().action_id;
+    let id = reservation.id.clone();
     let mut side = SpawnBuildSideChannel::default();
+    // The spawn-in-flight marker is NOT armed here: `spawn_test` arms it at the
+    // placeholder insert and moves its guard into the future that awaits this
+    // one, so it also covers the mint/submit gap before this fn runs.
     // Merged on BOTH arms, not just `Err`. Several of the inner fn's FAILURE
     // responses (`runner_died_during_startup`, `runner_started_but_unresponsive`,
     // `frontend_stale` / `frontend_dist_missing`, the paired-profile failure) are
@@ -3162,18 +3728,222 @@ async fn execute_spawn_build(
     // without attribution and falsified `attach_build_slot_id`'s "always
     // present" contract. The insert is idempotent against the key the success
     // body already carries (same value, from the same `side.slot_id`).
-    match execute_spawn_build_inner(&state, body, &id, port, &managed, no_wait, &mut side).await {
+    let result = execute_spawn_build_inner(
+        &state,
+        body,
+        &mut reservation,
+        port,
+        no_wait,
+        action_id,
+        &mut side,
+    )
+    .await;
+    // One owner of the release: a no-op once the start succeeded.
+    reservation.release().await;
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            action_id,
+            spawn_run_result(&result),
+            // Every `Ran` has an answer dated. With none, the date is this
+            // chokepoint, which errs towards a false failure, never a false up.
+            side.answered_at.unwrap_or_else(chrono::Utc::now),
+        )
+        .await,
+        run_guard,
+    );
+    // The build tree is merged on both arms too: a compile failure is exactly
+    // when a caller needs to know which runner commit and which schemas commit
+    // were compiled (`SpawnBuildSideChannel::tree`).
+    match result {
         Ok((status, mut body)) => {
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
         Err(e) => {
             let (status, mut body) = e.to_status_body();
             attach_build_slot_id(&mut body, side.slot_id);
+            attach_build_tree(&mut body, side.tree.as_ref());
             attach_spawn_identity(&mut body, &id, port);
             (status, body, side.stderr_tail)
         }
+    }
+}
+
+/// Safety margin added on top of the probe + wait allowances.
+const SPAWN_IN_FLIGHT_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Startup allowance a spawn-test request claims, measured from the runner's
+/// `started_at`: the health-probe window, plus the health wait when the caller
+/// asked for one, plus [`SPAWN_IN_FLIGHT_MARGIN`].
+fn spawn_in_flight_budget(body: &SpawnTestRequest) -> std::time::Duration {
+    // `wait_timeout_secs` is caller-supplied and unclamped: saturate rather
+    // than let `Duration + Duration` panic on overflow.
+    let wait = if body.wait { body.wait_timeout_secs } else { 0 };
+    std::time::Duration::from_millis(body.health_probe_timeout_ms)
+        .saturating_add(std::time::Duration::from_secs(wait))
+        .saturating_add(SPAWN_IN_FLIGHT_MARGIN)
+}
+
+/// RAII owner of [`ManagedRunner::spawn_in_flight`]: sets the marker on
+/// construction, clears it on `Drop` — so every return path of the spawn
+/// handler (and a cancelled future) releases the startup protection.
+struct SpawnInFlightGuard {
+    managed: Arc<ManagedRunner>,
+}
+
+impl SpawnInFlightGuard {
+    fn arm(managed: &Arc<ManagedRunner>, budget: std::time::Duration) -> Self {
+        managed.set_spawn_in_flight(Some(budget));
+        Self {
+            managed: Arc::clone(managed),
+        }
+    }
+}
+
+impl Drop for SpawnInFlightGuard {
+    fn drop(&mut self) {
+        self.managed.set_spawn_in_flight(None);
+    }
+}
+
+/// RAII owner of a spawn-test's placeholder registry entry — the port
+/// reservation `spawn_test` inserts before any admission decision.
+///
+/// **It releases on ANY outcome unless disarmed**, and it is disarmed only once
+/// `manager::start_managed_runner` has returned `Ok` (from then on the runner
+/// may be running and its id is the caller's handle on it). So every refusal
+/// gives the port back — an `Err`, a pre-start `Ok((non-2xx, body))`, a panic,
+/// a cancelled future — through one owner instead of a `runners.remove(id)` at
+/// each return, one of which (the no-wait `BuildPoolFull`) was missing and
+/// leaked a never-started placeholder per refused spawn.
+///
+/// Ordinary paths call the awaited [`Self::release`] at the chokepoint
+/// (`execute_spawn_build`), so the entry is gone before the caller is answered.
+/// `Drop` is the backstop for a panic or cancellation, and mirrors
+/// `build_monitor::SlotGuard`: it cannot await the registry's lock, so it
+/// tries it, and on contention hands the removal to a task — only when a
+/// tokio runtime is current, since `tokio::spawn` outside one panics. Either
+/// way it removes the entry only while it is still THIS reservation's
+/// `ManagedRunner` (`Arc::ptr_eq`), never a later entry under the same id.
+///
+/// **Once the start has been entered, `Drop` leaves the entry alone.** A panic
+/// or cancellation INSIDE `manager::start_managed_runner` can land after its
+/// child was spawned; removing the entry then would orphan a live process,
+/// and `finish_spawn_build`'s `panicked` answer tells the caller to stop the
+/// runner by this id, which needs the entry. A start that RETURNS `Err` is
+/// different: [`Self::start_failed`] clears the mark, so the explicit
+/// [`Self::release`] — or `Drop`, if that release is cancelled — removes it.
+struct PlaceholderReservation {
+    state: SharedState,
+    id: String,
+    managed: Arc<ManagedRunner>,
+    armed: bool,
+    start_entered: bool,
+}
+
+impl PlaceholderReservation {
+    /// Take ownership of the placeholder `managed`, registered under `id`.
+    fn new(state: &SharedState, id: &str, managed: &Arc<ManagedRunner>) -> Self {
+        Self {
+            state: state.clone(),
+            id: id.to_string(),
+            managed: Arc::clone(managed),
+            armed: true,
+            start_entered: false,
+        }
+    }
+
+    /// Set immediately before `manager::start_managed_runner` is called: from
+    /// here a `Drop` (a panic or cancellation inside the start) may be
+    /// abandoning a spawned child, so it no longer removes the entry.
+    fn entering_start(&mut self) {
+        self.start_entered = true;
+    }
+
+    /// The start RETURNED `Err`: it hands back no runner, so the entry is a
+    /// never-started placeholder again and `Drop` must remove it — a release
+    /// cancelled on the registry lock after a failed start would otherwise
+    /// leave it to the stale sweep.
+    fn start_failed(&mut self) {
+        self.start_entered = false;
+    }
+
+    /// The runner started: from here its entry is the caller's, not ours.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    /// Give the reservation back now, unless disarmed. Idempotent.
+    ///
+    /// The removal happens BEFORE `armed` is cleared: a future cancelled while
+    /// waiting for the registry lock leaves the reservation armed, so its
+    /// `Drop` still releases it. `remove_if_reserved` is idempotent.
+    async fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut runners = self.state.runners.write().await;
+        remove_if_reserved(&mut runners, &self.id, &self.managed);
+        drop(runners);
+        self.armed = false;
+    }
+}
+
+/// Remove `id` from `runners` only while it still maps to `managed`.
+fn remove_if_reserved(
+    runners: &mut std::collections::HashMap<String, Arc<ManagedRunner>>,
+    id: &str,
+    managed: &Arc<ManagedRunner>,
+) {
+    if runners
+        .get(id)
+        .is_some_and(|registered| Arc::ptr_eq(registered, managed))
+    {
+        runners.remove(id);
+    }
+}
+
+impl Drop for PlaceholderReservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.start_entered {
+            warn!(
+                "spawn-test {} ended inside its start (a panic or cancellation); its registry \
+                 entry is kept because the runner's process may already be running — stop it \
+                 by this id",
+                self.id
+            );
+            return;
+        }
+        if let Ok(mut runners) = self.state.runners.try_write() {
+            remove_if_reserved(&mut runners, &self.id, &self.managed);
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "spawn-test placeholder {} could not be released: its registry lock was held \
+                 and no tokio runtime is current; the stale sweep will reap it",
+                self.id
+            );
+            return;
+        };
+        let (state, id, managed) = (
+            self.state.clone(),
+            self.id.clone(),
+            Arc::clone(&self.managed),
+        );
+        handle.spawn(async move {
+            let mut runners = state.runners.write().await;
+            remove_if_reserved(&mut runners, &id, &managed);
+        });
     }
 }
 
@@ -3219,6 +3989,184 @@ struct SpawnBuildSideChannel {
     /// signal for that: a quiet cleanup pass emits no event at all, and the
     /// diagnostics ring can evict one that did.
     slot_id: Option<usize>,
+    /// When this spawn's runner FIRST answered its health check, the probe's or
+    /// else the `wait` loop's. The first, because a boot that answered the probe and
+    /// was restarted before the wait's answer did come up. The trial asks whether
+    /// its boot had ended by THEN ([`crate::dev_action::held_to_own_boot`]), and the
+    /// door records its verdict only after the slow work that follows the wait.
+    answered_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The tree this spawn's build compiles: the runner tree and the
+    /// `qontinui-schemas` sibling its path-deps resolve to. Set once that tree
+    /// is prepared or validated, so it is known before the build runs. `None`
+    /// for a live-tree spawn, and for any failure that happened before the tree
+    /// was ready.
+    ///
+    /// It is here because a FAILED build needs it most. When a spawn worktree's
+    /// build fails to compile against its schemas sibling (2026-11-11: four
+    /// `E0425`s against schemas `origin/main`, where the runner's own declared
+    /// pin built clean), the caller has to know which schemas commit the build
+    /// used. Before this field, only the success body named it, and every
+    /// `return Err(e)` lost it.
+    tree: Option<SpawnBuildTree>,
+}
+
+/// The tree a spawn-test build compiles, recorded before the build runs: the
+/// runner tree, plus the `qontinui-schemas` sibling its
+/// `../../qontinui-schemas/...` path-deps resolve to.
+///
+/// [`SpawnBuildTree::attach`] is the only thing that writes these fields to a
+/// spawn-test body. The success body and every failure body that follows the
+/// tree's preparation therefore carry the same values under the same keys.
+#[derive(Clone, Debug, PartialEq)]
+enum SpawnBuildTree {
+    /// A managed `.spawn-<ref>/` worktree: the default `origin/main` build or an
+    /// explicit `git_ref`, with the container's own pinned schemas worktree.
+    Managed {
+        requested_ref: String,
+        /// `git rev-parse HEAD` of the runner worktree.
+        resolved_sha: String,
+        /// The response's `source` (`SpawnBuildSource::label`): `origin_main`
+        /// for the default, `worktree` for an explicit ref.
+        source: &'static str,
+        schemas_path: std::path::PathBuf,
+        /// `git rev-parse HEAD` of the pinned schemas worktree.
+        schemas_sha: String,
+        /// The sha the runner tree declared in `.github/sibling-pins.conf`,
+        /// else `origin/main`.
+        schemas_pin_ref: String,
+        /// True when `schemas_pin_ref` came from the declared pin.
+        schemas_pin_declared: bool,
+    },
+    /// A caller-owned `worktree_path` checkout, built in place against its own
+    /// `../qontinui-schemas` sibling.
+    CallerOwned {
+        worktree_path: std::path::PathBuf,
+        resolved_sha: Option<String>,
+        schemas_path: Option<std::path::PathBuf>,
+        schemas_sha: Option<String>,
+        /// The sibling is the SHARED workspace-root checkout (drift hazard).
+        schemas_is_shared: bool,
+    },
+}
+
+impl SpawnBuildTree {
+    fn managed(wt: &crate::spawn_worktree::PreparedWorktree, source: &'static str) -> Self {
+        SpawnBuildTree::Managed {
+            requested_ref: wt.requested_ref.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            source,
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_resolved_sha.clone(),
+            schemas_pin_ref: wt.schemas_pin_ref.clone(),
+            schemas_pin_declared: wt.schemas_pin_declared,
+        }
+    }
+
+    fn caller_owned(wt: &crate::spawn_worktree::ValidatedExistingWorktree) -> Self {
+        SpawnBuildTree::CallerOwned {
+            worktree_path: wt.worktree_path.clone(),
+            resolved_sha: wt.resolved_sha.clone(),
+            schemas_path: wt.schemas_path.clone(),
+            schemas_sha: wt.schemas_sha.clone(),
+            schemas_is_shared: wt.schemas_is_shared,
+        }
+    }
+
+    /// Merge this tree's provenance fields into a rendered spawn-test body:
+    /// success, a non-2xx `Ok`, or a `SupervisorError::to_status_body()` error.
+    ///
+    /// - `source`: `origin_main` | `worktree` | `worktree_path`.
+    /// - `git_ref` / `git_ref_resolved` (managed only), `worktree_path`
+    ///   (caller-owned only).
+    /// - `git_ref_resolved_sha` / `git_ref_resolved_sha_short`: the runner
+    ///   tree's HEAD. Absent for a caller-owned tree that is not a git checkout.
+    /// - `schemas_path` / `schemas_sha` / `schemas_is_shared`.
+    /// - `schemas_pin_ref` / `schemas_pin_source` (`sibling_pins_conf` |
+    ///   `origin_main_fallback`): managed only, because a caller-owned tree's
+    ///   sibling is whatever the caller checked out.
+    ///
+    /// The values come from the tree, so re-attaching onto a body that already
+    /// carries them changes nothing. A non-object body is left alone rather
+    /// than reshaped, as in [`attach_build_slot_id`].
+    fn attach(&self, body: &mut serde_json::Value) {
+        let Some(obj) = body.as_object_mut() else {
+            return;
+        };
+        let mut put = |k: &str, v: serde_json::Value| {
+            obj.insert(k.to_string(), v);
+        };
+        match self {
+            SpawnBuildTree::Managed {
+                requested_ref,
+                resolved_sha,
+                source,
+                schemas_path,
+                schemas_sha,
+                schemas_pin_ref,
+                schemas_pin_declared,
+            } => {
+                put("source", json!(source));
+                put("git_ref", json!(requested_ref));
+                put("git_ref_resolved", json!(requested_ref));
+                put("git_ref_resolved_sha", json!(resolved_sha));
+                put(
+                    "git_ref_resolved_sha_short",
+                    json!(resolved_sha.chars().take(12).collect::<String>()),
+                );
+                put("schemas_path", json!(schemas_path.to_string_lossy()));
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_pin_ref", json!(schemas_pin_ref));
+                put(
+                    "schemas_pin_source",
+                    json!(if *schemas_pin_declared {
+                        "sibling_pins_conf"
+                    } else {
+                        "origin_main_fallback"
+                    }),
+                );
+                // The pinned sibling lives inside the spawn container, never
+                // the shared checkout.
+                put("schemas_is_shared", json!(false));
+            }
+            SpawnBuildTree::CallerOwned {
+                worktree_path,
+                resolved_sha,
+                schemas_path,
+                schemas_sha,
+                schemas_is_shared,
+            } => {
+                put("source", json!("worktree_path"));
+                put("worktree_path", json!(worktree_path.to_string_lossy()));
+                if let Some(sha) = resolved_sha {
+                    put("git_ref_resolved_sha", json!(sha));
+                    put(
+                        "git_ref_resolved_sha_short",
+                        json!(sha.chars().take(12).collect::<String>()),
+                    );
+                }
+                put(
+                    "schemas_path",
+                    json!(schemas_path.as_ref().map(|p| p.to_string_lossy())),
+                );
+                put("schemas_sha", json!(schemas_sha));
+                put("schemas_is_shared", json!(schemas_is_shared));
+            }
+        }
+    }
+}
+
+/// Merge the spawn's build tree ([`SpawnBuildSideChannel::tree`]) into an
+/// already-rendered body, success or failure.
+///
+/// With no tree it writes NOTHING. That covers a failure before the tree was
+/// prepared (a `git_ref` whose worktree could not be made, a `worktree_path`
+/// that failed validation), where any `source` would claim a tree the request
+/// never reached. The success body's own `source: "live_tree"` for a live-tree
+/// spawn is written where that body is built, not here.
+fn attach_build_tree(body: &mut serde_json::Value, tree: Option<&SpawnBuildTree>) {
+    if let Some(tree) = tree {
+        tree.attach(body);
+    }
 }
 
 /// Merge `build_slot_id` into an already-rendered error body.
@@ -3234,6 +4182,41 @@ fn attach_build_slot_id(body: &mut serde_json::Value, build_slot_id: Option<usiz
     if let Some(obj) = body.as_object_mut() {
         obj.insert("build_slot_id".to_string(), json!(build_slot_id));
     }
+}
+
+/// Await `build`, the spawn-test's build, as the `(http_status, body,
+/// stderr_tail)` its submission stores, then free its dedup key so the next
+/// request for it starts a fresh build instead of joining a corpse.
+///
+/// A panic skips everything `execute_spawn_build` would have attached, so it is
+/// caught here, where the reservation is known: it answers `panicked` naming the
+/// runner, which a caller needs to follow or stop it, since the process may
+/// already be running. A placeholder that never started is released by its
+/// [`PlaceholderReservation`] as the panic unwinds through the build future.
+async fn finish_spawn_build<F>(
+    state: &SharedState,
+    build: F,
+    id: &str,
+    port: u16,
+    release_key: Option<SpawnDedupKey>,
+    release_id: &std::sync::OnceLock<uuid::Uuid>,
+) -> (u16, serde_json::Value, Vec<String>)
+where
+    F: std::future::Future<Output = (axum::http::StatusCode, serde_json::Value, Vec<String>)>,
+{
+    let outcome = match crate::build_submissions::caught(build).await {
+        Ok((status, body, stderr_tail)) => (status.as_u16(), body, stderr_tail),
+        Err(reason) => {
+            let (status, mut body) = crate::build_submissions::panicked_outcome(reason);
+            attach_spawn_identity(&mut body, id, port);
+            attach_build_slot_id(&mut body, None);
+            (status, body, Vec::new())
+        }
+    };
+    if let Some(key) = release_key {
+        state.release_spawn_inflight(&key, release_id).await;
+    }
+    outcome
 }
 
 /// Merge the reserved runner IDENTITY (`id`, `port`, and the URLs derived from
@@ -3259,31 +4242,236 @@ fn attach_spawn_identity(body: &mut serde_json::Value, id: &str, port: u16) {
     if let Some(obj) = body.as_object_mut() {
         obj.insert("id".to_string(), json!(id));
         obj.insert("port".to_string(), json!(port));
-        obj.insert(
-            "api_url".to_string(),
-            json!(format!("http://localhost:{port}")),
-        );
+        obj.insert("api_url".to_string(), json!(runner_loopback_base(port)));
         obj.insert(
             "ui_bridge_url".to_string(),
-            json!(format!("http://localhost:{port}/ui-bridge")),
+            json!(runner_ui_bridge_base(port)),
         );
         obj.insert("logs_url".to_string(), json!(format!("/runners/{id}/logs")));
         obj.insert("stop_url".to_string(), json!(format!("/runners/{id}/stop")));
     }
 }
 
+/// A spawn-test's wait for its managed container while another build held
+/// it: whom it waited for, and for how long, so a queue-timeout 504 can say
+/// how much of `queue_timeout_secs` went to it.
+#[derive(Clone, Debug)]
+struct ContainerWait {
+    container: std::path::PathBuf,
+    /// Who held the container when the wait began.
+    held: crate::spawn_worktree::ContainerHeld,
+    waited: std::time::Duration,
+}
+
+/// A spawn-test's managed container, taken ([`take_container_for_spawn`]).
+struct ContainerTaken {
+    guard: crate::spawn_worktree::SpawnContainerGuard,
+    /// What the wait left of the caller's queue budget for the build's own
+    /// queue wait, `None` when the caller set no budget. A wait never leaves
+    /// it at zero: a wait that spent the whole budget is a 504.
+    budget_left: Option<std::time::Duration>,
+    /// The wait, when another build held the container.
+    wait: Option<ContainerWait>,
+}
+
+/// Take a spawn-test's container lock under the caller's queue contract.
+///
+/// Waiting for the container is a queue wait like waiting for a build slot:
+/// under `X-Queue-Mode: no-wait` a container another build holds answers 503
+/// `spawn_container_busy` at once, naming that build, and a
+/// `queue_timeout_secs` budget bounds the wait, answering 504 naming the build
+/// still holding it. What the wait leaves of the budget is what the build then
+/// queues with ([`ContainerTaken::budget_left`]), and a wait that leaves
+/// nothing is a 504 as well ([`queue_budget_left`]). Without either, it waits
+/// as long as the holder builds, and the log says whom it waits for.
+async fn take_container_for_spawn(
+    state: &SharedState,
+    container: &std::path::Path,
+    taker: &str,
+    no_wait: bool,
+    queue_budget: Option<std::time::Duration>,
+) -> Result<ContainerTaken, SupervisorError> {
+    let held = match state.spawn_container_locks.try_take(container, taker) {
+        Ok(guard) => {
+            return Ok(ContainerTaken {
+                guard,
+                budget_left: queue_budget,
+                wait: None,
+            })
+        }
+        Err(held) => held,
+    };
+    if no_wait {
+        return Err(SupervisorError::SpawnContainerBusy {
+            container: container.display().to_string(),
+            holder: held.holder,
+        });
+    }
+    // The tokio clock, the one the timeout below runs on.
+    let waiting_since = tokio::time::Instant::now();
+    let take = state.take_spawn_container_lock(container, taker);
+    let guard = match queue_budget {
+        None => take.await,
+        Some(budget) => match tokio::time::timeout(budget, take).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                let still_held = crate::spawn_worktree::ContainerHeld {
+                    holder: state.spawn_container_locks.holder(container),
+                };
+                return Err(container_wait_spent_the_budget(
+                    budget, container, still_held,
+                ));
+            }
+        },
+    };
+    let wait = ContainerWait {
+        container: container.to_path_buf(),
+        held,
+        waited: waiting_since.elapsed(),
+    };
+    // On a refusal `guard` drops here, releasing the container.
+    let budget_left = queue_budget
+        .map(|budget| queue_budget_left(budget, &wait))
+        .transpose()?;
+    Ok(ContainerTaken {
+        guard,
+        budget_left,
+        wait: Some(wait),
+    })
+}
+
+/// What the wait for the container left of `budget` for the build's own queue
+/// wait. A wait that left nothing is a 504 naming the build it waited for,
+/// decided here: handed on, a zero remainder would start the build's queue
+/// watcher on a zero timer, racing the build in a `select!`.
+fn queue_budget_left(
+    budget: std::time::Duration,
+    wait: &ContainerWait,
+) -> Result<std::time::Duration, SupervisorError> {
+    match budget.checked_sub(wait.waited) {
+        Some(left) if !left.is_zero() => Ok(left),
+        _ => Err(container_wait_spent_the_budget(
+            budget,
+            &wait.container,
+            format!("{} when the wait began", wait.held),
+        )),
+    }
+}
+
+/// The 504 when waiting for the container spent all of `queue_timeout_secs`,
+/// so the build never queued for a slot. `holder` names the build waited for.
+fn container_wait_spent_the_budget(
+    budget: std::time::Duration,
+    container: &std::path::Path,
+    holder: impl std::fmt::Display,
+) -> SupervisorError {
+    SupervisorError::Timeout(format!(
+        "Build queue timeout: all of queue_timeout_secs={} went to waiting for spawn container \
+         {container:?} ({holder}), so the build never queued for a cargo build slot",
+        budget.as_secs()
+    ))
+}
+
+/// The 504 message of a spawn-test build whose own queue wait (for a cargo
+/// slot, then the frontend lock) ran out of budget. `queue_timeout_secs` is
+/// the caller's whole budget. After a wait for the container, the message
+/// splits the budget between the two waits, rather than charging all of it to
+/// the slot or the frontend lock.
+fn spawn_queue_timeout_message(
+    phase: crate::build_monitor::BuildPhase,
+    queue_timeout_secs: u64,
+    container_wait: Option<&ContainerWait>,
+    available_permits: usize,
+) -> String {
+    let Some(wait) = container_wait else {
+        return phase.timeout_message(queue_timeout_secs, available_permits);
+    };
+    let container_secs = wait.waited.as_secs().min(queue_timeout_secs);
+    format!(
+        "{}, after {container_secs}s of queue_timeout_secs={queue_timeout_secs} went to waiting \
+         for spawn container {:?} ({} when the wait began)",
+        phase.timeout_message(queue_timeout_secs - container_secs, available_permits),
+        wait.container,
+        wait.held,
+    )
+}
+
+/// Race a spawn-test build against its queue budget: the build's own result,
+/// or a 504 naming the phase that was still waiting when `budget` ran out.
+///
+/// `queue_timeout_secs` bounds the QUEUE, not the build. It used to wrap the
+/// whole future, so a caller passing a small bound to say "don't make me wait
+/// for a busy pool" got a 504 that ALSO abandoned an already-compiling slot —
+/// throwing away a live build (and everything it had compiled) for a wait that
+/// had already ended. The watcher ([`wait_out_queue_timeout`]) counts only the
+/// time the build's phase marker spends in a queue phase, so the field means
+/// what it is documented to mean.
+///
+/// **`biased;`, with the build first.** An unbiased `select!` picks its first
+/// branch at random, and with a zero budget the watcher resolves on its first
+/// poll whenever the marker still reads a queue phase — so a spawn that had a
+/// free slot got a spurious "waited 0s for a cargo build slot" about half the
+/// time. Polled first, the build runs to its first real yield, and the marker
+/// it leaves there says truthfully whether it is still queued (the build
+/// stores [`crate::build_monitor::BuildPhase::SlotHeld`] the moment its
+/// permit is held). A yield BEFORE the permit — inside the disk or memory
+/// guard — still reads `AwaitingSlot` and is counted, so a zero budget can
+/// still fire there under contention. Both attempts of a spawn — the first and
+/// the poisoned-slot retry — come through here, since both go through
+/// `run_detailed`.
+async fn race_build_against_queue_budget<F>(
+    state: &SharedState,
+    build: F,
+    phase_marker: Arc<std::sync::atomic::AtomicU8>,
+    budget: std::time::Duration,
+    queue_timeout_secs: u64,
+    container_wait: Option<&ContainerWait>,
+) -> Result<crate::build_monitor::BuildAttempt, (SupervisorError, crate::build_monitor::BuildAttempt)>
+where
+    F: std::future::Future<
+        Output = Result<
+            crate::build_monitor::BuildAttempt,
+            (SupervisorError, crate::build_monitor::BuildAttempt),
+        >,
+    >,
+{
+    let watcher = wait_out_queue_timeout(budget, phase_marker);
+    tokio::pin!(build);
+    tokio::select! {
+        biased;
+        r = &mut build => r,
+        phase = watcher => {
+            let available_permits = state.build_pool.permits.available_permits();
+            Err((
+                SupervisorError::Timeout(spawn_queue_timeout_message(
+                    phase,
+                    queue_timeout_secs,
+                    container_wait,
+                    available_permits,
+                )),
+                crate::build_monitor::BuildAttempt::default(),
+            ))
+        }
+    }
+}
+
 /// Inner body returning `Result` so the existing `?` / `return Err(e)` control
-/// flow is preserved verbatim from the pre-Item-6 handler. The placeholder
-/// removal on the error paths below is unchanged.
+/// flow is preserved verbatim from the pre-Item-6 handler. It never removes the
+/// placeholder itself: it disarms `reservation` once the runner has started,
+/// and the caller releases it on every other outcome.
 async fn execute_spawn_build_inner(
     state: &SharedState,
     body: SpawnTestRequest,
-    id: &str,
+    reservation: &mut PlaceholderReservation,
     port: u16,
-    managed: &Arc<ManagedRunner>,
     no_wait: bool,
+    action_id: uuid::Uuid,
     side: &mut SpawnBuildSideChannel,
 ) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
+    let id_owned = reservation.id.clone();
+    let id = id_owned.as_str();
+    let managed_owned = Arc::clone(&reservation.managed);
+    let managed = &managed_owned;
     // Build-result tracking for the response. Populated by the rebuild
     // branch below; surfaced via the `build_result` JSON field. When
     // `body.rebuild` is false, `attempted` stays false and `succeeded`
@@ -3307,7 +4495,9 @@ async fn execute_spawn_build_inner(
     );
     // Set when a managed-worktree build occurred — either an explicit `git_ref`
     // or the DEFAULT `origin/main`: (requested_ref, resolved_sha).
-    // Surfaced in the response as `git_ref` / `git_ref_resolved_sha`.
+    // The response fields (`git_ref`, `git_ref_resolved_sha`, the schemas
+    // pin) come from `side.tree`, set at the same point, so that a failure
+    // body carries them too.
     let mut git_ref_info: Option<(String, String)> = None;
     // Set alongside `git_ref_info` when prepare_worktree returns Ok. Used by
     // the `cleanup_worktree_on_fail` flag to wipe the spawn container on a
@@ -3322,13 +4512,21 @@ async fn execute_spawn_build_inner(
     // machinery (the type-level guarantee from the plan).
     let mut worktree_path_info: Option<crate::spawn_worktree::ValidatedExistingWorktree> = None;
 
-    // Set to the spawn container path of a `git_ref` build that materialized a
-    // fresh `.spawn-*` container, so we can (a) mark it active for the duration
-    // of the build (the pruner's active-build exclusion) and (b) run an
-    // opportunistic prune sweep after the build, scrubbing OTHER stale
-    // containers this new one's parent dir accumulated. `None` for live-tree /
-    // worktree_path builds (no supervisor-owned scratch container involved).
-    let mut active_spawn_container: Option<std::path::PathBuf> = None;
+    // The lock on this spawn's managed `.spawn-<ref>` container
+    // (`SupervisorState::take_spawn_container_lock`), the one signal that the
+    // container is in use. Taken before `prepare_worktree` materializes or
+    // resets the tree, held through the build AND the frontend verdict that
+    // reads the built tree, then dropped explicitly once nothing reads the
+    // container any more. While it is held, a same-ref spawn-test or a primary
+    // rebuild waits instead of resetting the tree, and every sweep keeps the
+    // container as in use. Declared here, at function scope, because the
+    // verdict is read after the rebuild block: a guard scoped to that block
+    // ended before the verdict, which let a sweep (or a queued same-ref build)
+    // delete or rebuild the tree the verdict then read (plan
+    // `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+    // `None` for the live tree and a caller-owned `worktree_path`, which the
+    // supervisor neither resets nor prunes.
+    let mut container_guard: Option<crate::spawn_worktree::SpawnContainerGuard> = None;
 
     // Set when a provenance build (`git_ref` / `worktree_path`) occurred: the
     // runner root of the tree that was actually built. The spawned exe embeds
@@ -3398,33 +4596,45 @@ async fn execute_spawn_build_inner(
         // path (`origin/main`) as well as the explicit-`git_ref` path — the
         // shared checkout is only compiled on an explicit `from_working_tree`.
         // Any git failure aborts the request (no silent fallback to the live
-        // tree — provenance is the whole point). Release the placeholder port
-        // on failure so it doesn't leak.
-        // Held across BOTH materialize and build so a concurrent spawn of the
-        // same ref can't `git reset --hard` the container out from under this
-        // build (the race the default-origin/main flip made common — see
-        // `SupervisorState::spawn_container_locks`). `None` for the non-managed
-        // sources (live tree / caller-owned worktree_path): those are not
-        // reset by the supervisor, so they need no guard. The guard drops at
-        // the end of this function scope, after the build completes.
-        let _container_guard: Option<tokio::sync::OwnedMutexGuard<()>> =
-            match build_source.managed_ref() {
-                Some(git_ref) => {
-                    match crate::spawn_worktree::container_path_for_ref(
-                        &state.config.project_dir,
-                        git_ref,
-                    ) {
-                        Ok(container) => {
-                            Some(state.spawn_container_lock(&container).lock_owned().await)
-                        }
-                        // Can't derive the container path (malformed layout) —
-                        // prepare_worktree below will surface the real error;
-                        // proceed unguarded rather than 500 here.
-                        Err(_) => None,
+        // tree — provenance is the whole point). The caller's reservation
+        // gives the placeholder port back on every such refusal.
+        //
+        // The container's lock first (see `container_guard`), under the
+        // caller's queue contract (`take_container_for_spawn`): its wait is a
+        // queue wait, so it answers `no_wait` and counts against
+        // `queue_timeout_secs`. A container path that cannot be derived
+        // (malformed layout) takes no lock: `prepare_worktree` fails on the
+        // same derivation before it touches anything, and surfaces the real
+        // error.
+        let queue_budget = body.queue_timeout_secs.map(std::time::Duration::from_secs);
+        // What the container wait leaves of the budget for the build's own
+        // queue wait, and the wait itself, which that wait's 504 names.
+        let mut build_queue_budget = queue_budget;
+        let mut container_wait: Option<ContainerWait> = None;
+        if let Some(git_ref) = build_source.managed_ref() {
+            if let Ok(container) =
+                crate::spawn_worktree::container_path_for_ref(&state.config.project_dir, git_ref)
+            {
+                let taker = match body.requester_id.as_deref() {
+                    Some(requester) => format!("spawn-test {id} (requester {requester})"),
+                    None => format!("spawn-test {id}"),
+                };
+                match take_container_for_spawn(state, &container, &taker, no_wait, queue_budget)
+                    .await
+                {
+                    Ok(ContainerTaken {
+                        guard,
+                        budget_left,
+                        wait,
+                    }) => {
+                        container_guard = Some(guard);
+                        build_queue_budget = budget_left;
+                        container_wait = wait;
                     }
+                    Err(e) => return Err(e),
                 }
-                None => None,
-            };
+            }
+        }
         let build_dir_override = match build_source.managed_ref() {
             Some(git_ref) => {
                 match crate::spawn_worktree::prepare_worktree(&state.config.project_dir, git_ref)
@@ -3437,15 +4647,17 @@ async fn execute_spawn_build_inner(
                                 LogSource::Supervisor,
                                 LogLevel::Info,
                                 format!(
-                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} (requester={:?})",
+                                    "spawn-test git_ref build: ref={:?} resolved_sha={} worktree={:?} {} (requester={:?})",
                                     wt.requested_ref,
                                     wt.resolved_sha,
                                     wt.worktree_path,
+                                    wt.schemas_pin_summary(),
                                     body.requester_id
                                 ),
                             )
                             .await;
                         git_ref_info = Some((wt.requested_ref.clone(), wt.resolved_sha.clone()));
+                        side.tree = Some(SpawnBuildTree::managed(&wt, build_source.label()));
                         // Stash paths for the optional cleanup-on-fail branch
                         // below. `find_repo_root` walks up from the
                         // configured project_dir; if it errors here (the
@@ -3470,15 +4682,6 @@ async fn execute_spawn_build_inner(
                                 schemas_wt_path: Some(wt.schemas_path.clone()),
                             });
                         }
-                        // Mark this container active so the pruner never reaps
-                        // it while the build below is in flight. Removed after
-                        // the build completes (success or failure) — see the
-                        // unregister + opportunistic-sweep block after the build.
-                        {
-                            let mut active = state.active_spawn_worktrees.lock().unwrap();
-                            active.insert(wt.container_path.clone());
-                        }
-                        active_spawn_container = Some(wt.container_path.clone());
                         // The staleness check must inspect the tree whose
                         // dist/ the spawned exe embeds. That is the runner
                         // worktree root (`<ws>/.spawn-<ref>/qontinui-runner`),
@@ -3487,11 +4690,7 @@ async fn execute_spawn_build_inner(
                         built_root = Some(wt.worktree_path.clone());
                         Some(wt.src_tauri)
                     }
-                    Err(e) => {
-                        let mut runners = state.runners.write().await;
-                        runners.remove(id);
-                        return Err(e);
-                    }
+                    Err(e) => return Err(e),
                 }
             }
             // No managed worktree. If `worktree_path` was supplied (mutually
@@ -3542,14 +4741,11 @@ async fn execute_spawn_build_inner(
                             // Staleness check must inspect the caller-owned
                             // tree whose dist/ the spawned exe embeds.
                             built_root = Some(validated.worktree_path.clone());
+                            side.tree = Some(SpawnBuildTree::caller_owned(&validated));
                             worktree_path_info = Some(validated);
                             Some(src_tauri)
                         }
-                        Err(e) => {
-                            let mut runners = state.runners.write().await;
-                            runners.remove(id);
-                            return Err(e);
-                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 None => None,
@@ -3569,10 +4765,10 @@ async fn execute_spawn_build_inner(
             .await;
 
         // Run the build, optionally bounded by a queue timeout.
-        // On any failure (build error, timeout, etc.), remove the placeholder
-        // we reserved above so the port doesn't leak — UNLESS the caller
-        // opted into `allow_stale_fallback`, in which case we keep the
-        // placeholder and fall through to spawn from the previous slot exe.
+        // On any failure (build error, timeout, etc.) return the error, and
+        // the caller's reservation frees the placeholder's port — UNLESS the
+        // caller opted into `allow_stale_fallback`, in which case we fall
+        // through to spawn from the previous slot exe.
         // Phase 3: `frontend_only` FORCES a fresh `pnpm run build` in the
         // isolated override tree even when the dist-present idempotency gate
         // would otherwise skip it (a TS edit after the tree's last build would
@@ -3596,14 +4792,17 @@ async fn execute_spawn_build_inner(
         // whatever branch the shared checkout happened to be parked on.
         let source_kind =
             build_source.build_source_kind(git_ref_info.as_ref().map(|(_, s)| s.as_str()));
-        let run_detailed = |override_dir: Option<std::path::PathBuf>| {
+        let run_detailed = |override_dir: Option<std::path::PathBuf>,
+                            queue_budget: Option<std::time::Duration>,
+                            container_wait: Option<ContainerWait>| {
             let requester = requester_id.clone();
             let source_kind = source_kind.clone();
             async move {
                 // Shared phase marker the build future advances
-                // (AwaitingSlot → AwaitingNpmLock → BuildingFrontend →
-                // Compiling). On a queue timeout the future is cancelled
-                // mid-flight and returns no `BuildAttempt`, so reading this
+                // (AwaitingSlot → SlotHeld → AwaitingNpmLock →
+                // BuildingFrontend → Compiling, a worktree build visiting the
+                // frontend-lock wait twice). On a queue timeout the future is
+                // cancelled mid-flight and returns no `BuildAttempt`, so reading this
                 // marker is the ONLY way to compose a phase-accurate message —
                 // it reflects exactly what the cancelled future was doing.
                 let phase_marker = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
@@ -3617,40 +4816,35 @@ async fn execute_spawn_build_inner(
                     source_kind,
                     phase_marker.clone(),
                 );
-                match queue_timeout_secs {
-                    Some(secs) => {
-                        // `queue_timeout_secs` bounds the QUEUE, not the build.
-                        // It used to wrap the whole future, so a caller passing
-                        // a small bound to say "don't make me wait for a busy
-                        // pool" got a 504 that ALSO abandoned an already-
-                        // compiling slot — throwing away a live build (and
-                        // everything it had compiled) for a wait that had
-                        // already ended. The watcher below stops counting the
-                        // moment the build leaves its queue phases, so the
-                        // field now means what it is documented to mean.
-                        let timeout = std::time::Duration::from_secs(secs);
-                        let watcher = wait_out_queue_timeout(timeout, phase_marker.clone());
-                        tokio::pin!(fut);
-                        tokio::select! {
-                            r = &mut fut => r,
-                            phase = watcher => {
-                                let available_permits =
-                                    state.build_pool.permits.available_permits();
-                                Err((
-                                    SupervisorError::Timeout(
-                                        phase.timeout_message(secs, available_permits),
-                                    ),
-                                    crate::build_monitor::BuildAttempt::default(),
-                                ))
-                            }
-                        }
+                match queue_budget {
+                    // `budget` is what is left of the caller's budget for this
+                    // attempt; the message names the caller's whole budget, and
+                    // how much of it a wait for the container took first.
+                    Some(budget) => {
+                        race_build_against_queue_budget(
+                            state,
+                            fut,
+                            phase_marker,
+                            budget,
+                            queue_timeout_secs.unwrap_or(budget.as_secs()),
+                            container_wait.as_ref(),
+                        )
+                        .await
                     }
                     None => fut.await,
                 }
             }
         };
 
-        let mut build_result = run_detailed(build_dir_override.clone()).await;
+        // The first attempt queues with what the container wait left of the
+        // budget, and its 504 says how the budget was split; a poisoned-slot
+        // retry below queues afresh with all of it.
+        let mut build_result = run_detailed(
+            build_dir_override.clone(),
+            build_queue_budget,
+            container_wait,
+        )
+        .await;
 
         // Poisoned-slot self-heal (Issue 3 fix part 2). On a build FAILURE
         // whose stderr is NOT a genuine compiler diagnostic (no `error[E####]`,
@@ -3707,7 +4901,8 @@ async fn execute_spawn_build_inner(
                                 e
                             ),
                         }
-                        let retry = run_detailed(build_dir_override.clone()).await;
+                        let retry =
+                            run_detailed(build_dir_override.clone(), queue_budget, None).await;
                         match &retry {
                             Ok(_) => {
                                 tracing::info!(
@@ -3853,56 +5048,68 @@ async fn execute_spawn_build_inner(
                     // Fall through to exe-resolution + spawn below. If the
                     // resolution fails, we'll surface 500 there.
                 } else {
-                    // Release the placeholder port reservation.
-                    if let Some(container) = active_spawn_container.take() {
-                        state
-                            .active_spawn_worktrees
-                            .lock()
-                            .unwrap()
-                            .remove(&container);
-                    }
-                    let mut runners = state.runners.write().await;
-                    runners.remove(id);
+                    // The caller's reservation frees the placeholder's port.
+                    // (Returning drops `container_guard`: nothing will read
+                    // the tree.)
                     return Err(e);
                 }
             }
         }
+    }
 
-        // Build finished (success, or stale-fallback that didn't early-return).
-        // Unregister the active spawn container so the pruner may reap it once
-        // it ages out, then run an OPPORTUNISTIC prune sweep: a freshly-built
-        // `.spawn-*` container is the natural trigger to scrub OTHER stale
-        // scratch containers its parent dir accumulated. Best-effort + bounded
-        // — the sweep itself never fails the spawn request.
-        if let Some(container) = active_spawn_container.take() {
+    // The frontend verdict, read while `container_guard` still holds the
+    // managed container: the built tree's `dist/` cannot be deleted by a sweep
+    // or emptied by a queued same-ref build's `vite build` between the build
+    // and this read. Invariant: it inspects the tree whose dist/ the spawned
+    // exe embeds — the provenance build tree (`built_root`) when a
+    // `git_ref`/`worktree_path` build happened, the live tree otherwise. A
+    // build that failed into the stale fallback embedded no tree at all: its
+    // exe is a previous build's, so no tree on disk speaks for it (and
+    // `cleanup_worktree_on_fail` may have just removed this one) and only the
+    // slot's own frontend flag is read. It is ACTED on below, before any
+    // runner starts.
+    let checked_tree = if matches!(build_succeeded, Some(false)) {
+        None
+    } else {
+        match (built_root.as_deref(), git_ref_info.is_some()) {
+            (Some(root), true) => Some(CheckedTree::Managed(root)),
+            (Some(root), false) => Some(CheckedTree::CallerOwned(root)),
+            (None, _) => state.config.project_dir.parent().map(CheckedTree::Live),
+        }
+    };
+    let (frontend_stale, stale_reason, stale_slot_id) =
+        resolve_frontend_stale_for_spawn(state, checked_tree.map(CheckedTree::root)).await;
+
+    // Nothing reads the managed container after this point: the exe and its
+    // sidecars are deployed from the build slot, the runner runs in the live
+    // tree, and the provenance compares below run in the runner repo
+    // (`provenance_compare_root`). Release it so a queued same-ref build can
+    // start, and so a sweep may prune it once it ages out.
+    drop(container_guard);
+
+    // A managed build is the natural trigger to scrub OTHER stale scratch
+    // containers the workspace root accumulated: an OPPORTUNISTIC sweep. It
+    // runs after this spawn released its own container, so a queued same-ref
+    // build does not wait for it. That container stays under any retention
+    // window longer than the build, since `prepare_worktree` stamped it used
+    // when the build began; `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS=0` prunes
+    // it, which is harmless, because nothing reads it after the release.
+    // Best-effort + bounded — the sweep itself never fails the spawn request.
+    if git_ref_info.is_some() {
+        let report = state.sweep_spawn_worktrees(None).await;
+        if !report.removed.is_empty() || !report.failed.is_empty() {
             state
-                .active_spawn_worktrees
-                .lock()
-                .unwrap()
-                .remove(&container);
-
-            let active_now: std::collections::HashSet<std::path::PathBuf> =
-                state.active_spawn_worktrees.lock().unwrap().clone();
-            let report = crate::spawn_worktree::prune_spawn_worktrees(
-                &state.config.project_dir,
-                &active_now,
-                std::time::SystemTime::now(),
-            )
-            .await;
-            if !report.removed.is_empty() || !report.failed.is_empty() {
-                state
-                    .logs
-                    .emit(
-                        LogSource::Supervisor,
-                        LogLevel::Info,
-                        format!(
-                            "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
-                            report.removed.len(),
-                            report.failed.len()
-                        ),
-                    )
-                    .await;
-            }
+                .logs
+                .emit(
+                    LogSource::Supervisor,
+                    LogLevel::Info,
+                    format!(
+                        "spawn-test opportunistic prune: removed {} stale scratch worktree(s), {} failed",
+                        report.removed.len(),
+                        report.failed.len()
+                    ),
+                )
+                .await;
         }
     }
 
@@ -3940,22 +5147,16 @@ async fn execute_spawn_build_inner(
                     )
                     .await;
             }
-            Err(e) => {
-                let mut runners = state.runners.write().await;
-                runners.remove(id);
-                return Err(e);
-            }
+            Err(e) => return Err(e),
         }
     }
 
     // Check that a runner binary exists in some build slot (or at the legacy path).
     // Without this check, a fresh supervisor would succeed the request only to
-    // fail inside `start_runner_by_id` with a less helpful error. If the check
-    // fails, remove the placeholder we reserved above so the port frees up.
+    // fail inside `start_managed_runner` with a less helpful error. A refusal
+    // here frees the placeholder's port through the caller's reservation.
     // Skip when use_lkg pinned an override above — we already verified that path.
     if !body.use_lkg && manager::resolve_source_exe(state).await.is_err() {
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
         return Err(SupervisorError::Process(
             "Runner binary not found in any build slot. Use rebuild: true to build it first, or use_lkg: true if a previous build's LKG copy is acceptable."
                 .to_string(),
@@ -3967,6 +5168,24 @@ async fn execute_spawn_build_inner(
     // mark the build_result as reusing-stale so callers can detect it.
     if matches!(build_succeeded, Some(false)) {
         build_reused_stale = true;
+    }
+
+    // Refuse on the frontend verdict BEFORE starting a runner — never start
+    // one only to kill it. `DistMissing` and `BuildTreeRemoved` refuse
+    // unconditionally (`FrontendStaleReason::refuses_unconditionally`): a
+    // runner that embeds no frontend serves a blank screen at every route,
+    // and one whose built tree is gone embeds a frontend nobody can verify.
+    // The stale-but-functional reasons refuse only under `frontend_strict`.
+    // Placed after the exe checks above, so a spawn with no runner binary at
+    // all still says so. An `Ok` refusal still frees the placeholder's port:
+    // the reservation is released on every outcome that started no runner.
+    if let Some(reason) =
+        stale_reason.filter(|reason| reason.refuses_unconditionally() || body.frontend_strict)
+    {
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
+        ));
     }
 
     // Log label only — this value never reaches `RunnerConfig` (the
@@ -3984,12 +5203,22 @@ async fn execute_spawn_build_inner(
     // Either way the files land in THIS runner's per-instance config dir
     // BEFORE the runner starts — the dir the spawn exports as
     // `QONTINUI_SECURE_STORAGE_DIR`, and the only one the child reads its
-    // pairing from. On failure release the placeholder port and return the
-    // structured error body.
+    // pairing from. On failure return the structured error body; the caller's
+    // reservation frees the placeholder's port.
     //
     // Reported on the spawn-test response as `paired_state`, plus the legacy
     // `paired_profile_applied` / `paired_profile_id` for a profile spawn.
-    let paired_state = match apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id) {
+    //
+    // A `fresh_device_identity` spawn (Phase 8b) projects NO paired state: the
+    // subject is a different device, and the primary's pairing (or a
+    // snapshot) would bind it to the harness's device.
+    let paired_state = match apply_paired_state_for_spawn(
+        crate::process::instance_root::DeviceIdentity::from_fresh_flag(
+            managed.config.fresh_device_identity,
+        ),
+        body.paired_profile_id.as_deref(),
+        id,
+    ) {
         Ok(report) => {
             state
                 .logs
@@ -4003,38 +5232,49 @@ async fn execute_spawn_build_inner(
         }
         Err((status, body_json)) => {
             // The copy may have already created the destination instance dir
-            // before a `fs::copy` failed. We are about to drop this runner
-            // from the registry, and the instance-dir reaper only visits
-            // REGISTERED runners — so the dir would leak forever. `id` is
-            // uuid-unique, so nothing else owns this path.
+            // before a `fs::copy` failed. The reservation is about to drop
+            // this runner from the registry, and the instance-dir reaper only
+            // visits REGISTERED runners — so the dir would leak forever. `id`
+            // is uuid-unique, so nothing else owns this path.
             if let Some(dest) = crate::process::instance_config_dir(id) {
                 let _ = std::fs::remove_dir_all(&dest);
             }
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-            drop(runners);
             return Ok((status, body_json));
         }
     };
 
+    // From here a panic or cancellation may abandon a spawned child, so the
+    // reservation's `Drop` keeps the entry; an `Err` return still releases it.
+    reservation.entering_start();
     // Start the runner using the Arc captured at insertion time. This avoids
-    // the id-based lookup in `start_runner_by_id` which can race with
+    // an id-based lookup, which can race with
     // concurrent paths that remove the id from the registry (e.g. a sibling
-    // spawn's failed health probe, stop_all_temp_runners, the reaper).
-    // `start_managed_runner` also re-inserts the Arc if the id went missing,
-    // so the subsequent health probe and /runners lookups still work.
-    if let Err(e) = manager::start_managed_runner(state, managed).await {
-        // Clean up on failure — the registry entry AND the instance dir the
-        // paired-state copy just populated (it holds a copy of the
-        // operator's credential store, and the instance-dir reaper only
-        // visits registered runners, so it would otherwise leak forever).
+    // spawn's failed health probe, the reaper).
+    // A start that finds the id gone by the time it holds the lifecycle lock
+    // fails `RunnerNotFound`: something tore this runner down.
+    if let Err(e) = manager::start_managed_runner(
+        state,
+        managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
+        // Clean up on failure — the instance dir the paired-state copy just
+        // populated (it holds a copy of the operator's credential store, and
+        // the instance-dir reaper only visits registered runners, so it would
+        // otherwise leak forever). The registry entry goes with the
+        // reservation, which is still armed.
         if let Some(dest) = crate::process::instance_config_dir(id) {
             let _ = std::fs::remove_dir_all(&dest);
         }
-        let mut runners = state.runners.write().await;
-        runners.remove(id);
+        reservation.start_failed();
         return Err(e);
     }
+    // Started: the runner may be running, and its id is the caller's handle on
+    // it, so no later outcome gives the reservation back. A failure from here
+    // on stops the runner and removes its entry itself (the probe below).
+    reservation.disarm();
 
     state
         .logs
@@ -4076,6 +5316,7 @@ async fn execute_spawn_build_inner(
                 git_sha,
                 health_body,
             } => {
+                side.answered_at.get_or_insert_with(chrono::Utc::now);
                 health_probe_ms = Some(elapsed_ms);
                 probed_git_sha = git_sha;
                 child_health_body = health_body;
@@ -4135,7 +5376,8 @@ async fn execute_spawn_build_inner(
                 // probe just failed — there is no session on it to protect,
                 // and a readiness refusal here would leak the zombie this
                 // line exists to prevent.
-                let _ = manager::stop_runner_by_id(state, id, true).await;
+                let _ =
+                    manager::stop_runner_by_id(state, id, true, manager::CloseIntent::Kill).await;
                 {
                     let mut runners = state.runners.write().await;
                     runners.remove(id);
@@ -4187,7 +5429,7 @@ async fn execute_spawn_build_inner(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -4226,6 +5468,7 @@ async fn execute_spawn_build_inner(
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     healthy = true;
+                    side.answered_at.get_or_insert_with(chrono::Utc::now);
                     wait_ms = start.elapsed().as_millis() as u64;
                     if let Some(v) = resp
                         .text()
@@ -4246,7 +5489,7 @@ async fn execute_spawn_build_inner(
 
                     // Clear localStorage for this port to avoid stale tab state
                     let clear_url =
-                        format!("http://localhost:{}/ui-bridge/control/clear-storage", port);
+                        format!("{}/control/clear-storage", runner_ui_bridge_base(port));
                     if let Err(e) = client
                         .post(&clear_url)
                         .json(&serde_json::json!({}))
@@ -4278,75 +5521,6 @@ async fn execute_spawn_build_inner(
             .ok()
             .and_then(|p| crate::process::manager::binary_meta(&p))
     };
-
-    // Determine if the slot we used for the binary has a stale frontend
-    // baked in (build failure) OR if `src/` is newer than `dist/index.html`
-    // (someone forgot to `npm run build`). Either way, the runner ships with
-    // a UI that doesn't reflect current source.
-    //
-    // Invariant: the staleness check must inspect the tree whose dist/ the
-    // spawned exe embeds — the provenance build tree (`built_root`) when a
-    // `git_ref`/`worktree_path` build happened, the live tree otherwise.
-    let (frontend_stale, stale_reason, stale_slot_id) = resolve_frontend_stale_for_spawn(
-        state,
-        built_root.as_deref().or(state.config.project_dir.parent()),
-    )
-    .await;
-
-    // Short-circuit with 503 before reporting success when the spawned
-    // runner would serve a broken or stale UI. Two triggers:
-    //
-    //  1. `DistMissing` — ALWAYS hard-fails, regardless of `frontend_strict`.
-    //     A missing `dist/index.html` is not "stale but functional": the
-    //     runner has NO embedded frontend and serves `asset not found:
-    //     index.html` at every route — a blank screen. Returning
-    //     `status=healthy` here lies to the caller (a manual-test run caught
-    //     exactly this: gutted `node_modules/.bin` + empty `dist/` → the
-    //     freshly-built runner embedded a blank frontend, yet spawn-test only
-    //     warned and reported healthy). A blank UI is never healthy, so the
-    //     default path must refuse the spawn, not warn-and-serve.
-    //
-    //  2. Any other `frontend_stale` reason (`BuildFailed` / `SrcDrift`) —
-    //     hard-fails only when the caller opted into strict-frontend
-    //     enforcement via `frontend_strict: true`. These are stale-but-
-    //     functional (the UI renders, just not the latest source), so the
-    //     default stays warn-and-serve for back-compat.
-    let dist_missing = matches!(stale_reason, Some(FrontendStaleReason::DistMissing));
-    if frontend_stale && (dist_missing || body.frontend_strict) {
-        // Stop the runner we just spawned — we will not ship a broken/stale
-        // UI to the caller. `force: true` for the same reason as the
-        // failed-probe teardown above: nothing has ever run on this runner.
-        let _ = manager::stop_runner_by_id(state, id, true).await;
-        {
-            let mut runners = state.runners.write().await;
-            runners.remove(id);
-        }
-        state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let message = if dist_missing {
-            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
-             missing, so the runner would embed no frontend and serve a blank screen \
-             (`asset not found: index.html`) at every route. Run \
-             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
-             unconditional: a missing dist is never reported as healthy."
-                .to_string()
-        } else {
-            format!(
-                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
-                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
-                 or pass {{\"frontend_strict\": false}} to override.",
-                reason_str
-            )
-        };
-        let body = json!({
-            "error": if dist_missing { "frontend_dist_missing" } else { "frontend_stale" },
-            "message": message,
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, body));
-    }
 
     // Item A: assemble the build_result JSON object. `slot_id` reads
     // last_successful_slot AFTER the build (or after the no-op when
@@ -4416,8 +5590,8 @@ async fn execute_spawn_build_inner(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         // Per-runner log endpoints — these capture the runner's own
         // stdout/stderr. /logs/history on the supervisor has the
         // supervisor's own buffer and does NOT include runner logs, so
@@ -4440,6 +5614,7 @@ async fn execute_spawn_build_inner(
         // directory the binary came from, which is the gap that let a
         // 54-day-old exe pass for a branch under test.
         "source_exe": source_exe_json(managed).await,
+        "instance_root": instance_root_json(id),
         "auth_state": auth_state_json,
         "message": if body.wait && healthy {
             format!("Test runner ready on port {} ({}ms)", port, wait_ms)
@@ -4464,6 +5639,9 @@ async fn execute_spawn_build_inner(
         resp["paired_profile_id"] = paired_state["paired_profile_id"].clone();
     }
     resp["paired_state"] = paired_state;
+    if managed.config.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(id);
+    }
     resp["coord_credential"] = coord_credential_from_health(
         child_health_body.as_ref(),
         if child_health_body.is_some() {
@@ -4545,65 +5723,34 @@ async fn execute_spawn_build_inner(
         }
     }
 
-    // Provenance for a git_ref build: the requested ref and the SHA the
-    // managed worktree actually resolved to. Only present when a git_ref
-    // build occurred (rebuild:true + git_ref).
-    //
-    // Field shape (kept stable for downstream callers / agents):
-    //   git_ref               — the input ref verbatim (e.g. "origin/main").
-    //   git_ref_resolved      — echo alias of git_ref so callers that want a
-    //                           "resolved" label don't have to special-case.
-    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the
-    //                           prepared worktree.
+    // Build-tree provenance: which runner tree and which schemas sibling were
+    // compiled. A managed worktree (the default `origin/main` build or a
+    // `git_ref`) and a caller-owned `worktree_path` are rendered by
+    // `SpawnBuildTree::attach`, which `execute_spawn_build` also applies to
+    // every failure body. Field shape (kept stable for downstream callers):
+    //   source                — `origin_main` (the default), `worktree` (an
+    //                           explicit ref), `worktree_path`, or `live_tree`.
+    //                           Callers that need a single-field "where did
+    //                           the binary come from?" answer branch on this.
+    //   git_ref / git_ref_resolved
+    //                         — the input ref verbatim, and its echo alias.
+    //   git_ref_resolved_sha  — full 40-char `git rev-parse HEAD` of the tree.
     //   git_ref_resolved_sha_short
-    //                         — 12-char abbreviated SHA for log-readable
-    //                           comparison against `git rev-parse origin/main
-    //                           | head -c 12`. Always derived from
-    //                           git_ref_resolved_sha; never re-shells out to
-    //                           git so it's a pure presentational helper.
-    //   source                — "worktree" when this build came from the
-    //                           managed detached worktree; absent when the
-    //                           live tree was used. Callers that need a
-    //                           single-field "where did the binary come
-    //                           from?" answer can branch on this.
-    if let Some((requested_ref, resolved_sha)) = &git_ref_info {
-        let short = resolved_sha.chars().take(12).collect::<String>();
-        resp["git_ref"] = json!(requested_ref);
-        resp["git_ref_resolved"] = json!(requested_ref);
-        resp["git_ref_resolved_sha"] = json!(resolved_sha);
-        resp["git_ref_resolved_sha_short"] = json!(short);
-        // `origin_main` for the DEFAULT path, `worktree` for an explicitly
-        // requested ref — so a caller can tell "the supervisor picked merged
-        // truth for me" from "I asked for this ref" without re-reading
-        // `git_ref`.
-        resp["source"] = json!(build_source.label());
-    } else if let Some(wt) = &worktree_path_info {
-        // Phase 2 — `worktree_path` provenance. Echo the canonical path, the
-        // worktree's HEAD SHA (when it's a git checkout) reusing the same
-        // `git_ref_resolved_sha`/`_short` field names callers already parse,
-        // and the schemas-sibling drift provenance (`schemas_path`,
-        // `schemas_sha`, `schemas_is_shared`). `source: "worktree_path"`
-        // distinguishes it from a managed `git_ref` worktree.
-        resp["source"] = json!("worktree_path");
-        resp["worktree_path"] = json!(wt.worktree_path.to_string_lossy());
-        if let Some(sha) = &wt.resolved_sha {
-            let short = sha.chars().take(12).collect::<String>();
-            resp["git_ref_resolved_sha"] = json!(sha);
-            resp["git_ref_resolved_sha_short"] = json!(short);
-        }
-        resp["schemas_path"] = match &wt.schemas_path {
-            Some(p) => json!(p.to_string_lossy()),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_sha"] = match &wt.schemas_sha {
-            Some(s) => json!(s),
-            None => serde_json::Value::Null,
-        };
-        resp["schemas_is_shared"] = json!(wt.schemas_is_shared);
-    } else {
+    //                         — its 12-char prefix, for comparison against
+    //                           `git rev-parse origin/main | head -c 12`.
+    //   worktree_path         — the caller-owned checkout (that arm only).
+    //   schemas_path / schemas_sha / schemas_is_shared
+    //                         — the schemas sibling the path-deps resolved to.
+    //   schemas_pin_ref / schemas_pin_source
+    //                         — managed worktrees only: the runner tree's
+    //                           declared `.github/sibling-pins.conf` sha
+    //                           (`sibling_pins_conf`), or `origin/main`
+    //                           (`origin_main_fallback`).
+    match &side.tree {
+        Some(tree) => tree.attach(&mut resp),
         // Explicit "live_tree" provenance so callers can always branch on a
         // present field rather than needing missing-field handling.
-        resp["source"] = json!("live_tree");
+        None => resp["source"] = json!("live_tree"),
     }
 
     // Item 8 — build-vintage warning. `source` says WHICH tree was compiled but
@@ -4697,19 +5844,7 @@ async fn execute_spawn_build_inner(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
 
         // The legacy `X-Frontend-Stale: 1` response header can't ride a stored
         // submission outcome, so the sync handler re-attaches it by branching on
@@ -4732,6 +5867,18 @@ async fn execute_spawn_build_inner(
 ///   `supervisor-frontend-build-silent-success.md`. Surface it loudly
 ///   instead so callers learn the runner will serve `asset not found:
 ///   index.html`.
+/// - `BuildTreeRemoved`: the built tree's root itself does not exist, so
+///   nothing can say which frontend the binary embeds. Reporting that as
+///   `DistMissing` claimed a blank UI it had not observed, and its `npm run
+///   build` remedy sent the operator after a dist/ that was never the problem
+///   (plan
+///   `2026-11-13-spawn-test-opportunistic-prune-deletes-the-container-it-just-built`).
+///   A managed build reads its verdict while it holds the container's lock,
+///   so no sweep removes its tree first; it still meets this when something
+///   outside the supervisor removed the tree. A caller-owned `worktree_path`
+///   meets it when its owner removed it, and the live tree when that checkout
+///   is gone. A build that failed into the stale fallback never reads a tree
+///   here: its exe is a previous build's.
 ///
 /// Reported back to callers via `frontend_stale_reason`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4739,6 +5886,7 @@ enum FrontendStaleReason {
     BuildFailed,
     SrcDrift,
     DistMissing,
+    BuildTreeRemoved,
 }
 
 impl FrontendStaleReason {
@@ -4747,7 +5895,142 @@ impl FrontendStaleReason {
             FrontendStaleReason::BuildFailed => "build_failed",
             FrontendStaleReason::SrcDrift => "src_newer_than_dist",
             FrontendStaleReason::DistMissing => "dist_missing",
+            FrontendStaleReason::BuildTreeRemoved => "build_tree_removed",
         }
+    }
+
+    /// Whether a spawn door refuses on this reason whatever `frontend_strict`
+    /// says. `DistMissing` is not "stale but functional": the runner has NO
+    /// embedded frontend and serves `asset not found: index.html` at every
+    /// route — a blank screen, never healthy (a manual-test run caught a
+    /// gutted `node_modules/.bin` + empty `dist/` reported healthy). With
+    /// `BuildTreeRemoved` nobody can say which frontend it embeds, and an
+    /// UNKNOWN is not reported as healthy either. `BuildFailed` / `SrcDrift`
+    /// are stale but functional (the UI renders, just not the latest source),
+    /// so they refuse only when the caller opts in with `frontend_strict`.
+    fn refuses_unconditionally(self) -> bool {
+        matches!(
+            self,
+            FrontendStaleReason::DistMissing | FrontendStaleReason::BuildTreeRemoved
+        )
+    }
+}
+
+/// The tree a spawn door's frontend verdict reads, and so who can bring it
+/// back when it is gone ([`FrontendStaleReason::BuildTreeRemoved`]).
+#[derive(Clone, Copy, Debug)]
+enum CheckedTree<'a> {
+    /// A managed `.spawn-<ref>` container's runner worktree: a spawn
+    /// materializes it again.
+    Managed(&'a std::path::Path),
+    /// A caller-owned `worktree_path` checkout: only its owner can restore it.
+    CallerOwned(&'a std::path::Path),
+    /// The live runner checkout the supervisor's `--project-dir` names.
+    Live(&'a std::path::Path),
+}
+
+impl<'a> CheckedTree<'a> {
+    fn root(self) -> &'a std::path::Path {
+        match self {
+            CheckedTree::Managed(root)
+            | CheckedTree::CallerOwned(root)
+            | CheckedTree::Live(root) => root,
+        }
+    }
+
+    /// What brings this tree back once it is gone. Only a managed container
+    /// comes back with a retry.
+    fn remedy_when_removed(self) -> &'static str {
+        match self {
+            CheckedTree::Managed(_) => {
+                "Retry the spawn: it materializes the container again. The spawn-worktree sweeps (the startup sweep, the sweep after a spawn-test build, `DELETE /spawn-worktrees`) keep a container while a build holds its lock, so something outside the supervisor removed it."
+            }
+            CheckedTree::CallerOwned(_) => {
+                "The supervisor never creates or removes a `worktree_path` tree, so a retry of this request cannot help: restore that checkout, or pass a `worktree_path` that exists."
+            }
+            CheckedTree::Live(_) => {
+                "It is the live runner checkout the supervisor's `--project-dir` names, so a retry cannot help: restore that checkout."
+            }
+        }
+    }
+}
+
+/// The 503 body a spawn door answers with when it refuses a spawn on its
+/// frontend verdict: `reason` refuses unconditionally, or the caller asked
+/// for `frontend_strict`. `checked` is the tree the verdict read.
+///
+/// `error` is a token per refusal (`frontend_dist_missing`,
+/// `frontend_build_tree_removed`, `frontend_stale` for a strict refusal),
+/// and each message names the remedy that fits its own cause. A removed tree
+/// is not a dist/ problem, so its message never recommends rebuilding the
+/// frontend, and it offers a retry only where a retry brings the tree back.
+fn frontend_refusal_body(
+    reason: FrontendStaleReason,
+    stale_slot_id: Option<usize>,
+    checked: Option<CheckedTree<'_>>,
+) -> serde_json::Value {
+    let (error, message) = match reason {
+        FrontendStaleReason::DistMissing => (
+            "frontend_dist_missing",
+            "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html is \
+             missing, so the runner would embed no frontend and serve a blank screen \
+             (`asset not found: index.html`) at every route. Run \
+             `cd qontinui-runner && npm run build` to rebuild dist/, then retry. This is \
+             unconditional: a missing dist is never reported as healthy."
+                .to_string(),
+        ),
+        FrontendStaleReason::BuildTreeRemoved => (
+            "frontend_build_tree_removed",
+            format!(
+                "frontend_build_tree_removed: refusing to spawn — the tree this spawn built \
+                 ({}) no longer exists, so nothing can say which frontend the runner would \
+                 embed, and its dist/ was never the problem. {}",
+                checked.map_or_else(
+                    || "unresolved".to_string(),
+                    |tree| tree.root().display().to_string()
+                ),
+                checked.map_or("", CheckedTree::remedy_when_removed),
+            ),
+        ),
+        FrontendStaleReason::BuildFailed | FrontendStaleReason::SrcDrift => (
+            "frontend_stale",
+            format!(
+                "frontend_strict: refusing to spawn — frontend dist is stale (reason={}). \
+                 Run `cd qontinui-runner && npm run build` (or fix the build error) and retry, \
+                 or pass {{\"frontend_strict\": false}} to override.",
+                reason.as_str()
+            ),
+        ),
+    };
+    json!({
+        "error": error,
+        "message": message,
+        "frontend_stale": true,
+        "frontend_stale_reason": reason.as_str(),
+        "stale_slot_id": stale_slot_id,
+    })
+}
+
+/// The `warnings` entry of a spawn served with a stale frontend, the same at
+/// both spawn doors. The doors answer a reason that refuses unconditionally
+/// with [`frontend_refusal_body`] instead, so only `BuildFailed` / `SrcDrift`
+/// reach this from them; the other arms describe their reason all the same.
+fn frontend_stale_warning(
+    reason: Option<FrontendStaleReason>,
+    stale_slot_id: Option<usize>,
+) -> String {
+    match reason {
+        Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
+            Some(sid) => format!(
+                "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
+                sid
+            ),
+            None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
+        },
+        Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
+        Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
+        Some(FrontendStaleReason::BuildTreeRemoved) => "frontend_stale: the tree this spawn built no longer exists, so nothing can say which frontend the runner embeds.".to_string(),
+        None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
     }
 }
 
@@ -4791,7 +6074,9 @@ async fn resolve_frontend_stale_for_spawn(
         return (true, Some(FrontendStaleReason::BuildFailed), None);
     }
 
-    // (2) On-disk dist/ check — handles two cases:
+    // (2) On-disk dist/ check — handles three cases:
+    //   - the built tree itself is gone (`BuildTreeRemoved`): its dist/ says
+    //     nothing about what the binary embeds.
     //   - `dist/index.html` is missing entirely (the silent-success bug:
     //     prior to 2026-05-11 this returned "not stale" and the runner
     //     went on to serve `asset not found: index.html`).
@@ -4812,8 +6097,12 @@ async fn resolve_frontend_stale_for_spawn(
 /// return the appropriate `FrontendStaleReason` (or `None` if the dist on
 /// disk genuinely covers the current source).
 ///
-/// Three outcomes:
+/// Four outcomes:
 ///
+/// - `Some(BuildTreeRemoved)` — `runner_root` itself is gone (positively
+///   absent, not merely unreadable), so its dist/ says nothing about the
+///   frontend the binary embeds. Read as `DistMissing` before, it sent a
+///   caller after an `npm run build` that could not help.
 /// - `Some(DistMissing)` — `dist/index.html` doesn't exist on disk. Prior
 ///   to 2026-05-11 this silently returned "not stale", which let the
 ///   runner spawn with no embedded frontend and serve `asset not found:
@@ -4827,6 +6116,12 @@ async fn resolve_frontend_stale_for_spawn(
 ///   to).
 async fn check_dist_freshness(runner_root: &std::path::Path) -> Option<FrontendStaleReason> {
     use std::time::SystemTime;
+
+    // Only a positive answer of absence counts: an error reading the root is
+    // left to the dist/ check below, as it was before this arm existed.
+    if matches!(runner_root.try_exists(), Ok(false)) {
+        return Some(FrontendStaleReason::BuildTreeRemoved);
+    }
 
     let dist_index = runner_root.join("dist").join("index.html");
     let src_root = runner_root.join("src");
@@ -4923,7 +6218,7 @@ enum ProbeOutcome {
     },
 }
 
-/// Poll `GET http://localhost:{port}/health` every 200ms until it succeeds or
+/// Poll `GET http://127.0.0.1:{port}/health` every 200ms until it succeeds or
 /// `timeout_ms` elapses. On failure, also reports whether the child process
 /// is still alive and snapshots the last 20 log lines from the runner's
 /// per-runner buffer.
@@ -4936,7 +6231,7 @@ async fn probe_runner_health(
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let interval = std::time::Duration::from_millis(200);
     let start = std::time::Instant::now();
-    let url = format!("http://localhost:{}/health", port);
+    let url = format!("{}/health", runner_loopback_base(port));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(500))
         .build()
@@ -4974,21 +6269,14 @@ async fn probe_runner_health(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
-    // Determine if the child process is still alive and capture its pid.
-    // try_wait() returns Ok(Some(_)) if the child has exited, Ok(None) if
-    // still running, Err(_) on a system error (treated as "unknown — assume
-    // dead" so we report the more honest 500).
-    let (child_alive, pid) = if let Some(managed) = state.get_runner(runner_id).await {
-        let mut runner = managed.runner.write().await;
-        let pid = runner.pid;
-        let alive = match runner.process.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(None)),
-            None => false,
-        };
-        (alive, pid)
-    } else {
-        (false, None)
+    // Determine if the child process is still alive and capture its pid. The
+    // exit monitor owns the child and clears the pid when it exits, so a pid
+    // that is still recorded and alive is the process that never answered.
+    let pid = match state.get_runner(runner_id).await {
+        Some(managed) => managed.runner.read().await.pid,
+        None => None,
     };
+    let child_alive = pid.is_some_and(crate::process::proc_kill::pid_alive);
 
     let recent_logs = recent_runner_log_lines(state, runner_id, 20).await;
 
@@ -5001,17 +6289,33 @@ async fn probe_runner_health(
         let path = crate::process::panic_log::resolve_panic_log_path(dir_opt.as_deref());
         let parsed = crate::process::panic_log::parse_panic_file(&path);
         if let Some(p) = parsed.as_ref() {
-            // Freshness: a panic log from a prior boot of a re-used runner
-            // id would lie here. Match the same 60s window the exit-
-            // monitor uses.
-            if !crate::process::panic_log::is_fresh(p, chrono::Utc::now()) {
-                None
-            } else {
-                // Stash on the managed runner so subsequent callers of
-                // GET /runners see the same record.
-                let mut slot = managed.recent_panic.write().await;
-                *slot = Some(p.clone());
-                Some(p.clone())
+            // The panic must be this spawn's: the runner's newest ring entry,
+            // which `start_managed_runner` pushed before this probe ran. Its
+            // pid decides, not the panic's age, so a boot panic is kept
+            // however long the probe ran, and a panic of an older process
+            // still in the file (the runner never truncates it) is not. An
+            // empty ring stores nothing.
+            let newest = managed.recent_spawns.read().await.newest().cloned();
+            match newest.filter(|spawn| crate::dev_action::attribution::is_panic_of_spawn(p, spawn))
+            {
+                None => None,
+                Some(spawn) => {
+                    // Stash on the managed runner so subsequent callers of
+                    // GET /runners see the same record.
+                    *managed.recent_panic.write().await = Some(p.clone());
+                    // And on the spawn's own ring entry, keyed by when it was
+                    // spawned. The stop that follows this probe can end in a
+                    // teardown panic that overwrites the file and, on an exit
+                    // that is not clean, `recent_panic` and the entry's
+                    // `exit_panic`; the attribution watcher reads this copy
+                    // first (`SpawnMarker::boot_panic`).
+                    managed
+                        .recent_spawns
+                        .write()
+                        .await
+                        .attach_boot_panic(spawn.spawned_at, p.clone());
+                    Some(p.clone())
+                }
             }
         } else {
             None
@@ -5070,7 +6374,7 @@ pub async fn spawn_named(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(body): Json<SpawnNamedRequest>,
-) -> Result<impl IntoResponse, SupervisorError> {
+) -> Result<Response, SupervisorError> {
     // Validate name
     let name = body.name.trim().to_string();
     if name.is_empty() {
@@ -5099,12 +6403,17 @@ pub async fn spawn_named(
     // Linux spawn with no display can only end in `no_display` too (plan
     // `2026-09-23-conductor-e2e-phase1-defects`, S-3). Refuse before a
     // `rebuild: true` build rather than after it; the spawn path's
-    // post-forwarder check stays the final authority. `spawn-named` takes no
-    // `extra_env`, so nothing here can supply DISPLAY that way.
+    // post-forwarder check stays the final authority. A `DISPLAY` in the
+    // request's `extra_env` satisfies it, exactly as for spawn-test.
+    if let Some(conflict) =
+        fresh_device_identity_conflict(body.fresh_device_identity, None, &body.extra_env)
+    {
+        return Ok((axum::http::StatusCode::BAD_REQUEST, Json(conflict)).into_response());
+    }
     if let Some(refusal) = crate::process::env_forwarders::display_preflight_refusal(
         cfg!(target_os = "linux"),
         "spawn-named",
-        &std::collections::HashMap::new(),
+        &body.extra_env,
         |k| std::env::var(k).ok(),
         state.config.temp_runner_display.as_deref(),
     ) {
@@ -5121,6 +6430,7 @@ pub async fn spawn_named(
             runners.values().map(|r| r.config.port).collect();
         let port = match body.port {
             Some(p) => {
+                refuse_reserved_non_primary_port(p)?;
                 if used_ports.contains(&p) {
                     return Err(SupervisorError::Validation(format!(
                         "Port {} is already in use",
@@ -5166,7 +6476,8 @@ pub async fn spawn_named(
             restate_service_port: resolved.service_port,
             external_restate_admin_url: resolved.external_admin_url,
             external_restate_ingress_url: resolved.external_ingress_url,
-            extra_env: Default::default(),
+            extra_env: body.extra_env.clone(),
+            fresh_device_identity: body.fresh_device_identity,
         };
         let managed = Arc::new(ManagedRunner::new_with_log_dir(
             runner_config,
@@ -5177,21 +6488,124 @@ pub async fn spawn_named(
         (id, port, managed)
     };
 
+    // Everything after the reservation runs on its own task, from the dev-action mint
+    // (a coord fetch, so a window a client can hang up in) through the build, the
+    // start, the health wait, the `DistMissing` teardown and the recorded verdict. A
+    // client that hangs up (dropping this future) changes nothing about what happens
+    // to the runner or to its action; one that stays sees exactly the response it
+    // always did.
+    let (status, resp) = manager::run_detached(spawn_named_after_reservation(
+        state,
+        Arc::new(body),
+        name,
+        id,
+        port,
+        managed,
+        no_wait,
+    ))
+    .await?;
+    let frontend_stale = resp
+        .get("frontend_stale")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut response = (status, Json(resp)).into_response();
+    if status == axum::http::StatusCode::OK && frontend_stale {
+        response
+            .headers_mut()
+            .insert("X-Frontend-Stale", "1".parse().unwrap());
+    }
+    Ok(response)
+}
+
+/// What a spawn-named does once its placeholder holds the port, on the task
+/// [`spawn_named`] detaches it onto: stamp the requester, mint the dev-action, run
+/// [`spawn_named_inner`], record the terminal result and render the body. Always
+/// `Ok`: a failed spawn is a status and a body, stamped with its action like a
+/// successful one, so the caller can reach the verdict.
+async fn spawn_named_after_reservation(
+    state: SharedState,
+    body: Arc<SpawnNamedRequest>,
+    name: String,
+    id: String,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
     // friction-1: stamp the owning requester (mirror of spawn_test).
     if body.requester_id.is_some() {
         *managed.requester_id.write().await = body.requester_id.clone();
     }
 
     // Mint a `spawn`-kind dev-action snapshot for the named runner (same shape
-    // as spawn-test). Stamped into the success response below.
-    let (action_id, action_states_active, action_predicted, action_risk) = mint_spawn_action(
+    // as spawn-test). Stamped into the response below, failed or not.
+    let minted = mint_spawn_action(
         &state,
         format!("named={};rebuild={}", name, body.rebuild),
         body.requester_id.clone(),
         managed.clone(),
     )
     .await;
-    let action_risk_json = spawn_risk_ack_json(&action_risk);
+    let action_id = minted.record.action_id;
+    // The guard records the action abandoned if this task is dropped or panics
+    // before the verdict below; a client hanging up does not drop it.
+    let run_guard = RunResultGuard::arm(minted.record.clone(), "spawn-named's detached task");
+
+    let mut answered_at = None;
+    let result = spawn_named_inner(
+        state.clone(),
+        &body,
+        &name,
+        &id,
+        port,
+        managed.clone(),
+        no_wait,
+        action_id,
+        &mut answered_at,
+    )
+    .await;
+    // The one chokepoint of a spawn-named's terminal result, read before an
+    // `Err` is rendered to a body.
+    record_start_verdict(
+        &state,
+        &id,
+        crate::dev_action::held_to_own_boot(
+            &state,
+            &id,
+            action_id,
+            spawn_run_result(&result),
+            // As at spawn-test's door: with no date, this chokepoint's.
+            answered_at.unwrap_or_else(chrono::Utc::now),
+        )
+        .await,
+        run_guard,
+    );
+
+    let (status, resp) = match result {
+        Ok(ok) => ok,
+        Err(e) => e.to_status_body(),
+    };
+    // Dev-action snapshot fields (in-place ACK enrichment per §6.1), on a
+    // failed response too, so its caller can reach the verdict.
+    Ok((status, minted.stamp(resp)))
+}
+
+/// spawn-named from "Item A" on: build, start, wait, assemble. Returns the
+/// `(status, body)` [`spawn_run_result`] maps, so the handler records the
+/// spawn's terminal result before it renders an `Err`.
+#[allow(clippy::too_many_arguments)]
+async fn spawn_named_inner(
+    state: SharedState,
+    body: &SpawnNamedRequest,
+    name: &str,
+    id: &str,
+    port: u16,
+    managed: Arc<ManagedRunner>,
+    no_wait: bool,
+    action_id: uuid::Uuid,
+    answered_at: &mut Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<(axum::http::StatusCode, serde_json::Value), SupervisorError> {
+    let name = name.to_string();
+    let id = id.to_string();
 
     // Item A — build_result tracking (mirror of spawn_test).
     let mut build_attempted = false;
@@ -5318,10 +6732,21 @@ pub async fn spawn_named(
     // non-pool artifact instead of refusing it — and the response says so.
     *managed.allow_unverified_exe.write().await = body.allow_stale_fallback;
 
-    // Start the runner using the Arc captured at insertion time (race-free
-    // — no re-lookup of `id` which could fail transiently under concurrent
-    // load).
-    if let Err(e) = manager::start_managed_runner(&state, &managed).await {
+    // This whole function runs on the task [`spawn_named`] detaches
+    // ([`spawn_named_after_reservation`]), so the start, its settings row and the
+    // health wait below all outlive a client that hangs up: a live named runner with
+    // no row would not survive a supervisor restart.
+    //
+    // Start the runner using the Arc captured at insertion time (race-free — no
+    // re-lookup of `id` which could fail transiently under concurrent load).
+    if let Err(e) = manager::start_managed_runner(
+        &state,
+        &managed,
+        Some(action_id),
+        manager::StartAs::Registered,
+    )
+    .await
+    {
         let mut runners = state.runners.write().await;
         runners.remove(&id);
         return Err(e);
@@ -5366,7 +6791,7 @@ pub async fn spawn_named(
         let timeout = std::time::Duration::from_secs(body.wait_timeout_secs);
         let poll_interval = std::time::Duration::from_secs(2);
         let start = std::time::Instant::now();
-        let health_url = format!("http://localhost:{}/health", port);
+        let health_url = format!("{}/health", runner_loopback_base(port));
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(3))
             .build()
@@ -5405,6 +6830,7 @@ pub async fn spawn_named(
             match client.get(&health_url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     healthy = true;
+                    answered_at.get_or_insert_with(chrono::Utc::now);
                     wait_ms = start.elapsed().as_millis() as u64;
                     state
                         .logs
@@ -5428,25 +6854,34 @@ pub async fn spawn_named(
         .and_then(|p| crate::process::manager::binary_meta(&p));
 
     // spawn-named has no provenance selectors — it always builds the live
-    // tree, so the live tree IS the built tree here.
+    // tree, so the live tree IS the built tree here. As at spawn-test, a
+    // build that failed into the stale fallback reuses a previous build's
+    // exe, which no tree on disk speaks for: only the slot's flag is read.
+    let checked_tree = if build_reused_stale {
+        None
+    } else {
+        state.config.project_dir.parent().map(CheckedTree::Live)
+    };
     let (frontend_stale, stale_reason, stale_slot_id) =
-        resolve_frontend_stale_for_spawn(&state, state.config.project_dir.parent()).await;
+        resolve_frontend_stale_for_spawn(&state, checked_tree.map(CheckedTree::root)).await;
 
-    // DistMissing hard-fail (symmetric with spawn_test). A missing
+    // The unconditional refusals, symmetric with spawn_test
+    // (`FrontendStaleReason::refuses_unconditionally`). A missing
     // `dist/index.html` means the runner embeds NO frontend and serves a
-    // blank screen (`asset not found: index.html`) at every route — never a
+    // blank screen (`asset not found: index.html`) at every route, and a
+    // removed tree means nobody can say which frontend it embeds — never a
     // `healthy` outcome. Unlike `SrcDrift`/`BuildFailed` (stale-but-
-    // functional), this is unconditional. Tear the named runner back down
-    // (stop, drop from the registry, AND remove the just-persisted settings
-    // entry so it doesn't resurrect on the next supervisor restart) and
-    // return 503 instead of reporting a blank UI as healthy.
-    if frontend_stale && matches!(stale_reason, Some(FrontendStaleReason::DistMissing)) {
+    // functional), these do not wait for an opt-in. Tear the named runner
+    // back down (stop, drop from the registry, AND remove the just-persisted
+    // settings entry so it doesn't resurrect on the next supervisor restart)
+    // and return 503 instead of reporting it as healthy.
+    if let Some(reason) = stale_reason.filter(|reason| reason.refuses_unconditionally()) {
         // `force: true`: a NAMED runner, so the gate would otherwise apply —
         // but this is the teardown of a runner spawned moments ago that we are
-        // refusing to hand back because it embeds no frontend. It has never
-        // hosted a session, and leaving it running while also returning 503
-        // would leak it.
-        let _ = manager::stop_runner_by_id(&state, &id, true).await;
+        // refusing to hand back because of its frontend. It has never hosted
+        // a session, and leaving it running while also returning 503 would
+        // leak it.
+        let _ = manager::stop_runner_by_id(&state, &id, true, manager::CloseIntent::Kill).await;
         {
             let mut runners = state.runners.write().await;
             runners.remove(&id);
@@ -5454,18 +6889,10 @@ pub async fn spawn_named(
         let settings_path = settings::settings_path(&state.config);
         settings::remove_runner(&settings_path, &id);
         state.notify_health_change();
-        let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
-        let body = json!({
-            "error": "frontend_dist_missing",
-            "message": "frontend_dist_missing: refusing to spawn — qontinui-runner/dist/index.html \
-                is missing, so the runner would embed no frontend and serve a blank screen \
-                (`asset not found: index.html`) at every route. Run \
-                `cd qontinui-runner && npm run build` to rebuild dist/, then retry.",
-            "frontend_stale": true,
-            "frontend_stale_reason": reason_str,
-            "stale_slot_id": stale_slot_id,
-        });
-        return Ok((axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response());
+        return Ok((
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            frontend_refusal_body(reason, stale_slot_id, checked_tree),
+        ));
     }
 
     // Item A: assemble build_result alongside the existing top-level
@@ -5487,14 +6914,15 @@ pub async fn spawn_named(
         "port": port,
         "status": if body.wait { if healthy { "healthy" } else { "timeout" } } else { "started" },
         "wait_ms": wait_ms,
-        "api_url": format!("http://localhost:{}", port),
-        "ui_bridge_url": format!("http://localhost:{}/ui-bridge", port),
+        "api_url": runner_loopback_base(port),
+        "ui_bridge_url": runner_ui_bridge_base(port),
         "logs_url": format!("/runners/{}/logs", id),
         "logs_stream_url": format!("/runners/{}/logs/stream", id),
         "build_result": build_result,
         // Which artifact was launched and which resolution rung produced it —
         // same shape as spawn-test (`source_exe_json`).
         "source_exe": source_exe_json(&managed).await,
+        "instance_root": instance_root_json(&id),
         "message": if body.wait && healthy {
             format!("Named runner '{}' ready on port {} ({}ms)", name, port, wait_ms)
         } else if body.wait {
@@ -5507,13 +6935,12 @@ pub async fn spawn_named(
         resp["binary_mtime"] = json!(meta.binary_mtime);
         resp["binary_size_bytes"] = json!(meta.binary_size_bytes);
     }
-    // Dev-action snapshot fields (in-place ACK enrichment per §6.1).
-    resp["action_id"] = json!(action_id.to_string());
-    resp["states_active"] = json!(action_states_active);
-    resp["predicted"] = json!(action_predicted);
-    resp["risk"] = action_risk_json;
-    resp["outcome_url"] = json!(format!("/actions/{}/outcome", action_id));
-
+    // Phase 8b: the device id the runner minted (or `pending` before its
+    // first start reaches `ensure_device_initialized` — `GET /runners`
+    // re-reads it). Flagged runners only.
+    if body.fresh_device_identity {
+        resp["device_identity"] = device_identity_report(&id);
+    }
     // Symmetric with spawn_test: always emit `frontend_stale`, plus a
     // diagnostic `frontend_stale_reason` when set. (Named runners don't get
     // the `frontend_strict` opt-out yet — they're long-lived, so callers who
@@ -5522,28 +6949,12 @@ pub async fn spawn_named(
     if frontend_stale {
         let reason_str = stale_reason.map(|r| r.as_str()).unwrap_or("unknown");
         resp["frontend_stale_reason"] = json!(reason_str);
-        let stale_msg = match stale_reason {
-            Some(FrontendStaleReason::BuildFailed) => match stale_slot_id {
-                Some(sid) => format!(
-                    "frontend_stale: slot {} embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.",
-                    sid
-                ),
-                None => "frontend_stale: the active build slot embeds a stale dist/ because the most recent `npm run build` failed. Fix tsc errors and rebuild to refresh.".to_string(),
-            },
-            Some(FrontendStaleReason::SrcDrift) => "frontend_stale: src/**/*.{ts,tsx,css,json,html} is newer than dist/index.html — the runner embeds a UI that doesn't reflect current source. Run `cd qontinui-runner && npm run build` to refresh.".to_string(),
-            Some(FrontendStaleReason::DistMissing) => "frontend_stale: dist/index.html is missing — likely a concurrent external `npm run build` wiped dist/, or an npm-exit-0 empty-output regression. Run `cd qontinui-runner && npm run build` to rebuild.".to_string(),
-            None => "frontend_stale: the runner may embed a stale frontend dist (reason unavailable).".to_string(),
-        };
-        resp["warnings"] = json!([stale_msg]);
-
-        let mut response = (axum::http::StatusCode::OK, Json(resp)).into_response();
-        response
-            .headers_mut()
-            .insert("X-Frontend-Stale", "1".parse().unwrap());
-        return Ok(response);
+        resp["warnings"] = json!([frontend_stale_warning(stale_reason, stale_slot_id)]);
+        // The handler adds the `X-Frontend-Stale: 1` header for this body.
+        return Ok((axum::http::StatusCode::OK, resp));
     }
 
-    Ok(Json(resp).into_response())
+    Ok((axum::http::StatusCode::OK, resp))
 }
 
 // --- Build pool visibility ---
@@ -5648,6 +7059,10 @@ pub async fn list_builds(
             // Inline ~1 KiB tail of the most recent FAILED build's stderr.
             // Cleared on subsequent success. Full log: GET /builds/{id}/log.
             "last_error_log": history_snapshot.last_error_log,
+            // Pre-permit memory-gate outcome of the last build to claim this
+            // slot — `proceeded_after_wait` marks a build that ran because the
+            // gate's wait expired (fail-open), not because headroom was there.
+            "last_mem_gate": history_snapshot.last_mem_gate,
         });
 
         let (slot_git_sha, slot_source) = match provenance_by_slot.get(&slot.id) {
@@ -5673,6 +7088,7 @@ pub async fn list_builds(
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "mem_gate": i.mem_gate,
                 }));
                 json!({
                     "id": slot.id,
@@ -5682,6 +7098,7 @@ pub async fn list_builds(
                     "elapsed_secs": elapsed,
                     "requester_id": i.requester_id,
                     "rebuild_kind": i.rebuild_kind,
+                    "mem_gate": i.mem_gate,
                     "frontend_stale": frontend_stale,
                     "git_sha": slot_git_sha,
                     "source": slot_source,
@@ -5950,9 +7367,10 @@ pub async fn list_builds(
 
 #[derive(Deserialize, Default)]
 pub struct PruneSpawnQuery {
-    /// Retention window override in hours. A container is prunable once its
-    /// mtime is older than this (dirty registered worktrees need DOUBLE). When
-    /// omitted, the engine resolves the window from
+    /// Retention window override in hours. A container is prunable once it
+    /// was last used longer ago than this (its mtime, which `prepare_worktree`
+    /// stamps on every use; dirty registered worktrees need DOUBLE) and no
+    /// build holds it. When omitted, the engine resolves the window from
     /// `QONTINUI_SPAWN_WORKTREE_RETENTION_HOURS` / its 48h default.
     #[serde(default)]
     pub older_than_hours: Option<u64>,
@@ -5963,10 +7381,13 @@ pub struct PruneSpawnQuery {
 ///
 /// Thin wrapper over the existing engine
 /// [`crate::spawn_worktree::prune_spawn_worktrees_with_window`]. The engine
-/// owns ALL selection + safety (prefix-under-root filter, active-build
-/// exclusion, age + dirty double-retention). This handler only:
-///   1. passes the LIVE active-container set from state (same source the
-///      opportunistic sweep uses),
+/// owns ALL selection + safety (prefix-under-root filter, the in-use
+/// exclusion, last-use age + dirty double-retention). This handler only:
+///   1. runs it through `SupervisorState::sweep_spawn_worktrees`, on a task of
+///      its own and with the supervisor's container locks, so a container a
+///      build holds is kept as in use — even under `older_than_hours=0`, which
+///      otherwise prunes every container at once — and a client that hangs up
+///      mid-sweep cannot cut a removal short,
 ///   2. forwards the optional `older_than_hours` window override,
 ///   3. measures container sizes BEFORE the delete so it can report
 ///      `bytes_freed`,
@@ -5999,17 +7420,10 @@ pub async fn prune_spawn_worktrees_endpoint(
             Err(_) => std::collections::HashMap::new(),
         };
 
-    // Live active-build container set — mirror the opportunistic sweep.
-    let active_now: std::collections::HashSet<std::path::PathBuf> =
-        state.active_spawn_worktrees.lock().unwrap().clone();
-
-    let report = crate::spawn_worktree::prune_spawn_worktrees_with_window(
-        &state.config.project_dir,
-        &active_now,
-        std::time::SystemTime::now(),
-        query.older_than_hours,
-    )
-    .await;
+    // On a task of its own: a client that hangs up mid-sweep drops only its
+    // wait, so the sweep holds each container's lock until that container's
+    // removal is done (`SupervisorState::sweep_spawn_worktrees`).
+    let report = state.sweep_spawn_worktrees(query.older_than_hours).await;
 
     let bytes_freed: u64 = report
         .removed
@@ -6673,9 +8087,16 @@ pub async fn runner_early_log(
                 axum::http::StatusCode::NOT_FOUND,
                 Json(json!({
                     "error": "early_log_unavailable",
-                    "reason": format!("file not found at {}", path.display()),
+                    "reason": format!(
+                        "file not found at {} (the max-age sweep prunes an early log once it has not been \
+                         written for {} s, unless it belongs to a spawn the supervisor still \
+                         tracks as live)",
+                        path.display(),
+                        crate::process::early_log::EARLY_LOG_RETENTION.as_secs()
+                    ),
                     "runner_id": id,
                     "path": path.to_string_lossy(),
+                    "retention_secs": crate::process::early_log::EARLY_LOG_RETENTION.as_secs(),
                 })),
             )
                 .into_response();
@@ -6812,31 +8233,25 @@ pub async fn runner_crash_summary(
             .join("\n")
     };
 
-    // Compose `panic_excerpt`: read <panic_log_dir>/runner-last-panic.txt if present.
-    let panic_excerpt: Option<String> = match snapshot.panic_log_dir.as_ref() {
-        Some(dir) => {
-            let path = dir.join("runner-last-panic.txt");
-            match tokio::fs::read_to_string(&path).await {
-                Ok(s) => {
-                    if s.len() > CRASH_SUMMARY_PANIC_EXCERPT_CAP {
-                        // Take the last cap bytes, snapping forward to a UTF-8
-                        // boundary so JSON serialization can't fail mid-codepoint.
-                        let want_start = s.len() - CRASH_SUMMARY_PANIC_EXCERPT_CAP;
-                        let snap = s
-                            .char_indices()
-                            .find(|(i, _)| *i >= want_start)
-                            .map(|(i, _)| i)
-                            .unwrap_or(s.len());
-                        Some(s[snap..].to_string())
-                    } else {
-                        Some(s)
-                    }
-                }
-                Err(_) => None,
-            }
-        }
-        None => None,
+    // Compose `panic_excerpt`: the `runner-last-panic.txt` text captured when
+    // the snapshot was taken, else a read of <panic_log_dir> now. The capture is
+    // what survives teardown: a non-primary runner's log dir lies inside its
+    // instance root, which is removed right after the snapshot.
+    let panic_text: Option<String> = match snapshot.last_panic_text.clone() {
+        Some(text) => Some(text),
+        None => match snapshot.panic_log_dir.as_ref() {
+            Some(dir) => tokio::fs::read_to_string(dir.join("runner-last-panic.txt"))
+                .await
+                .ok(),
+            None => None,
+        },
     };
+    // Take the last cap bytes, snapping forward to a UTF-8 boundary so JSON
+    // serialization can't fail mid-codepoint.
+    let panic_excerpt: Option<String> = panic_text.map(|s| {
+        crate::process::stopped_cache::tail_on_char_boundary(&s, CRASH_SUMMARY_PANIC_EXCERPT_CAP)
+            .to_string()
+    });
 
     // duration_alive_ms = stopped_at - started_at (when both available).
     let duration_alive_ms: Option<i64> = snapshot.started_at.map(|started| {
@@ -6860,6 +8275,13 @@ pub async fn runner_crash_summary(
         "stop_reason": stop_reason,
         "last_phase_log": last_phase_log,
         "panic_excerpt": panic_excerpt,
+        // Only an exit-78 refusal is explained by it; any other exit would be
+        // pinned on a stale line from an earlier launch.
+        "startup_refusal": if snapshot.exit_code == Some(78) {
+            snapshot.startup_refusal.clone()
+        } else {
+            None
+        },
         "early_log_path": snapshot.early_log_path.as_ref().map(|p| p.to_string_lossy().into_owned()),
     }))
     .into_response()
@@ -7041,2444 +8463,4 @@ pub async fn clear_test_login(State(state): State<SharedState>) -> impl IntoResp
 }
 
 #[cfg(test)]
-mod tests {
-    //! Regression tests for `check_dist_freshness` and the
-    //! `FrontendStaleReason` wire format. The motivating bug
-    //! (`supervisor-frontend-build-silent-success.md`) was that the old
-    //! `check_src_newer_than_dist` returned `false` (= "not stale") on a
-    //! missing `dist/index.html`, exactly the case the gate was supposed
-    //! to catch. These tests pin the new contract: missing dist surfaces
-    //! as `Some(DistMissing)`, src drift as `Some(SrcDrift)`, healthy
-    //! state as `None`.
-    use super::{
-        attach_build_slot_id, attach_spawn_identity, check_dist_freshness, spawn_abandoned_body,
-        wait_out_queue_timeout, FrontendStaleReason,
-    };
-    use crate::build_monitor::BuildPhase;
-    use std::fs;
-    use std::sync::atomic::AtomicU8;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    /// Walk every `.rs` file under `src/`, returning `(path, line_no, line)` for
-    /// each PRODUCTION line matching `pred`.
-    ///
-    /// "Production" = everything before the file's first `#[cfg(test)] mod`,
-    /// and never a `//` / `///` line. Test modules legitimately build fixture
-    /// ids from ports, and the doc comments deliberately quote the old form to
-    /// explain why it is gone — neither reaches a spawn.
-    ///
-    /// **The cut is anchored on the test MODULE, not the bare attribute.**
-    /// `#[cfg(test)]` also decorates test-only *helper items* at column 0, and
-    /// cutting at the first one discards every real function after it. Measured
-    /// on this tree, `"\n#[cfg(test)]\n"` cut `process/manager.rs` at line 455
-    /// (its `#[cfg(test)] pub fn read_slot_sha`) instead of 4448 and
-    /// `build_monitor.rs` at 2179 instead of 3732 — hiding 21,654 of 65,665
-    /// `src/` lines, including `reap_stale_test_runners`, `start_managed_runner`
-    /// and `apply_non_primary_instance_env`, i.e. the exact function this branch
-    /// extracted to hold `QONTINUI_INSTANCE_NAME`. A false NEGATIVE, and
-    /// invisible: the guard still passed.
-    ///
-    /// It must be `mod ` and not `mod tests`: `supervisor_bridge.rs` alone has
-    /// five named test modules (`mod heartbeat_body_tests`, …).
-    ///
-    /// **Line endings are normalized to LF before the split.**
-    /// `fs::read_to_string` does no newline translation, so on a CRLF checkout
-    /// (this repo's default working-copy state — `git` normalizes to LF only on
-    /// commit) a marker written as `"\n#[cfg(test)]\n"` never matches, the
-    /// split silently falls through to "whole file", and every test module in
-    /// the tree gets scanned as if it were production. That is a false POSITIVE
-    /// here, but the same mistake in a guard whose default is "skip" would be a
-    /// silent false negative — so normalize rather than rely on the checkout.
-    fn scan_production_lines(
-        pred: impl Fn(&str) -> bool,
-    ) -> Vec<(std::path::PathBuf, usize, String)> {
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
-
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        assert!(
-            files.len() > 20,
-            "the source walk found only {} files under {src:?} — it is not scanning the tree, \
-             so this guard would pass vacuously",
-            files.len()
-        );
-
-        // Anti-vacuity canary. `process/manager.rs` is the largest production
-        // file and the one most likely to grow a spawn path; it is also the file
-        // the bare-attribute split truncated to 455 lines. If the split ever
-        // regresses, its scanned span collapses and this fires — the coverage
-        // loss cannot go silent again. The floor is well under the real span
-        // (~4.4k) so ordinary edits do not trip it.
-        const CANARY: &str = "manager.rs";
-        const CANARY_MIN_PRODUCTION_LINES: usize = 3000;
-        let mut canary_lines = 0usize;
-
-        let mut hits = Vec::new();
-        for path in files {
-            // A file we cannot read must fail loudly, not skip: a silent skip
-            // lets the guard rot into a no-op.
-            let text = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("spawn-site guard could not read {path:?}: {e}"))
-                .replace("\r\n", "\n");
-            let prod = text
-                .split_once("\n#[cfg(test)]\nmod ")
-                .map(|(before, _)| before)
-                .unwrap_or(&text);
-            if path.ends_with(CANARY) {
-                canary_lines = prod.lines().count();
-            }
-            for (i, line) in prod.lines().enumerate() {
-                let l = line.trim();
-                if l.starts_with("//") {
-                    continue;
-                }
-                if pred(l) {
-                    hits.push((path.clone(), i + 1, l.to_string()));
-                }
-            }
-        }
-
-        assert!(
-            canary_lines >= CANARY_MIN_PRODUCTION_LINES,
-            "the production span of {CANARY} scanned as only {canary_lines} lines (floor \
-             {CANARY_MIN_PRODUCTION_LINES}). The `#[cfg(test)] mod` cut has regressed — most \
-             likely back to the bare `#[cfg(test)]` attribute, which stops at the first \
-             test-only helper item and hides thousands of production lines from every \
-             predicate this scanner runs."
-        );
-
-        hits
-    }
-
-    /// No spawn site anywhere in `src/` may mint a temp runner's instance name
-    /// or id from its PORT.
-    ///
-    /// The env-block assertion in
-    /// `process::manager::tests::non_primary_env_block_keys_instance_name_per_spawn_not_per_port`
-    /// builds its fixture THROUGH [`crate::process::temp_runner_instance_name`], so it
-    /// pins the helper — not the call site's use of it. This test is the only
-    /// thing tying `spawn_test` to the helper, so it is deliberately
-    /// spelling-agnostic and repo-wide:
-    ///
-    /// - **Normalized match, not one literal.** Any production line containing
-    ///   both `"test-{` and `port` is rejected. That covers the original
-    ///   `format!("test-{}", port)`, the inline-capture `format!("test-{port}")`
-    ///   — which is the form a future author is most likely to reach for, since
-    ///   it is the form this file's own rustdoc and tests use — and the
-    ///   `managed.config.port` / `body.port` spellings.
-    /// - **Whole `src/` tree**, not just this file, so a spawn path added in a
-    ///   new module is covered too (the same gap
-    ///   `process::claude_env`'s `KNOWN_SPAWN_SITE_FILES` documents about
-    ///   itself).
-    /// - **Plus a positive assertion** that `spawn_test`'s body still calls
-    ///   `temp_runner_instance_name(&id)`. A negative grep alone would pass if
-    ///   someone deleted the mint entirely, or routed it through a third,
-    ///   port-derived helper whose name happens not to match.
-    #[test]
-    fn no_spawn_site_mints_a_port_derived_instance_name() {
-        // Assembled at runtime so this line does not contain the needle and
-        // self-flag. (It sits inside `mod tests` and is excluded by the
-        // `#[cfg(test)]` split anyway — but only while that split works, and a
-        // guard that depends on its own exclusion to pass is one checkout
-        // setting away from crying wolf. Belt and braces.)
-        let needle = format!("{}{}", "\"test-", '{');
-        let offenders =
-            scan_production_lines(|l| l.contains(needle.as_str()) && l.contains("port"));
-
-        assert!(
-            offenders.is_empty(),
-            "a temp runner's name/id must never be derived from its port — ports 9877-9899 \
-             are recycled, so the second spawn on a port inherits the first's \
-             instance-<name> app-data tree (terminal-sessions.json included). Route it \
-             through `temp_runner_instance_name(&id)` instead. Offending lines: {offenders:#?}"
-        );
-
-        // Positive half: `spawn_test` must still route through the helper.
-        let this_file = fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("routes")
-                .join("runners.rs"),
-        )
-        .expect("this source file must be readable")
-        .replace("\r\n", "\n");
-        let spawn_test_body = this_file
-            .split_once("pub async fn spawn_test(")
-            .map(|(_, after)| after)
-            .expect("spawn_test must exist — did it get renamed?");
-        // Bound the search to spawn_test itself, not the whole rest of the file:
-        // cut at whichever top-level `fn` comes first, so a match in a LATER
-        // function can never satisfy this assertion.
-        let spawn_test_body = ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
-            .iter()
-            .filter_map(|marker| spawn_test_body.find(marker))
-            .min()
-            .map(|end| &spawn_test_body[..end])
-            .unwrap_or(spawn_test_body);
-        assert!(
-            spawn_test_body.contains("temp_runner_instance_name(&id)"),
-            "spawn_test no longer mints its instance name via \
-             `temp_runner_instance_name(&id)`. That helper is what keeps \
-             QONTINUI_INSTANCE_NAME in lockstep with the per-spawn runner id; a call site \
-             that stops using it re-opens the port-recycling inheritance even if the \
-             negative grep above still passes."
-        );
-    }
-
-    /// HEADLINE regression (2026-08-03): `queue_timeout_secs` must stop
-    /// counting once the build holds its slot and is compiling. Before this,
-    /// the bound wrapped the whole build future, so a caller who passed a
-    /// small bound to avoid queueing got a 504 that ALSO abandoned a live
-    /// compile.
-    #[tokio::test]
-    async fn queue_timeout_never_fires_once_the_build_is_compiling() {
-        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
-        // The build acquires its permit and starts compiling almost at once.
-        BuildPhase::Compiling.store(&marker);
-
-        let fired = tokio::time::timeout(
-            Duration::from_millis(900),
-            wait_out_queue_timeout(Duration::from_millis(100), marker),
-        )
-        .await;
-        assert!(
-            fired.is_err(),
-            "the queue watcher fired against a COMPILING build — that 504s a live compile"
-        );
-    }
-
-    /// The other half: while the request really is queued, the bound still
-    /// fires, and it names the phase that was blocking.
-    #[tokio::test]
-    async fn queue_timeout_still_fires_while_actually_queued() {
-        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingSlot.as_u8()));
-        // Give-up budget on "the queue watcher fires at all", not a speed
-        // assertion — it returns the instant the watcher does.
-        let phase = tokio::time::timeout(
-            crate::test_clock::poll_budget(Duration::from_secs(30)),
-            wait_out_queue_timeout(Duration::from_millis(150), marker),
-        )
-        .await
-        .expect("a genuinely queued request must still time out");
-        assert_eq!(phase, BuildPhase::AwaitingSlot);
-    }
-
-    /// A build blocked on the serialized frontend (pnpm) lock is still queued
-    /// — no work of its own is happening — so the bound applies there too, and
-    /// the reported phase distinguishes it from cargo-slot exhaustion.
-    #[tokio::test]
-    async fn queue_timeout_covers_the_frontend_lock_wait() {
-        let marker = Arc::new(AtomicU8::new(BuildPhase::AwaitingNpmLock.as_u8()));
-        // Give-up budget, same reasoning as the test above.
-        let phase = tokio::time::timeout(
-            crate::test_clock::poll_budget(Duration::from_secs(30)),
-            wait_out_queue_timeout(Duration::from_millis(150), marker),
-        )
-        .await
-        .expect("a frontend-lock wait is still a queue wait");
-        assert_eq!(phase, BuildPhase::AwaitingNpmLock);
-    }
-
-    /// A FAILED spawn-test build that had already claimed a slot must still
-    /// report `build_slot_id` on the error body.
-    ///
-    /// The regression: the `Err` arm reads the slot off the `BuildAttempt`, but
-    /// then `return Err(e)`s, and `SupervisorError::to_status_body()` renders a
-    /// canonical `{"error": …}` that knows nothing about slots. So attribution
-    /// vanished exactly when it matters most — the build claimed slot N, ran the
-    /// cleanup pass over slot N (reaping whatever the harness had planted
-    /// there), and then cargo failed. Without the merge, a harness reading the
-    /// response cannot say which slot's probe its own build was responsible for.
-    #[test]
-    fn error_body_carries_the_claimed_build_slot_id() {
-        let mut body = serde_json::json!({ "error": "cargo build failed" });
-        attach_build_slot_id(&mut body, Some(1));
-        assert_eq!(body["build_slot_id"], serde_json::json!(1));
-        // The canonical error text is preserved, not replaced.
-        assert_eq!(body["error"], serde_json::json!("cargo build failed"));
-    }
-
-    /// The key is ALWAYS present, `null` included, so a caller can read
-    /// `build_slot_id` unconditionally on success and failure alike instead of
-    /// having to distinguish "absent" from "no slot claimed".
-    #[test]
-    fn error_body_carries_a_null_build_slot_id_when_no_slot_was_claimed() {
-        let mut body = serde_json::json!({ "error": "build_pool_full" });
-        attach_build_slot_id(&mut body, None);
-        assert!(
-            body.as_object().unwrap().contains_key("build_slot_id"),
-            "{body}"
-        );
-        assert_eq!(body["build_slot_id"], serde_json::Value::Null);
-    }
-
-    // ---------------------------------------------------------------------
-    // Regression: "a caller receives no answer, or a confidently useless one"
-    //
-    // `POST /runners/spawn-test` reserves the runner id and port BEFORE the
-    // (20-50 minute) build starts, but on the synchronous path it wrote nothing
-    // until the build was terminal. Two failures fell out of that:
-    //
-    //   * a supervisor restart mid-build closed the connection with no response
-    //     at all (`curl` reports `HTTP=000`), and
-    //   * every non-success body rendered from a `SupervisorError` named the
-    //     error and nothing else,
-    //
-    // so in both cases the caller could not learn the id of the runner it had
-    // just created — and the id is the only handle on `/runners/{id}/logs` and
-    // `/runners/{id}/stop`. These pin the contract: EVERY outcome names the
-    // runner, and "abandoned" is distinguishable from both "failed" and
-    // "succeeded".
-    // ---------------------------------------------------------------------
-
-    /// The canonical `SupervisorError` body carries `{"error": …}` and nothing
-    /// else. After the merge it must still name the runner that was reserved.
-    #[test]
-    fn spawn_error_body_names_the_runner_it_reserved() {
-        let mut body = serde_json::json!({ "error": "cargo build failed" });
-        attach_spawn_identity(&mut body, "test-abc123", 9878);
-
-        assert_eq!(body["id"], serde_json::json!("test-abc123"));
-        assert_eq!(body["port"], serde_json::json!(9878));
-        assert_eq!(body["api_url"], serde_json::json!("http://localhost:9878"));
-        // The two URLs a caller needs to follow and clean up its own runner.
-        assert_eq!(
-            body["logs_url"],
-            serde_json::json!("/runners/test-abc123/logs")
-        );
-        assert_eq!(
-            body["stop_url"],
-            serde_json::json!("/runners/test-abc123/stop")
-        );
-        // The original diagnosis is preserved, not replaced.
-        assert_eq!(body["error"], serde_json::json!("cargo build failed"));
-    }
-
-    /// The reservation is authoritative. A body that somehow disagrees with it
-    /// is corrected rather than trusted — a response naming a DIFFERENT runner
-    /// than the one reserved is the "confidently useless answer" failure mode,
-    /// which is worse than no answer.
-    #[test]
-    fn spawn_identity_is_authoritative_over_the_body_it_merges_into() {
-        let mut body = serde_json::json!({ "id": "stale-id", "port": 1234, "status": "healthy" });
-        attach_spawn_identity(&mut body, "test-real", 9880);
-
-        assert_eq!(body["id"], serde_json::json!("test-real"));
-        assert_eq!(body["port"], serde_json::json!(9880));
-        assert_eq!(body["status"], serde_json::json!("healthy"));
-    }
-
-    /// A non-object body is left alone rather than silently reshaped —
-    /// same contract as `attach_build_slot_id`.
-    #[test]
-    fn spawn_identity_leaves_a_non_object_body_alone() {
-        let mut body = serde_json::json!("not an object");
-        attach_spawn_identity(&mut body, "test-abc", 9877);
-        assert_eq!(body, serde_json::json!("not an object"));
-    }
-
-    /// The answer a synchronous caller gets when the supervisor starts shutting
-    /// down mid-build. It replaces a dropped connection (`HTTP=000`), so it has
-    /// to carry everything the caller lost: the runner id + port, the build id,
-    /// and an unambiguous "abandoned" verdict.
-    #[test]
-    fn abandoned_spawn_answer_names_the_runner_and_the_build() {
-        let submission = uuid::Uuid::new_v4();
-        let body = spawn_abandoned_body("test-1a0453e4740-2", 9879, submission);
-
-        // The handle on the runner.
-        assert_eq!(body["id"], serde_json::json!("test-1a0453e4740-2"));
-        assert_eq!(body["port"], serde_json::json!(9879));
-        assert_eq!(
-            body["logs_url"],
-            serde_json::json!("/runners/test-1a0453e4740-2/logs")
-        );
-        assert_eq!(
-            body["stop_url"],
-            serde_json::json!("/runners/test-1a0453e4740-2/stop")
-        );
-
-        // The handle on the build. `build_id` is the same token the sync body,
-        // the async 202 and `GET /build/{id}/status` all use.
-        assert_eq!(body["build_id"], serde_json::json!(submission.to_string()));
-        assert_eq!(
-            body["submission_id"],
-            serde_json::json!(submission.to_string())
-        );
-        assert_eq!(
-            body["poll_url"],
-            serde_json::json!(format!("/build/{submission}/status"))
-        );
-
-        // The verdict: not "failed", not "succeeded", and machine-readable.
-        assert_eq!(body["spawn_abandoned"], serde_json::json!(true));
-        assert_eq!(body["error"], serde_json::json!("spawn_abandoned"));
-        assert_eq!(body["status"], serde_json::json!("abandoned"));
-    }
-
-    /// Source guard: `execute_spawn_build` must merge the identity on BOTH
-    /// arms.
-    ///
-    /// The `Err` arm is the one that matters — it renders through
-    /// `SupervisorError::to_status_body()`, which knows nothing about the
-    /// reservation — but a merge on only one arm is exactly the "uniform on
-    /// some paths and not others" state this fix exists to remove, so pin both.
-    /// Mirrors the `attach_build_slot_id` contract, which was lost the same way.
-    #[test]
-    fn execute_spawn_build_attaches_identity_on_both_arms() {
-        let body = fn_source("async fn execute_spawn_build(");
-        let merges = body
-            .matches("attach_spawn_identity(&mut body, &id, port)")
-            .count();
-        assert_eq!(
-            merges, 2,
-            "execute_spawn_build must call `attach_spawn_identity` on the Ok arm AND the Err \
-             arm (found {merges}). The Err arm renders through \
-             `SupervisorError::to_status_body()`, which emits `{{\"error\": …}}` and nothing \
-             else — without the merge, a caller whose spawn FAILED cannot learn the id of the \
-             runner reserved for it, and so cannot read its logs or stop it. Body scanned:\n\
-             {body}"
-        );
-    }
-
-    /// Source guard: the SYNCHRONOUS spawn-test path must race its terminal
-    /// wait against the shutdown signal.
-    ///
-    /// A bare `await_terminal(&sub_arc).await` holds the HTTP connection open
-    /// for the whole cargo build with nothing written. Axum's graceful shutdown
-    /// drops the LISTENER immediately but waits for in-flight connections, so
-    /// during a restart that produced the reported incident: the replacement
-    /// supervisor bound the port and answered `Runner not found` from an empty
-    /// registry, while the old process stayed alive compiling, holding this
-    /// connection, addressable by nobody — and the caller got `HTTP=000` when it
-    /// was finally force-killed. The race is what turns that into an answer.
-    #[test]
-    fn sync_spawn_test_wait_is_shutdown_aware() {
-        let body = fn_source("pub async fn spawn_test(");
-        assert!(
-            body.contains("await_terminal"),
-            "spawn_test's sync path no longer awaits the submission's terminal state — did the \
-             handler get restructured? Re-point this guard at whatever replaced it."
-        );
-        assert!(
-            body.contains("state.shutdown_signal()"),
-            "spawn_test's synchronous terminal wait is not raced against \
-             `state.shutdown_signal()`. Without that race a supervisor shutdown during a \
-             20-50 minute build drops the caller's connection with no response written at all \
-             (`curl` reports HTTP=000) and the caller never learns the runner id it created. \
-             Body scanned:\n{body}"
-        );
-        assert!(
-            body.contains("spawn_abandoned_body"),
-            "spawn_test observes the shutdown but does not answer with \
-             `spawn_abandoned_body`. Detecting the shutdown and still returning nothing useful \
-             reproduces the defect in a politer form: the caller must be able to tell \
-             'abandoned' from 'failed' and from 'it worked and I was not told'."
-        );
-    }
-
-    /// S-4 at the route: the spawn path hands `paired_profile_id` to the
-    /// paired-state decision UNCONDITIONALLY (so an absent id reaches the
-    /// primary-snapshot arm, which `no_paired_profile_id_applies_the_primary_snapshot`
-    /// pins), and surfaces both new response fields. Re-wrapping the call in
-    /// `if let Some(..)` — the pre-S-4 shape, under which a default spawn came
-    /// up unpaired — fails here.
-    #[test]
-    fn spawn_path_applies_paired_state_even_without_a_profile_id() {
-        let body = fn_source("async fn execute_spawn_build_inner(");
-        assert!(
-            body.contains("apply_paired_state_for_spawn(body.paired_profile_id.as_deref(), id)"),
-            "execute_spawn_build_inner must pass the OPTIONAL paired_profile_id straight to \
-             apply_paired_state_for_spawn, so an absent id snapshots the primary"
-        );
-        assert!(
-            !body.contains("if let Some(profile_id) = body.paired_profile_id"),
-            "the paired-state copy is gated on a profile id again — a default spawn-test would \
-             come up unpaired (plan 2026-09-23-conductor-e2e-phase1-defects, S-4)"
-        );
-        assert!(body.contains("resp[\"paired_state\"]"));
-        assert!(body.contains("resp[\"coord_credential\"]"));
-    }
-
-    /// Read one function's body out of this source file, bounded at the next
-    /// top-level `fn` so a match in a LATER function can never satisfy an
-    /// assertion. Same technique as
-    /// `no_spawn_site_mints_a_port_derived_instance_name`'s positive half.
-    fn fn_source(signature: &str) -> String {
-        let this_file = fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("routes")
-                .join("runners.rs"),
-        )
-        .expect("this source file must be readable")
-        .replace("\r\n", "\n");
-        let after = this_file
-            .split_once(signature)
-            .map(|(_, after)| after)
-            .unwrap_or_else(|| panic!("`{signature}` must exist — did it get renamed?"))
-            .to_string();
-        ["\npub async fn ", "\nasync fn ", "\npub fn ", "\nfn "]
-            .iter()
-            .filter_map(|marker| after.find(marker))
-            .min()
-            .map(|end| after[..end].to_string())
-            .unwrap_or(after)
-    }
-
-    fn write_file(path: &std::path::Path, contents: &[u8]) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("mkdir parent");
-        }
-        fs::write(path, contents).expect("write file");
-    }
-
-    #[tokio::test]
-    async fn returns_dist_missing_when_dist_index_absent() {
-        // Repro of the exact silent-success bug: src/ has files but
-        // dist/index.html is gone. Old code returned false (not stale);
-        // new code must return Some(DistMissing).
-        let tmp = TempDir::new().expect("tempdir");
-        write_file(
-            &tmp.path().join("src").join("App.tsx"),
-            b"export const App = () => null;",
-        );
-
-        let result = check_dist_freshness(tmp.path()).await;
-        assert_eq!(
-            result,
-            Some(FrontendStaleReason::DistMissing),
-            "missing dist/index.html must be flagged DistMissing, not silently treated as fresh"
-        );
-    }
-
-    #[tokio::test]
-    async fn returns_dist_missing_even_when_src_tree_is_empty() {
-        // Edge case: no src files at all, no dist either. Should still
-        // flag DistMissing rather than silently returning None — a
-        // runner with no embedded frontend is broken regardless of
-        // whether src/ has anything to drift.
-        let tmp = TempDir::new().expect("tempdir");
-        let result = check_dist_freshness(tmp.path()).await;
-        assert_eq!(result, Some(FrontendStaleReason::DistMissing));
-    }
-
-    #[tokio::test]
-    async fn returns_src_drift_when_src_newer_than_dist() {
-        // Build dist first, then write src/. The src file's mtime will
-        // be at least as new as dist/index.html — sleep is enough on
-        // every supported platform to guarantee strict-newer.
-        let tmp = TempDir::new().expect("tempdir");
-        write_file(&tmp.path().join("dist").join("index.html"), b"<old/>");
-
-        // Filesystem mtime resolution can be coarse (FAT = 2s, HFS = 1s);
-        // sleep enough to clear the worst case so the assertion is
-        // deterministic.
-        std::thread::sleep(std::time::Duration::from_millis(2100));
-
-        write_file(
-            &tmp.path().join("src").join("App.tsx"),
-            b"export const App = () => 'changed';",
-        );
-
-        let result = check_dist_freshness(tmp.path()).await;
-        assert_eq!(result, Some(FrontendStaleReason::SrcDrift));
-    }
-
-    #[tokio::test]
-    async fn returns_none_when_dist_newer_than_src() {
-        // Happy path: src/ written, then dist built afterward.
-        let tmp = TempDir::new().expect("tempdir");
-        write_file(
-            &tmp.path().join("src").join("App.tsx"),
-            b"export const App = () => null;",
-        );
-
-        std::thread::sleep(std::time::Duration::from_millis(2100));
-
-        write_file(
-            &tmp.path().join("dist").join("index.html"),
-            b"<!doctype html><html/>",
-        );
-
-        let result = check_dist_freshness(tmp.path()).await;
-        assert_eq!(
-            result, None,
-            "dist newer than src is the healthy state; must not be flagged"
-        );
-    }
-
-    #[tokio::test]
-    async fn ignores_unrelated_extensions_in_src() {
-        // Touching a .md or .png in src/ shouldn't trip the drift signal —
-        // the walker only looks at .ts/.tsx/.css/.json/.html.
-        let tmp = TempDir::new().expect("tempdir");
-        write_file(&tmp.path().join("dist").join("index.html"), b"<built/>");
-        std::thread::sleep(std::time::Duration::from_millis(2100));
-        write_file(&tmp.path().join("src").join("README.md"), b"# notes");
-        write_file(&tmp.path().join("src").join("logo.png"), b"\x89PNG fake");
-
-        let result = check_dist_freshness(tmp.path()).await;
-        assert_eq!(
-            result, None,
-            "non-source extensions must not trigger SrcDrift"
-        );
-    }
-
-    /// Pins the built-tree fix: the freshness verdict follows the root you
-    /// pass, not some implicitly-derived live tree. A `git_ref` /
-    /// `worktree_path` spawn-test build embeds the BUILT tree's `dist/`, so
-    /// `resolve_frontend_stale_for_spawn` must hand `check_dist_freshness`
-    /// that tree — checking a stale live tree instead produced false
-    /// `src_newer_than_dist` warnings (and spurious 503s under
-    /// `frontend_strict`) for perfectly fresh worktree builds.
-    #[tokio::test]
-    async fn freshness_verdict_follows_the_root_passed_not_the_live_tree() {
-        let tmp = TempDir::new().expect("tempdir");
-        let live_root = tmp.path().join("live");
-        let worktree_root = tmp.path().join("worktree");
-
-        // Live tree: dist built first, then src edited → stale (SrcDrift).
-        write_file(&live_root.join("dist").join("index.html"), b"<old/>");
-        // Worktree: src written first, dist built after → fresh.
-        write_file(
-            &worktree_root.join("src").join("App.tsx"),
-            b"export const App = () => 'worktree';",
-        );
-
-        // Coarse-mtime safety margin (FAT = 2s), same as the other tests.
-        std::thread::sleep(std::time::Duration::from_millis(2100));
-
-        write_file(
-            &live_root.join("src").join("App.tsx"),
-            b"export const App = () => 'edited after build';",
-        );
-        write_file(
-            &worktree_root.join("dist").join("index.html"),
-            b"<!doctype html><html/>",
-        );
-
-        assert_eq!(
-            check_dist_freshness(&worktree_root).await,
-            None,
-            "fresh worktree build must not be flagged stale just because the live tree drifted"
-        );
-        assert_eq!(
-            check_dist_freshness(&live_root).await,
-            Some(FrontendStaleReason::SrcDrift),
-            "the live tree really is stale — the verdict must follow the root passed"
-        );
-    }
-
-    #[test]
-    fn frontend_stale_reason_wire_format_is_stable() {
-        // External callers parse the `frontend_stale_reason` string —
-        // pin the wire format so a refactor can't silently rename it.
-        assert_eq!(FrontendStaleReason::BuildFailed.as_str(), "build_failed");
-        assert_eq!(
-            FrontendStaleReason::SrcDrift.as_str(),
-            "src_newer_than_dist"
-        );
-        assert_eq!(FrontendStaleReason::DistMissing.as_str(), "dist_missing");
-    }
-
-    /// Pin the default + explicit-true wire shapes for the
-    /// `cleanup_worktree_on_fail` flag. External agents call this endpoint
-    /// with arbitrary JSON; a typo or default-change must be caught here.
-    #[test]
-    fn spawn_test_request_cleanup_worktree_on_fail_defaults_false() {
-        // Empty payload (every field at default) — flag must be false so
-        // existing callers' idempotent-reuse semantics are preserved.
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(
-            !req.cleanup_worktree_on_fail,
-            "default must be false (idempotent reuse)"
-        );
-    }
-
-    #[test]
-    fn spawn_test_request_cleanup_worktree_on_fail_explicit_true() {
-        // Explicit opt-in by an agent that wants a fresh worktree on the
-        // next attempt after a downstream cargo failure.
-        let req: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"cleanup_worktree_on_fail": true}"#)
-                .expect("deserialize SpawnTestRequest with cleanup_worktree_on_fail");
-        assert!(req.cleanup_worktree_on_fail);
-    }
-
-    /// Phase 2b — `paired_profile_id` defaults to None and round-trips a
-    /// supplied string verbatim. Pinned so a typo or default-change is
-    /// caught here rather than at `/manual-test-coord` runtime.
-    #[test]
-    fn spawn_test_request_paired_profile_id_defaults_none() {
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(req.paired_profile_id.is_none());
-    }
-
-    #[test]
-    fn spawn_test_request_paired_profile_id_explicit() {
-        let req: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"paired_profile_id":"jspinak-spaceship"}"#)
-                .expect("deserialize SpawnTestRequest with paired_profile_id");
-        assert_eq!(req.paired_profile_id.as_deref(), Some("jspinak-spaceship"));
-    }
-
-    // -------------------------------------------------------------------
-    // Phase 2b — apply_paired_profile helper tests.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn apply_paired_profile_rejects_traversal() {
-        let tmp_profiles = tempfile::tempdir().unwrap();
-        let tmp_data = tempfile::tempdir().unwrap();
-        for bad in ["", "../etc", "a/b", "a\\b", ".."] {
-            let result = super::apply_paired_profile(bad, tmp_profiles.path(), tmp_data.path());
-            assert!(
-                result.is_err(),
-                "profile_id={:?} must be rejected as traversal",
-                bad
-            );
-            let (status, _body) = result.err().unwrap();
-            assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        }
-    }
-
-    #[test]
-    fn apply_paired_profile_404_when_snapshot_missing() {
-        let tmp_profiles = tempfile::tempdir().unwrap();
-        let tmp_data = tempfile::tempdir().unwrap();
-        let result =
-            super::apply_paired_profile("does-not-exist", tmp_profiles.path(), tmp_data.path());
-        let (status, body) = result.expect_err("must error");
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "profile_not_found");
-        assert_eq!(body["paired_profile_id"], "does-not-exist");
-    }
-
-    #[test]
-    fn apply_paired_profile_copies_paired_user_only_when_no_tokens() {
-        // Snapshot dir has paired_user.json but no auth_tokens.enc.
-        // applied list must include only the file actually present.
-        let tmp_profiles = tempfile::tempdir().unwrap();
-        let tmp_data = tempfile::tempdir().unwrap();
-        let snapshot = tmp_profiles.path().join("dev-profile");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(
-            snapshot.join("paired_user.json"),
-            r#"{"user_id":"abc","tenant_id":"def"}"#,
-        )
-        .unwrap();
-
-        let applied =
-            super::apply_paired_profile("dev-profile", tmp_profiles.path(), tmp_data.path())
-                .expect("must succeed");
-
-        assert_eq!(applied, vec!["paired_user.json".to_string()]);
-        // File landed in the data dir.
-        let dst = tmp_data.path().join("paired_user.json");
-        assert!(dst.exists(), "paired_user.json must be copied to data dir");
-        let copied = std::fs::read_to_string(&dst).unwrap();
-        assert!(copied.contains("abc"));
-    }
-
-    #[test]
-    fn apply_paired_profile_copies_both_files_when_present() {
-        let tmp_profiles = tempfile::tempdir().unwrap();
-        let tmp_data = tempfile::tempdir().unwrap();
-        let snapshot = tmp_profiles.path().join("paired");
-        std::fs::create_dir_all(&snapshot).unwrap();
-        std::fs::write(snapshot.join("paired_user.json"), b"{}").unwrap();
-        std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02").unwrap();
-
-        let applied = super::apply_paired_profile("paired", tmp_profiles.path(), tmp_data.path())
-            .expect("must succeed");
-
-        assert_eq!(
-            applied,
-            vec![
-                "paired_user.json".to_string(),
-                "auth_tokens.enc".to_string()
-            ]
-        );
-        assert!(tmp_data.path().join("paired_user.json").exists());
-        assert!(tmp_data.path().join("auth_tokens.enc").exists());
-    }
-
-    /// The spawn-test route must write the profile snapshot into the SPAWNED
-    /// RUNNER'S per-instance dir — the same
-    /// `<config_dir>/com.qontinui.runner/instances/<runner id>` that
-    /// `process::manager` exports to the child as `QONTINUI_CONFIG_DIR` +
-    /// `QONTINUI_SECURE_STORAGE_DIR`.
-    ///
-    /// The bug this pins: the wrapper used to copy into the shared
-    /// `dirs::data_local_dir()/com.qontinui.runner` fallback, which a
-    /// supervisor-spawned runner never consults (its env vars win). The spawn
-    /// reported `paired_profile_applied` and the runner came up UNPAIRED.
-    ///
-    /// Driven through the real `apply_paired_state_for_spawn` rather than
-    /// re-deriving the destination, so re-inlining a different path in the
-    /// route fails here even though the helper itself is unchanged. Uses the
-    /// production `~/.qontinui/profiles` root under a pid-unique profile id and
-    /// removes both dirs afterwards.
-    #[test]
-    fn instance_config_dir_is_where_apply_paired_profile_for_spawn_writes() {
-        let unique = format!("supervisor-selftest-{}", std::process::id());
-        let runner_id = format!("test-{unique}");
-        let (Some(home), Some(dest)) = (
-            dirs::home_dir(),
-            crate::process::instance_config_dir(&runner_id),
-        ) else {
-            // No resolvable home / config dir on this platform.
-            return;
-        };
-        let snapshot = home.join(".qontinui").join("profiles").join(&unique);
-        std::fs::create_dir_all(&snapshot).expect("create profile snapshot dir");
-        let _cleanup = scopeguard::guard((snapshot.clone(), dest.clone()), |(snap, dst)| {
-            let _ = std::fs::remove_dir_all(snap);
-            let _ = std::fs::remove_dir_all(dst);
-        });
-        std::fs::write(
-            snapshot.join("paired_user.json"),
-            r#"{"user_id":"selftest"}"#,
-        )
-        .expect("write paired_user.json");
-        std::fs::write(snapshot.join("auth_tokens.enc"), b"\x00\x01\x02")
-            .expect("write auth_tokens.enc");
-
-        let report =
-            super::apply_paired_state_for_spawn(Some(&unique), &runner_id).expect("must succeed");
-
-        assert_eq!(report["source"], "paired_profile");
-        assert_eq!(
-            report["applied"],
-            serde_json::json!(["paired_user.json", "auth_tokens.enc"])
-        );
-        // The destination is the per-instance dir, spelled out literally so a
-        // drift on the ROUTE side trips this assertion. The spawn side (the
-        // `cmd.env(...)` that tells the child to read this dir) is pinned
-        // separately by
-        // `process::manager::tests::apply_instance_dir_env_sets_both_vars_to_instance_config_dir`.
-        let expected = dirs::config_dir()
-            .expect("config_dir resolved above")
-            .join("com.qontinui.runner")
-            .join("instances")
-            .join(&runner_id);
-        assert_eq!(dest, expected);
-        assert!(
-            dest.join("paired_user.json").exists(),
-            "paired_user.json must land in the runner's instance dir {dest:?}"
-        );
-        assert!(
-            dest.join("auth_tokens.enc").exists(),
-            "auth_tokens.enc must land in the runner's instance dir {dest:?}"
-        );
-        // And NOT in the shared fallback the runner ignores.
-        if let Some(shared) = dirs::data_local_dir() {
-            assert_ne!(dest, shared.join("com.qontinui.runner"));
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // S-4 — spawn-test with no `paired_profile_id` snapshots the PRIMARY.
-    // -------------------------------------------------------------------
-
-    /// The route's paired-state decision with no `paired_profile_id`: the
-    /// primary's live `paired_user.json` + `auth_tokens.enc` are copied into
-    /// the spawned runner's instance dir, and the named-profile root is not
-    /// consulted at all. Every root is injected, as `apply_paired_profile`'s
-    /// tests do.
-    #[test]
-    fn no_paired_profile_id_applies_the_primary_snapshot() {
-        let profiles = tempfile::tempdir().unwrap();
-        let primary = tempfile::tempdir().unwrap();
-        let dest_root = tempfile::tempdir().unwrap();
-        let dest = dest_root.path().join("instances").join("test-abc");
-        std::fs::write(
-            primary.path().join("paired_user.json"),
-            r#"{"user_id":"operator"}"#,
-        )
-        .unwrap();
-        std::fs::write(primary.path().join("auth_tokens.enc"), b"\x09\x08").unwrap();
-        // A profile the route must NOT pick up when no id is given.
-        let decoy = profiles.path().join("decoy");
-        std::fs::create_dir_all(&decoy).unwrap();
-        std::fs::write(decoy.join("paired_user.json"), r#"{"user_id":"decoy"}"#).unwrap();
-
-        let report =
-            super::apply_spawn_paired_state(None, profiles.path(), Some(primary.path()), &dest)
-                .expect("primary snapshot must succeed");
-
-        assert_eq!(report["source"], "primary_snapshot");
-        assert_eq!(report["status"], "paired");
-        assert_eq!(
-            report["applied"],
-            serde_json::json!(["paired_user.json", "auth_tokens.enc"])
-        );
-        assert!(
-            std::fs::read_to_string(dest.join("paired_user.json"))
-                .unwrap()
-                .contains("operator"),
-            "the PRIMARY's pairing must land in the instance dir, not a profile's"
-        );
-        assert_eq!(
-            std::fs::read(dest.join("auth_tokens.enc")).unwrap(),
-            b"\x09\x08"
-        );
-    }
-
-    /// An unpaired primary is not an error: the snapshot copies nothing — not
-    /// even a lone token cache with no pairing beside it — says so, and the
-    /// spawn proceeds.
-    #[test]
-    fn unpaired_primary_snapshot_reports_primary_unpaired() {
-        let profiles = tempfile::tempdir().unwrap();
-        let primary = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-        std::fs::write(primary.path().join("auth_tokens.enc"), b"\x01").unwrap();
-
-        let report = super::apply_spawn_paired_state(
-            None,
-            profiles.path(),
-            Some(primary.path()),
-            dest.path(),
-        )
-        .expect("an unpaired primary must not fail the spawn");
-        assert_eq!(report["status"], "primary_unpaired");
-        assert_eq!(report["applied"], serde_json::json!([]));
-        assert!(!dest.path().join("paired_user.json").exists());
-        assert!(!dest.path().join("auth_tokens.enc").exists());
-
-        let report = super::apply_spawn_paired_state(None, profiles.path(), None, dest.path())
-            .expect("an unresolvable primary dir must not fail the spawn");
-        assert_eq!(report["status"], "primary_dir_unresolved");
-    }
-
-    /// With a `paired_profile_id` the named snapshot still wins and a missing
-    /// one is still a 400 — the primary is never a silent fallback for it.
-    #[test]
-    fn paired_profile_id_still_selects_the_profile_not_the_primary() {
-        let profiles = tempfile::tempdir().unwrap();
-        let primary = tempfile::tempdir().unwrap();
-        let dest = tempfile::tempdir().unwrap();
-        std::fs::write(
-            primary.path().join("paired_user.json"),
-            r#"{"user_id":"operator"}"#,
-        )
-        .unwrap();
-        let snap = profiles.path().join("ci");
-        std::fs::create_dir_all(&snap).unwrap();
-        std::fs::write(snap.join("paired_user.json"), r#"{"user_id":"ci"}"#).unwrap();
-
-        let report = super::apply_spawn_paired_state(
-            Some("ci"),
-            profiles.path(),
-            Some(primary.path()),
-            dest.path(),
-        )
-        .unwrap();
-        assert_eq!(report["source"], "paired_profile");
-        assert_eq!(report["paired_profile_id"], "ci");
-        assert!(
-            std::fs::read_to_string(dest.path().join("paired_user.json"))
-                .unwrap()
-                .contains("\"ci\"")
-        );
-
-        let (status, body) = super::apply_spawn_paired_state(
-            Some("missing"),
-            profiles.path(),
-            Some(primary.path()),
-            dest.path(),
-        )
-        .expect_err("a missing profile must not fall back to the primary");
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-        assert_eq!(body["error"], "profile_not_found");
-    }
-
-    #[test]
-    fn coord_credential_is_relayed_or_typed_unknown() {
-        let body = serde_json::json!({
-            "data": {"coordCredential": {"posture": "live", "state": "live", "canAnswer": true}}
-        });
-        let got = super::coord_credential_from_health(Some(&body), "unused");
-        assert_eq!(got["posture"], "live");
-        assert_eq!(got["canAnswer"], true);
-
-        let old = serde_json::json!({"data": {"gitSha": "abc"}});
-        let got = super::coord_credential_from_health(Some(&old), "no block");
-        assert_eq!(got["posture"], "unknown");
-        assert_eq!(got["state"], "unknown");
-        assert_eq!(got["reason"], "no block");
-
-        let got = super::coord_credential_from_health(None, "not read");
-        assert_eq!(got["posture"], "unknown");
-        assert_eq!(got["reason"], "not read");
-    }
-
-    // -------------------------------------------------------------------
-    // Response field shape — `git_ref` request + provenance fields.
-    //
-    // The spawn-test response surfaces a fixed set of provenance fields
-    // for git_ref builds. These tests pin the wire shape so the agent-
-    // facing contract is enforced at PR time, not at first-use runtime.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn spawn_test_request_git_ref_defaults_none() {
-        // Default callers (no git_ref set) must get None so the handler's
-        // branch that requires rebuild:true is skipped.
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(req.git_ref.is_none(), "git_ref default must be None");
-    }
-
-    #[test]
-    fn spawn_test_request_git_ref_round_trips() {
-        // Verbatim round-trip — the supervisor never normalizes / lowercases
-        // the ref; whatever the caller sends is what `prepare_worktree`
-        // hands to `git`.
-        let req: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"git_ref":"origin/main","rebuild":true}"#)
-                .expect("deserialize SpawnTestRequest with git_ref");
-        assert_eq!(req.git_ref.as_deref(), Some("origin/main"));
-        assert!(req.rebuild);
-    }
-
-    /// The 12-char short SHA is a pure-presentational helper: the supervisor
-    /// keeps the full 40-char `git rev-parse HEAD` value in
-    /// `git_ref_resolved_sha` and exposes `git_ref_resolved_sha_short` as
-    /// the first 12 characters. This test pins both halves of that
-    /// contract so a future "shorten differently" refactor (8-char, last-N,
-    /// etc.) doesn't silently drift away from what callers compare with
-    /// `git rev-parse origin/main | head -c 12`.
-    #[test]
-    fn git_ref_resolved_sha_short_is_first_twelve_chars() {
-        // Real SHA shape: 40 hex chars. The Vec<char>→String roundtrip
-        // mirrors what runs inside the handler.
-        let full = "0156c6775b18deadbeef0123456789abcdef0011";
-        let short: String = full.chars().take(12).collect();
-        assert_eq!(short.len(), 12, "short SHA must always be 12 chars");
-        assert_eq!(short, "0156c6775b18");
-        assert!(
-            full.starts_with(&short),
-            "short SHA must be a prefix of the full SHA"
-        );
-    }
-
-    /// Boundary: shorter-than-12-char input (truncated/odd-shaped SHA from a
-    /// minimal/fixture repo) must not panic — `take(12)` clamps to len.
-    /// The handler's `chars().take(12).collect::<String>()` is panic-free,
-    /// but pinning that here means a future refactor to `[..12]` slicing
-    /// (which WOULD panic on shorter inputs) gets caught.
-    #[test]
-    fn git_ref_resolved_sha_short_handles_underlength_input() {
-        let full = "abc123"; // 6 chars — shorter than 12
-        let short: String = full.chars().take(12).collect();
-        assert_eq!(short, "abc123");
-        assert!(short.len() <= 12);
-    }
-
-    // -------------------------------------------------------------------
-    // Track 2 (UI-Bridge preview-verification) — work-unit ↔ preview binding.
-    //
-    // Pins: (1) the new `unit_id`/`attempt_id` passthrough fields default to
-    // None and round-trip verbatim; (2) the `git_ref requires rebuild:true`
-    // provenance guard still fires (and only when git_ref is set); (3) the
-    // `GET /runners/by-unit/{unit_id}` handler resolves bound previews and
-    // returns `[]` (not 404) for an unknown unit.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn spawn_test_request_unit_attempt_default_none() {
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(req.unit_id.is_none(), "unit_id default must be None");
-        assert!(req.attempt_id.is_none(), "attempt_id default must be None");
-    }
-
-    #[test]
-    fn spawn_test_request_unit_attempt_round_trip() {
-        let req: super::SpawnTestRequest = serde_json::from_str(
-            r#"{"rebuild":true,"git_ref":"feat/x","unit_id":"u1","attempt_id":"a1"}"#,
-        )
-        .expect("deserialize SpawnTestRequest with unit/attempt");
-        assert_eq!(req.unit_id.as_deref(), Some("u1"));
-        assert_eq!(req.attempt_id.as_deref(), Some("a1"));
-        // unit_id present without attempt_id is a valid shape (attempt unknown).
-        let req2: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"unit_id":"u1"}"#).expect("deserialize unit-only");
-        assert_eq!(req2.unit_id.as_deref(), Some("u1"));
-        assert!(req2.attempt_id.is_none());
-    }
-
-    #[test]
-    fn git_ref_rebuild_guard_rejects_ref_without_rebuild() {
-        // The no-silent-fallback provenance guard: git_ref + rebuild:false → 400.
-        let err = super::provenance_rebuild_guard(Some("feat/x"), None, false, false)
-            .expect_err("git_ref without rebuild must be rejected");
-        let status = axum::response::IntoResponse::into_response(err).status();
-        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn git_ref_rebuild_guard_allows_ref_with_rebuild() {
-        assert!(super::provenance_rebuild_guard(Some("feat/x"), None, false, true).is_ok());
-    }
-
-    // -------------------------------------------------------------------
-    // Phase 1 — generalized provenance guard + alias detector.
-    // -------------------------------------------------------------------
-
-    /// Full matrix for `provenance_rebuild_guard`:
-    /// {none, git_ref, worktree_path, both} × {rebuild false, true}.
-    #[test]
-    fn provenance_rebuild_guard_matrix() {
-        use super::provenance_rebuild_guard as g;
-        use crate::error::SupervisorError;
-        // none → always ok regardless of rebuild.
-        assert!(g(None, None, false, false).is_ok());
-        assert!(g(None, None, false, true).is_ok());
-
-        // git_ref alone → requires rebuild:true.
-        let err =
-            g(Some("feat/x"), None, false, false).expect_err("git_ref without rebuild must 400");
-        assert_eq!(
-            axum::response::IntoResponse::into_response(err).status(),
-            axum::http::StatusCode::BAD_REQUEST
-        );
-        assert!(g(Some("feat/x"), None, false, true).is_ok());
-
-        // worktree_path alone → requires rebuild:true (named in the message).
-        let err = g(None, Some("D:/wt"), false, false)
-            .expect_err("worktree_path without rebuild must 400");
-        match &err {
-            SupervisorError::Validation(m) => {
-                assert!(m.contains("worktree_path requires rebuild:true"), "got {m}");
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-        assert!(g(None, Some("D:/wt"), false, true).is_ok());
-
-        // from_working_tree alone → requires rebuild:true (named in the
-        // message). Silently ignoring it would hand back a live-tree exe while
-        // the caller believed they opted in — the same lie class as git_ref.
-        let err =
-            g(None, None, true, false).expect_err("from_working_tree without rebuild must 400");
-        match &err {
-            SupervisorError::Validation(m) => {
-                assert!(
-                    m.contains("from_working_tree requires rebuild:true"),
-                    "got {m}"
-                );
-            }
-            other => panic!("expected Validation, got {other:?}"),
-        }
-        assert!(g(None, None, true, true).is_ok());
-
-        // Any two selectors → provenance_conflict naming BOTH (even with
-        // rebuild:true, and regardless of rebuild).
-        for (gr, wp, fwt) in [
-            (Some("feat/x"), Some("D:/wt"), false),
-            (Some("feat/x"), None, true),
-            (None, Some("D:/wt"), true),
-        ] {
-            for rebuild in [true, false] {
-                let err = g(gr, wp, fwt, rebuild)
-                    .expect_err("two selectors must 400 regardless of rebuild");
-                match &err {
-                    SupervisorError::Validation(m) => {
-                        assert!(m.contains("provenance_conflict"), "got {m}")
-                    }
-                    other => panic!("expected Validation, got {other:?}"),
-                }
-            }
-        }
-        // All three at once is still a single, fully-named conflict.
-        let err =
-            g(Some("feat/x"), Some("D:/wt"), true, true).expect_err("three selectors must 400");
-        let msg = err.to_string();
-        for sel in ["git_ref", "worktree_path", "from_working_tree"] {
-            assert!(msg.contains(sel), "conflict must name {sel}; got {msg}");
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // THE DEFAULT FLIP — spawn-test builds origin/main, not the shared
-    // working checkout. This is the regression guard for the defect where a
-    // `{rebuild:true}` spawn silently compiled whatever branch a peer had
-    // parked the shared checkout on (72 commits behind origin/main), making a
-    // landed fix read as a regression.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn default_spawn_build_source_is_origin_main_not_the_shared_checkout() {
-        use super::{resolve_spawn_build_source as r, SpawnBuildSource};
-        assert_eq!(
-            r(None, None, false, true),
-            SpawnBuildSource::DefaultOriginMain,
-            "a plain {{rebuild:true}} spawn MUST build origin/main, never the shared checkout"
-        );
-        assert_eq!(
-            r(None, None, false, true).managed_ref(),
-            Some(crate::git_provenance::ORIGIN_MAIN_REF),
-            "the default must materialize a worktree at the canonical main ref"
-        );
-    }
-
-    #[test]
-    fn resolve_spawn_build_source_matrix() {
-        use super::{resolve_spawn_build_source as r, SpawnBuildSource};
-        // Explicit selectors win and are reported verbatim.
-        assert_eq!(
-            r(Some("feat/x"), None, false, true),
-            SpawnBuildSource::ExplicitRef("feat/x".into())
-        );
-        assert_eq!(
-            r(None, Some("D:/wt"), false, true),
-            SpawnBuildSource::WorktreePath("D:/wt".into())
-        );
-        // The shared checkout is reachable ONLY by explicit opt-in...
-        assert_eq!(r(None, None, true, true), SpawnBuildSource::LiveTree);
-        // ...or when no build happens at all (the exe comes from a slot/LKG),
-        // where materializing an origin/main worktree would be pure waste.
-        assert_eq!(r(None, None, false, false), SpawnBuildSource::LiveTree);
-
-        // Labels are the response `source` vocabulary.
-        assert_eq!(r(None, None, false, true).label(), "origin_main");
-        assert_eq!(r(Some("feat/x"), None, false, true).label(), "worktree");
-        assert_eq!(r(None, Some("D:/wt"), false, true).label(), "worktree_path");
-        assert_eq!(r(None, None, true, true).label(), "live_tree");
-
-        // Only the managed-worktree variants get a ref to prepare.
-        assert_eq!(
-            r(Some("feat/x"), None, false, true).managed_ref(),
-            Some("feat/x")
-        );
-        assert_eq!(r(None, Some("D:/wt"), false, true).managed_ref(), None);
-        assert_eq!(r(None, None, true, true).managed_ref(), None);
-    }
-
-    /// Provenance classification is graded by WHAT WAS COMPILED, not by how the
-    /// caller spelled the request: an explicit `git_ref: "origin/main"` yields
-    /// the same vouched `OriginMain` class as the default, because the binary
-    /// genuinely is merged truth. Vouched ⇒ LKG-promotable, which is the deep
-    /// fix for an LKG that used to be advanced by whatever branch the shared
-    /// checkout was parked on.
-    #[test]
-    fn build_source_kind_grades_by_compiled_tree_not_request_spelling() {
-        use super::SpawnBuildSource;
-        use crate::build_monitor::BuildSourceKind;
-        use crate::process::manager::BuildSource;
-
-        let sha = "a".repeat(40);
-
-        let default_kind = SpawnBuildSource::DefaultOriginMain.build_source_kind(Some(&sha));
-        assert!(matches!(default_kind, BuildSourceKind::OriginMain { .. }));
-        assert!(default_kind.build_source().is_vouched());
-
-        let explicit_main =
-            SpawnBuildSource::ExplicitRef("origin/main".into()).build_source_kind(Some(&sha));
-        assert!(matches!(explicit_main, BuildSourceKind::OriginMain { .. }));
-
-        // A non-canonical ref is a foreign tree: Override, NOT LKG-promotable.
-        let feature = SpawnBuildSource::ExplicitRef("feat/x".into()).build_source_kind(Some(&sha));
-        assert_eq!(feature.build_source(), BuildSource::Override);
-        assert!(!feature.build_source().is_vouched());
-
-        // A LOCAL `main` is deliberately NOT canonical — it can lag or carry
-        // unpushed commits, so vouching for it would re-open the hole.
-        let local_main = SpawnBuildSource::ExplicitRef("main".into()).build_source_kind(Some(&sha));
-        assert_eq!(local_main.build_source(), BuildSource::Override);
-
-        // Caller-owned checkout is always foreign.
-        assert_eq!(
-            SpawnBuildSource::WorktreePath("D:/wt".into())
-                .build_source_kind(Some(&sha))
-                .build_source(),
-            BuildSource::Override
-        );
-
-        // Explicit opt-in to the shared checkout stays LiveTree.
-        assert_eq!(
-            SpawnBuildSource::LiveTree
-                .build_source_kind(None)
-                .build_source(),
-            BuildSource::LiveTree
-        );
-
-        // Canonical-main WITHOUT a resolved sha must not claim merged-truth
-        // provenance it never observed.
-        assert_eq!(
-            SpawnBuildSource::DefaultOriginMain
-                .build_source_kind(None)
-                .build_source(),
-            BuildSource::Override,
-            "no resolved sha ⇒ cannot vouch"
-        );
-    }
-
-    /// The same contract on `POST /runners/{id}/restart`. This is the whole of
-    /// the 2026-09-09 defect: the wire default decides the PRIMARY's build
-    /// source, and it used to be hardcoded `true` at the call site where no
-    /// body could reach it. A body that omits the flag must get origin/main.
-    ///
-    /// Asserted on the deserialized request rather than on the literal at the
-    /// call site deliberately — the bug was a false premise ("this route only
-    /// serves named/temp runners"), so pinning the spelling would not have
-    /// caught it. Plan
-    /// `2026-09-13-supervisor-per-runner-restart-hardcodes-from-working-tree`.
-    #[test]
-    fn restart_runner_request_defaults_from_working_tree_to_false() {
-        let omitted: super::RestartRunnerRequest =
-            serde_json::from_str(r#"{"rebuild":true}"#).expect("deserialize");
-        assert!(
-            !omitted.from_working_tree,
-            "a primary rebuild that does not ask for the working tree must get origin/main"
-        );
-    }
-
-    /// The escape hatch stays reachable: an operator who deliberately wants the
-    /// primary to run uncommitted local changes can still say so.
-    #[test]
-    fn restart_runner_request_honours_explicit_from_working_tree() {
-        let opted: super::RestartRunnerRequest =
-            serde_json::from_str(r#"{"rebuild":true,"from_working_tree":true}"#)
-                .expect("deserialize");
-        assert!(opted.from_working_tree);
-    }
-
-    /// `from_working_tree` must round-trip through serde and default to
-    /// `false` — a body that omits it gets the safe origin/main default.
-    #[test]
-    fn from_working_tree_defaults_false_and_deserializes() {
-        let omitted: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"rebuild":true}"#).expect("deserialize");
-        assert!(
-            !omitted.from_working_tree,
-            "omitting the flag must NOT opt into the shared checkout"
-        );
-        let opted: super::SpawnTestRequest =
-            serde_json::from_str(r#"{"rebuild":true,"from_working_tree":true}"#)
-                .expect("deserialize");
-        assert!(opted.from_working_tree);
-    }
-
-    #[test]
-    fn reject_known_provenance_aliases_flags_each_alias() {
-        use super::reject_known_provenance_aliases as r;
-        for (alias, correct) in [
-            ("branch", "git_ref"),
-            ("ref", "git_ref"),
-            ("worktree", "worktree_path"),
-        ] {
-            let body = serde_json::json!({ alias: "value", "rebuild": true });
-            let err = r(&body).expect_err("alias must be rejected");
-            let s = err.to_string();
-            assert!(
-                s.contains(alias) && s.contains(correct),
-                "alias `{alias}` 400 must name both the alias and the correct field `{correct}`; got: {s}"
-            );
-            assert_eq!(
-                axum::response::IntoResponse::into_response(err).status(),
-                axum::http::StatusCode::BAD_REQUEST
-            );
-        }
-    }
-
-    #[test]
-    fn reject_known_provenance_aliases_allows_real_fields() {
-        use super::reject_known_provenance_aliases as r;
-        // The real fields must pass the alias check.
-        assert!(r(&serde_json::json!({"git_ref": "origin/main", "rebuild": true})).is_ok());
-        assert!(r(&serde_json::json!({"worktree_path": "D:/wt", "rebuild": true})).is_ok());
-        assert!(r(&serde_json::json!({})).is_ok());
-        // A non-object body short-circuits ok (typed deserialize handles it).
-        assert!(r(&serde_json::json!("not-an-object")).is_ok());
-    }
-
-    // -------------------------------------------------------------------
-    // S3 — `/build/{id}/status` must report the build's ACTUAL source root,
-    // not the supervisor's live `project_dir`.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn resolve_spawn_source_live_tree_when_no_selector() {
-        let project_dir = std::path::Path::new("D:/ws/qontinui-runner/src-tauri");
-        let (source, root) =
-            super::resolve_spawn_source(project_dir, &super::SpawnBuildSource::LiveTree);
-        assert_eq!(source, "live_tree");
-        assert_eq!(root, project_dir);
-    }
-
-    #[test]
-    fn resolve_spawn_source_git_ref_reports_spawn_container_not_project_dir() {
-        // The misleading-field regression: a git_ref build previously reported
-        // `project_dir`, making a worktree-spawned build look like it came from
-        // the live tree. It must report its own `.spawn-<ref>` container.
-        //
-        // `derive_workspace_root` probes the FS for the
-        // `qontinui-runner/` + `qontinui-schemas/` sibling pair, so the fixture
-        // is a real workspace-shaped tempdir.
-        let tmp = TempDir::new().expect("tempdir");
-        let ws = tmp.path();
-        std::fs::create_dir_all(ws.join("qontinui-runner").join("src-tauri"))
-            .expect("mkdir runner");
-        std::fs::create_dir_all(ws.join("qontinui-schemas")).expect("mkdir schemas");
-        let project_dir = ws.join("qontinui-runner").join("src-tauri");
-
-        let (source, root) = super::resolve_spawn_source(
-            &project_dir,
-            &super::SpawnBuildSource::ExplicitRef("origin/main".into()),
-        );
-
-        assert_eq!(
-            source, "worktree",
-            "must reuse the existing source vocabulary"
-        );
-        let root_s = root.to_string_lossy().replace('\\', "/");
-        assert!(
-            root_s.contains("/.spawn-"),
-            "a git_ref build must report its .spawn-<ref> container; got: {root_s}"
-        );
-        assert!(
-            root_s.ends_with("qontinui-runner/src-tauri"),
-            "the reported root must be the cargo source root inside the container; got: {root_s}"
-        );
-        assert_ne!(
-            root, project_dir,
-            "must NOT report the supervisor's live project_dir"
-        );
-
-        // And it must agree byte-for-byte with the path prepare_worktree
-        // materializes (same helper, single source of truth).
-        let expected =
-            crate::spawn_worktree::runner_worktree_path_for_ref(&project_dir, "origin/main")
-                .expect("derive container")
-                .join("src-tauri");
-        assert_eq!(root, expected);
-    }
-
-    #[test]
-    fn resolve_spawn_source_git_ref_degrades_to_project_dir_on_malformed_layout() {
-        // A workspace root that can't be derived must not fail the spawn — the
-        // build itself surfaces the real error. Degrade to project_dir.
-        let tmp = TempDir::new().expect("tempdir");
-        let project_dir = tmp.path().join("not-a-workspace");
-        let (source, root) = super::resolve_spawn_source(
-            &project_dir,
-            &super::SpawnBuildSource::ExplicitRef("origin/main".into()),
-        );
-        assert_eq!(source, "worktree");
-        assert_eq!(root, project_dir);
-    }
-
-    #[test]
-    fn resolve_spawn_source_worktree_path_reports_caller_checkout() {
-        let project_dir = std::path::Path::new("D:/ws/qontinui-runner/src-tauri");
-        let (source, root) = super::resolve_spawn_source(
-            project_dir,
-            &super::SpawnBuildSource::WorktreePath("D:/ws/.spawn-pr370/qontinui-runner".into()),
-        );
-        assert_eq!(source, "worktree_path");
-        assert_eq!(
-            root,
-            std::path::Path::new("D:/ws/.spawn-pr370/qontinui-runner/src-tauri")
-        );
-        assert_ne!(root, project_dir);
-    }
-
-    // -------------------------------------------------------------------
-    // Phase 2/3 — new request-field wire shapes.
-    // -------------------------------------------------------------------
-
-    #[test]
-    fn spawn_test_request_worktree_path_defaults_none() {
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(
-            req.worktree_path.is_none(),
-            "worktree_path default must be None"
-        );
-    }
-
-    #[test]
-    fn spawn_test_request_worktree_path_round_trips() {
-        let req: super::SpawnTestRequest = serde_json::from_str(
-            r#"{"worktree_path":"D:/qontinui-root/.spawn-pr370","rebuild":true}"#,
-        )
-        .expect("deserialize SpawnTestRequest with worktree_path");
-        assert_eq!(
-            req.worktree_path.as_deref(),
-            Some("D:/qontinui-root/.spawn-pr370")
-        );
-        assert!(req.rebuild);
-    }
-
-    #[test]
-    fn spawn_test_request_frontend_only_defaults_false() {
-        let req: super::SpawnTestRequest =
-            serde_json::from_str("{}").expect("deserialize empty SpawnTestRequest");
-        assert!(!req.frontend_only, "frontend_only default must be false");
-    }
-
-    #[test]
-    fn spawn_test_request_frontend_only_round_trips() {
-        let req: super::SpawnTestRequest = serde_json::from_str(
-            r#"{"worktree_path":"D:/wt","frontend_only":true,"rebuild":true}"#,
-        )
-        .expect("deserialize SpawnTestRequest with frontend_only");
-        assert!(req.frontend_only);
-    }
-
-    #[test]
-    fn git_ref_rebuild_guard_allows_no_ref() {
-        // No selector: guard is a no-op regardless of rebuild.
-        assert!(super::provenance_rebuild_guard(None, None, false, false).is_ok());
-        assert!(super::provenance_rebuild_guard(None, None, false, true).is_ok());
-    }
-
-    /// Helper: insert a runner with an optional preview binding into a state's
-    /// registry, mirroring the spawn-test path (config + binding on the
-    /// ManagedRunner). Returns the runner id.
-    async fn insert_runner_with_binding(
-        state: &crate::state::SharedState,
-        port: u16,
-        binding: Option<crate::state::PreviewBinding>,
-    ) -> String {
-        let id = format!("test-{}", port);
-        let mut config = crate::config::RunnerConfig::default_primary();
-        config.id = id.clone();
-        config.name = id.clone();
-        config.port = port;
-        config.kind = super::RunnerKind::Temp { id: id.clone() };
-        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
-            config, false, None,
-        ));
-        if let Some(b) = binding {
-            *managed.preview_binding.write().await = Some(b);
-        }
-        state.runners.write().await.insert(id.clone(), managed);
-        id
-    }
-
-    /// Like [`make_state`] but rooted at `root`, so `project_dir`
-    /// (`<root>/src-tauri`) has a real repo at `<root>` for the git-provenance
-    /// probes to run against.
-    fn make_state_at(root: &std::path::Path) -> crate::state::SharedState {
-        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-        let config = SupervisorConfig {
-            project_dir: root.join("src-tauri"),
-            watchdog_enabled_at_start: false,
-            auto_start: false,
-            auto_debug: false,
-            log_file: None,
-            log_dir: None,
-            port: 9875,
-            dev_logs_dir: root.join(".dev-logs"),
-            cli_args: vec![],
-            expo_dir: None,
-            expo_port: 19000,
-            runners: vec![RunnerConfig::default_primary()],
-            build_pool: BuildPoolConfig { pool_size: 1 },
-            no_prewarm: true,
-            no_webview: true,
-            temp_runner_display: None,
-        };
-        std::sync::Arc::new(crate::state::SupervisorState::new(config))
-    }
-
-    /// Run `git <args>` in `cwd`, asserting success.
-    fn git_in(cwd: &std::path::Path, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("spawn git");
-        assert!(out.status.success(), "git {args:?} failed in {cwd:?}");
-    }
-
-    /// Commit `name` on the current branch, returning the new HEAD sha.
-    fn commit_file(dir: &std::path::Path, name: &str) -> String {
-        std::fs::write(dir.join(name), name).expect("write file");
-        git_in(dir, &["add", "-A"]);
-        git_in(dir, &["commit", "-q", "-m", name]);
-        let out = std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(dir)
-            .output()
-            .expect("spawn git");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
-
-    /// Seed `state.build_pool.last_known_good` with an LKG carrying `sha`.
-    async fn seed_lkg(state: &crate::state::SharedState, sha: Option<String>) {
-        *state.build_pool.last_known_good.write().await = Some(crate::state::LkgInfo {
-            built_at: chrono::Utc::now(),
-            source_slot: 0,
-            exe_size: 1234,
-            sha,
-            source: crate::process::manager::BuildSource::LiveTree,
-        });
-    }
-
-    /// Item 8 — the motivating trap: the checkout `spawn-test {rebuild:true}`
-    /// would compile sits BEHIND the LKG, so the response must warn with the
-    /// LKG sha and a behind-count instead of silently building stale code.
-    #[tokio::test]
-    async fn build_older_than_lkg_warns_with_behind_count() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
-        git_in(root, &["init", "-q", "-b", "main"]);
-        git_in(root, &["config", "user.email", "test@example.com"]);
-        git_in(root, &["config", "user.name", "test"]);
-
-        // The tree that would be built is two commits behind the LKG's sha.
-        let built = commit_file(root, "seed.txt");
-        commit_file(root, "a.txt");
-        let lkg_sha = commit_file(root, "b.txt");
-
-        let state = make_state_at(root);
-        seed_lkg(&state, Some(lkg_sha.clone())).await;
-
-        let out = super::build_older_than_lkg_json(&state, Some(&built), None).await;
-        assert_eq!(out["older"], serde_json::json!(true), "got {out}");
-        assert_eq!(out["behind_count"], serde_json::json!(2));
-        assert_eq!(out["lkg_sha"], serde_json::json!(lkg_sha));
-        assert_eq!(out["built_sha"], serde_json::json!(built));
-        assert_eq!(out["diverged"], serde_json::json!(false));
-        assert!(
-            out["message"]
-                .as_str()
-                .unwrap()
-                .contains("build_older_than_lkg"),
-            "message must name the signal: {out}"
-        );
-    }
-
-    /// A build that already contains the LKG's commit is not older ⇒ no alarm.
-    #[tokio::test]
-    async fn build_not_older_than_lkg_is_silent() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let root = tmp.path();
-        std::fs::create_dir_all(root.join("src-tauri")).unwrap();
-        git_in(root, &["init", "-q", "-b", "main"]);
-        git_in(root, &["config", "user.email", "test@example.com"]);
-        git_in(root, &["config", "user.name", "test"]);
-
-        let lkg_sha = commit_file(root, "seed.txt");
-        let built = commit_file(root, "newer.txt");
-
-        let state = make_state_at(root);
-        seed_lkg(&state, Some(lkg_sha)).await;
-
-        let out = super::build_older_than_lkg_json(&state, Some(&built), None).await;
-        assert_eq!(out["older"], serde_json::json!(false), "got {out}");
-        assert!(out.get("behind_count").is_none());
-    }
-
-    /// REGRESSION (iteration-2): the spawn-response vintage compare must run in
-    /// the tree that was ACTUALLY compiled, not in the canonical checkout.
-    ///
-    /// Two UNRELATED repos: the canonical checkout (whose HEAD is the LKG sha)
-    /// and a caller-supplied `worktree_path` override. The override's sha does
-    /// not exist in the canonical object db at all, so a compare run there is
-    /// not computable — while the same compare run in the override tree
-    /// resolves. Threading `built_root` is what makes the difference, and that
-    /// thread-through is exactly what silently regresses.
-    #[tokio::test]
-    async fn build_older_than_lkg_compares_in_the_override_tree_not_the_canonical_checkout() {
-        let canonical_tmp = tempfile::TempDir::new().unwrap();
-        let canonical = canonical_tmp.path();
-        std::fs::create_dir_all(canonical.join("src-tauri")).unwrap();
-        git_in(canonical, &["init", "-q", "-b", "main"]);
-        git_in(canonical, &["config", "user.email", "test@example.com"]);
-        git_in(canonical, &["config", "user.name", "test"]);
-        let canonical_head = commit_file(canonical, "canonical.txt");
-
-        // A SEPARATE repo standing in for a caller-owned `worktree_path`. Its
-        // history is disjoint from the canonical checkout's.
-        let over_tmp = tempfile::TempDir::new().unwrap();
-        let over = over_tmp.path();
-        std::fs::create_dir_all(over.join("src-tauri")).unwrap();
-        git_in(over, &["init", "-q", "-b", "feature"]);
-        git_in(over, &["config", "user.email", "test@example.com"]);
-        git_in(over, &["config", "user.name", "test"]);
-        let over_built = commit_file(over, "seed.txt");
-        commit_file(over, "a.txt");
-        let over_lkg = commit_file(over, "b.txt");
-
-        let state = make_state_at(canonical);
-        seed_lkg(&state, Some(over_lkg.clone())).await;
-
-        // WITH the override root: both shas live in that repo, so the compare
-        // resolves and reports the override tree's real two-commit gap.
-        let out = super::build_older_than_lkg_json(&state, Some(&over_built), Some(over)).await;
-        assert_eq!(
-            out["older"],
-            serde_json::json!(true),
-            "the override tree's own history must be compared: {out}"
-        );
-        assert_eq!(out["behind_count"], serde_json::json!(2), "got {out}");
-        assert_eq!(out["built_sha"], serde_json::json!(over_built));
-
-        // WITHOUT it (the pre-fix behavior) the canonical checkout is probed,
-        // where the override's history does not exist. `git rev-parse` echoes a
-        // raw 40-hex sha verbatim even for an absent object, so the compare
-        // does not even fail loudly — it silently answers "not older". That
-        // false negative is precisely what threading `built_root` removes.
-        let wrong = super::build_older_than_lkg_json(&state, Some(&over_built), None).await;
-        assert_ne!(
-            wrong["older"],
-            serde_json::json!(true),
-            "fixture sanity: the canonical checkout cannot see the override tree's gap, which              is exactly why built_root must be threaded: {wrong}"
-        );
-        assert_ne!(
-            canonical_head, over_built,
-            "fixture sanity: the two trees must have different HEADs"
-        );
-    }
-
-    /// Best-effort: an LKG with no recorded sha (legacy sidecar / failed git
-    /// probe) reports a reason, never a false staleness alarm.
-    #[tokio::test]
-    async fn build_older_than_lkg_without_lkg_sha_is_not_computable() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let state = make_state_at(tmp.path());
-        seed_lkg(&state, None).await;
-
-        let out = super::build_older_than_lkg_json(&state, Some("deadbeef"), None).await;
-        assert_eq!(out["older"], serde_json::json!(false));
-        assert_eq!(out["reason"], serde_json::json!("lkg_sha_unknown"));
-    }
-
-    fn make_state() -> crate::state::SharedState {
-        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-        use std::path::PathBuf;
-        let config = SupervisorConfig {
-            project_dir: PathBuf::from("/tmp/test/src-tauri"),
-            watchdog_enabled_at_start: false,
-            auto_start: false,
-            auto_debug: false,
-            log_file: None,
-            log_dir: None,
-            port: 9875,
-            dev_logs_dir: PathBuf::from("/tmp/.dev-logs"),
-            cli_args: vec![],
-            expo_dir: None,
-            expo_port: 19000,
-            runners: vec![RunnerConfig::default_primary()],
-            build_pool: BuildPoolConfig { pool_size: 1 },
-            no_prewarm: false,
-            no_webview: true,
-            temp_runner_display: None,
-        };
-        std::sync::Arc::new(crate::state::SupervisorState::new(config))
-    }
-
-    #[tokio::test]
-    async fn runners_by_unit_resolves_bound_previews() {
-        use axum::extract::{Path, State};
-        let state = make_state();
-        // u1 has two attempts' previews on distinct ports; u2 has one.
-        insert_runner_with_binding(
-            &state,
-            9877,
-            Some(crate::state::PreviewBinding {
-                unit_id: "u1".into(),
-                attempt_id: Some("a1".into()),
-                git_sha: Some("0156c6775b18".into()),
-            }),
-        )
-        .await;
-        insert_runner_with_binding(
-            &state,
-            9878,
-            Some(crate::state::PreviewBinding {
-                unit_id: "u1".into(),
-                attempt_id: Some("a2".into()),
-                git_sha: None,
-            }),
-        )
-        .await;
-        insert_runner_with_binding(
-            &state,
-            9879,
-            Some(crate::state::PreviewBinding {
-                unit_id: "u2".into(),
-                attempt_id: None,
-                git_sha: None,
-            }),
-        )
-        .await;
-        // An unbound runner must never appear in any unit's handle list.
-        insert_runner_with_binding(&state, 9880, None).await;
-
-        let resp = super::runners_by_unit(State(state.clone()), Path("u1".to_string()))
-            .await
-            .expect("by-unit must succeed");
-        let arr = resp.0.as_array().expect("array body").clone();
-        assert_eq!(arr.len(), 2, "u1 has exactly two bound previews");
-        let ports: std::collections::HashSet<u64> =
-            arr.iter().map(|h| h["port"].as_u64().unwrap()).collect();
-        assert_eq!(
-            ports,
-            std::collections::HashSet::from([9877, 9878]),
-            "only u1's ports, not u2's or the unbound runner's"
-        );
-        // Handle shape: runner_id, port, ui_bridge_url, git_sha, attempt_id.
-        let a1 = arr
-            .iter()
-            .find(|h| h["attempt_id"] == "a1")
-            .expect("a1 present");
-        assert_eq!(a1["port"], 9877);
-        assert_eq!(a1["ui_bridge_url"], "http://localhost:9877/ui-bridge");
-        assert_eq!(a1["git_sha"], "0156c6775b18");
-        assert_eq!(a1["runner_id"], "test-9877");
-        let a2 = arr
-            .iter()
-            .find(|h| h["attempt_id"] == "a2")
-            .expect("a2 present");
-        assert!(a2["git_sha"].is_null(), "a2 sha not yet probed → null");
-    }
-
-    #[tokio::test]
-    async fn runners_by_unit_unknown_unit_returns_empty_not_404() {
-        use axum::extract::{Path, State};
-        let state = make_state();
-        insert_runner_with_binding(
-            &state,
-            9877,
-            Some(crate::state::PreviewBinding {
-                unit_id: "u1".into(),
-                attempt_id: Some("a1".into()),
-                git_sha: None,
-            }),
-        )
-        .await;
-        let resp = super::runners_by_unit(State(state.clone()), Path("nope".to_string()))
-            .await
-            .expect("unknown unit must be 200, not an error/404");
-        assert_eq!(
-            resp.0.as_array().expect("array body").len(),
-            0,
-            "unknown unit returns [] (a queryable answer), never 404"
-        );
-    }
-
-    // ----- friction-1: per-requester pinning + requester-scoped reaping -----
-
-    /// Insert a temp-runner placeholder owned by `requester` (or unowned when
-    /// `None`). Mirrors the spawn-test registry-insert + requester stamp. The
-    /// runner is left `running=false` so the reaper treats it as a reapable
-    /// placeholder (the spawn-test pre-build state).
-    async fn insert_temp_runner_owned(
-        state: &crate::state::SharedState,
-        port: u16,
-        requester: Option<&str>,
-    ) -> String {
-        let id = format!("test-{}", port);
-        let mut config = crate::config::RunnerConfig::default_primary();
-        config.id = id.clone();
-        config.name = id.clone();
-        config.port = port;
-        config.kind = super::RunnerKind::Temp { id: id.clone() };
-        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
-            config, false, None,
-        ));
-        if let Some(r) = requester {
-            *managed.requester_id.write().await = Some(r.to_string());
-        }
-        state.runners.write().await.insert(id.clone(), managed);
-        id
-    }
-
-    #[tokio::test]
-    async fn get_runners_surfaces_requester_id() {
-        use axum::extract::State;
-        let state = make_state();
-        insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-        insert_temp_runner_owned(&state, 9878, None).await;
-
-        let resp = super::list_runners(State(state.clone()))
-            .await
-            .expect("list must succeed");
-        let arr = resp.0.as_array().expect("array body").clone();
-
-        let r_a = arr
-            .iter()
-            .find(|r| r["port"] == 9877)
-            .expect("9877 present");
-        assert_eq!(
-            r_a["requester_id"], "session-A",
-            "owner must be surfaced so a session can pin by id, not port"
-        );
-        let r_b = arr
-            .iter()
-            .find(|r| r["port"] == 9878)
-            .expect("9878 present");
-        assert!(
-            r_b["requester_id"].is_null(),
-            "an unowned runner reports requester_id: null"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // S1 — a deaf-but-listening runner must not report healthy.
-    //
-    // The wedge that motivated this: the primary alive ~14h with 26178s of
-    // CPU, holding :9876, accepting TCP connections and answering none of
-    // them. `RunnerState::liveness` already classified it and the health
-    // refresher already escalated it (`RUNNER WEDGED`), but `GET /runners`
-    // rendered neither, so every liveness check on the box read `running`
-    // and called it healthy.
-    // ------------------------------------------------------------------
-
-    /// Put a runner into the exact wedge shape: the supervisor believes the
-    /// process is up (`running: true`, a pid), the listener probe says the
-    /// port is held, and the API probe says nothing answered.
-    async fn insert_wedged_runner(
-        state: &crate::state::SharedState,
-        port: u16,
-        last_seen: chrono::DateTime<chrono::Utc>,
-    ) -> String {
-        let id = format!("wedged-{port}");
-        let mut config = crate::config::RunnerConfig::default_primary();
-        config.id = id.clone();
-        config.name = id.clone();
-        config.port = port;
-        let managed = std::sync::Arc::new(crate::state::ManagedRunner::new_with_log_dir(
-            config, false, None,
-        ));
-        {
-            let mut r = managed.runner.write().await;
-            r.running = true;
-            r.pid = Some(148320);
-            r.last_seen_responding_at = Some(last_seen);
-        }
-        {
-            let mut c = managed.cached_health.write().await;
-            c.runner_port_open = true;
-            c.runner_responding = false;
-        }
-        state.runners.write().await.insert(id.clone(), managed);
-        id
-    }
-
-    #[tokio::test]
-    async fn list_runners_reports_a_deaf_but_listening_runner_as_wedged() {
-        use axum::extract::State;
-        let state = make_state();
-        let last_seen = chrono::Utc::now() - chrono::Duration::hours(14);
-        let id = insert_wedged_runner(&state, 9876, last_seen).await;
-
-        let resp = super::list_runners(State(state.clone()))
-            .await
-            .expect("list must succeed");
-        let arr = resp.0.as_array().expect("array body").clone();
-        let row = arr
-            .iter()
-            .find(|r| r["id"] == id.as_str())
-            .expect("the wedged runner is listed");
-
-        assert_eq!(
-            row["liveness"]["state"], "wedged",
-            "a held port with a silent API is the wedge state, not health: {row}"
-        );
-        assert_eq!(
-            row["liveness"]["unresponsive_since"],
-            last_seen.to_rfc3339(),
-            "the wedge must carry the T behind \"unresponsive since T\""
-        );
-        assert_eq!(
-            row["running"], true,
-            "the supervisor still believes the process is up — `running` alone              is exactly why the wedge was invisible, and it keeps its value"
-        );
-        assert_eq!(row["api_responding"], false);
-        assert_eq!(row["port_open"], true);
-        assert_eq!(row["last_seen_responding_at"], last_seen.to_rfc3339());
-    }
-
-    /// The additive contract: every row carries `liveness` as an object with
-    /// a `state` string, whatever the runner's condition — a consumer never
-    /// has to branch on the JSON type before reading the verdict, and an
-    /// un-probed runner says `unknown` rather than going missing.
-    #[tokio::test]
-    async fn every_runner_row_carries_a_liveness_object_with_a_state_string() {
-        use axum::extract::State;
-        let state = make_state(); // already seeds the configured primary
-        let wedged_id = insert_wedged_runner(&state, 9876, chrono::Utc::now()).await;
-        let temp_id = insert_temp_runner_owned(&state, 9877, None).await;
-
-        let resp = super::list_runners(State(state.clone()))
-            .await
-            .expect("list must succeed");
-        let arr = resp.0.as_array().expect("array body").clone();
-        assert!(
-            arr.len() >= 3,
-            "the seeded primary plus both inserts are listed: {arr:?}"
-        );
-        assert!(arr.iter().any(|r| r["id"] == wedged_id.as_str()));
-
-        for row in &arr {
-            let state_field = row["liveness"]["state"]
-                .as_str()
-                .unwrap_or_else(|| panic!("liveness.state must be a string: {row}"));
-            assert!(
-                matches!(state_field, "responding" | "wedged" | "stopped" | "unknown"),
-                "unexpected liveness state {state_field:?}: {row}"
-            );
-            assert!(
-                row["liveness"].get("unresponsive_since").is_some(),
-                "unresponsive_since is always present (null when N/A): {row}"
-            );
-            // The pre-existing fields are untouched by this addition.
-            assert!(row.get("running").is_some());
-            assert!(row.get("api_responding").is_some());
-        }
-
-        let unprobed = arr
-            .iter()
-            .find(|r| r["id"] == temp_id.as_str())
-            .expect("the never-probed temp runner is present");
-        assert_eq!(
-            unprobed["liveness"]["state"], "unknown",
-            "a runner the refresher has not reached is UNKNOWN, never `stopped`"
-        );
-    }
-
-    // ---------------------------------------------------------------------
-    // Wire shape `GET /builds` owes the Phase 3 verification harness.
-    //
-    // `scripts/verify-scoped-cleanup.ps1` is Windows-only and CI is
-    // `ubuntu-latest`, so the harness can never run on the merge gate — the
-    // same reason the sibling pins exist in `crate::diagnostics` and
-    // `crate::process::slot_territory`. This is the pin for the field it reads
-    // off THIS route.
-    // ---------------------------------------------------------------------
-
-    /// `pool_size` must stay on the `GET /builds` body, as a positive number.
-    ///
-    /// The harness's `Resolve-PoolSize` reads `$builds.pool_size` and feeds it
-    /// to `Get-SlotTargetDirs`, which decides how many slot territories get a
-    /// probe — so this one field bounds what assertion V2-3 ("orphans in the
-    /// OTHER pool slots are still ALIVE") can even see.
-    ///
-    /// This field used to be a SOFT dependency: a rename degraded to a
-    /// hardcoded `$PoolSize = 3`, and the run continued while quietly checking
-    /// the wrong number of slots. PR #139 deleted that default precisely
-    /// because the silent-undersize case manufactures a false PASS — which
-    /// makes the dependency HARD: rename or drop `pool_size` now and every
-    /// harness run aborts at preflight with "could not establish the build pool
-    /// size", on a fleet where the Rust suite stays entirely green. Escalating
-    /// the consumer's failure mode is what makes this pin necessary, not
-    /// optional.
-    #[tokio::test]
-    async fn list_builds_emits_the_pool_size_the_harness_refuses_to_run_without() {
-        use axum::extract::{Query, State};
-        use axum::response::IntoResponse;
-        let state = make_state(); // BuildPoolConfig { pool_size: 1 }
-
-        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
-            .await
-            .into_response();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read /builds body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
-
-        let pool_size = body
-            .get("pool_size")
-            .expect("`pool_size` is a hard dependency of verify-scoped-cleanup.ps1");
-        assert!(
-            pool_size.is_u64(),
-            "the harness casts this with [int]; a string or null is a contract miss: {body}"
-        );
-        assert_eq!(
-            pool_size.as_u64(),
-            Some(state.build_pool.slots.len() as u64),
-            "pool_size must report the REAL slot count — the harness plants one \
-             probe per slot and an undersized value silently narrows V2-3"
-        );
-        assert!(
-            pool_size.as_u64().unwrap_or(0) > 0,
-            "the harness treats a non-positive pool_size as an unusable answer \
-             and aborts; a live pool is never zero-sized"
-        );
-    }
-
-    /// A never-computed drift reading must not serialize as "no drift".
-    ///
-    /// `origin_main_drift` is `null` both when the LKG is up to date and when
-    /// nothing has been computed yet — indistinguishable to a reader, which is
-    /// the confident-looking default `verification-and-evidence` /
-    /// `unknown-must-not-render-as-a-default` forbids. `origin_main_drift_probe`
-    /// is what separates them, so it has to be present on a fresh state.
-    #[tokio::test]
-    async fn list_builds_reports_an_uncomputed_drift_as_pending_not_as_no_drift() {
-        use axum::extract::{Query, State};
-        use axum::response::IntoResponse;
-        let state = make_state();
-        assert!(
-            state.origin_drift.read().await.is_none(),
-            "a fresh state has no drift reading yet"
-        );
-
-        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
-            .await
-            .into_response();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read /builds body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
-
-        assert!(
-            body["origin_main_drift"].is_null(),
-            "nothing computed yet, so there is no drift to report"
-        );
-        let probe = body
-            .get("origin_main_drift_probe")
-            .expect("the probe field is what makes `null` readable");
-        assert_eq!(
-            probe["state"], "pending",
-            "never-computed must be distinguishable from up-to-date: {body}"
-        );
-        assert!(
-            probe["computed_at"].is_null() && probe["age_secs"].is_null(),
-            "a pending reading has no timestamp to report: {probe}"
-        );
-    }
-
-    /// A cached reading computed for a SUPERSEDED LKG sha must say so.
-    ///
-    /// The drift cache is refreshed on a timer, so the LKG can move between
-    /// refreshes. Serving the old reading as current would answer a question
-    /// nobody asked — about a build that is no longer the LKG.
-    #[tokio::test]
-    async fn list_builds_marks_a_drift_reading_superseded_when_the_lkg_moved() {
-        use axum::extract::{Query, State};
-        use axum::response::IntoResponse;
-        let state = make_state();
-
-        *state.build_pool.last_known_good.write().await = Some(crate::state::LkgInfo {
-            built_at: chrono::Utc::now(),
-            source_slot: 0,
-            exe_size: 1,
-            sha: Some("bbbbbbbb".to_string()),
-            source: crate::process::manager::BuildSource::OriginMain,
-        });
-        // Reading was computed for a DIFFERENT sha than the LKG now records.
-        *state.origin_drift.write().await = Some(crate::state::OriginDriftSnapshot {
-            built_sha: "aaaaaaaa".to_string(),
-            drift: crate::git_provenance::OriginMainDrift {
-                built_sha: "aaaaaaaa".to_string(),
-                origin_main_sha: "cccccccc".to_string(),
-                behind_count: 7,
-                is_ancestor: true,
-                fetched: true,
-            },
-            computed_at: chrono::Utc::now(),
-        });
-
-        let resp = super::list_builds(State(state.clone()), Query(Default::default()))
-            .await
-            .into_response();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("read /builds body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("/builds is JSON");
-
-        let probe = &body["origin_main_drift_probe"];
-        assert_eq!(
-            probe["state"], "superseded_lkg_moved",
-            "a reading for a stale sha must not read as current: {body}"
-        );
-        assert_eq!(
-            probe["computed_for_sha"], "aaaaaaaa",
-            "say WHICH sha the reading answers for, so the gap is checkable"
-        );
-        assert!(
-            body["origin_main_drift"].is_null(),
-            "a superseded reading must not be published as the drift itself"
-        );
-    }
-
-    #[tokio::test]
-    async fn scoped_purge_never_evicts_another_requesters_runner() {
-        // Two sessions each own a placeholder; both look dead (running=false).
-        // Session-A purges scoped to itself — only A's runner is reaped, B's
-        // (and an unowned third) survive untouched.
-        let state = make_state();
-        let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-        let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-        let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
-
-        let purged = super::purge_stale_test_runners_core(&state, false, Some("session-A")).await;
-
-        let purged_ids: std::collections::HashSet<String> =
-            purged.into_iter().map(|(id, _, _)| id).collect();
-        assert!(
-            purged_ids.contains(&id_a),
-            "session-A's own stale runner must be reaped"
-        );
-        assert!(
-            !purged_ids.contains(&id_b),
-            "session-B's runner must NOT be reaped by session-A's scoped purge"
-        );
-        assert!(
-            !purged_ids.contains(&id_unowned),
-            "an unowned runner is not 'this requester's' and must not be reaped under a scoped purge"
-        );
-
-        let registry = state.runners.read().await;
-        assert!(!registry.contains_key(&id_a), "A removed from registry");
-        assert!(registry.contains_key(&id_b), "B survives in registry");
-        assert!(
-            registry.contains_key(&id_unowned),
-            "unowned survives in registry"
-        );
-    }
-
-    #[tokio::test]
-    async fn unscoped_purge_reaps_all_stale_runners() {
-        // The periodic sweep / body-less purge-stale passes None and reaps
-        // every stale test runner regardless of owner (legacy behavior).
-        let state = make_state();
-        let id_a = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-        let id_b = insert_temp_runner_owned(&state, 9878, Some("session-B")).await;
-        let id_unowned = insert_temp_runner_owned(&state, 9879, None).await;
-
-        let purged = super::purge_stale_test_runners_core(&state, false, None).await;
-        let purged_ids: std::collections::HashSet<String> =
-            purged.into_iter().map(|(id, _, _)| id).collect();
-
-        for id in [&id_a, &id_b, &id_unowned] {
-            assert!(purged_ids.contains(id), "unscoped purge reaps {id}");
-        }
-    }
-
-    #[tokio::test]
-    async fn temp_runner_port_is_stable_for_its_lifetime() {
-        // A runner's port lives on its immutable RunnerConfig and the allocator
-        // only ever picks ports NOT already held by a runner in the registry —
-        // so no concurrent spawn can be handed a live runner's port, and a
-        // runner's own port never changes while it is registered.
-        let state = make_state();
-        let id = insert_temp_runner_owned(&state, 9877, Some("session-A")).await;
-
-        // The allocator's used-port set (the exact expression spawn_test uses).
-        let used_ports: std::collections::HashSet<u16> = {
-            let runners = state.runners.read().await;
-            runners.values().map(|r| r.config.port).collect()
-        };
-        let next = (9877..=9899)
-            .find(|p| !used_ports.contains(p))
-            .expect("a free port exists");
-        assert_ne!(
-            next, 9877,
-            "the next allocation must skip the live runner's port"
-        );
-
-        // The live runner's port is unchanged after the (hypothetical) sibling
-        // allocation — config.port is set once at insert and never reassigned.
-        let port_now = {
-            let runners = state.runners.read().await;
-            runners.get(&id).expect("still registered").config.port
-        };
-        assert_eq!(port_now, 9877, "a live runner's port is immutable");
-    }
-    // -------------------------------------------------------------------
-    // spawn-test single flight, keyed by (requester_id, build target).
-    //
-    // Three pool slots is the scarce resource: a retry of a `curl` that looked
-    // like it returned nothing must JOIN the build already running for that
-    // key, not claim a second slot to compile the identical tree.
-    // -------------------------------------------------------------------
-
-    /// Anonymous requests never join — not each other, and not a keyed build.
-    /// With no requester there is no way to tell one caller retrying from two
-    /// unrelated callers, and collapsing the latter hands a caller someone
-    /// else's runner.
-    #[test]
-    fn spawn_dedup_key_is_none_for_anonymous_requests() {
-        use super::{spawn_dedup_key as k, SpawnBuildSource};
-        assert!(k(None, true, false, &SpawnBuildSource::DefaultOriginMain).is_none());
-        assert!(k(Some(""), true, false, &SpawnBuildSource::DefaultOriginMain).is_none());
-        assert!(
-            k(
-                Some("   "),
-                true,
-                false,
-                &SpawnBuildSource::DefaultOriginMain
-            )
-            .is_none(),
-            "a whitespace-only requester is anonymous, not an identity"
-        );
-    }
-
-    /// A request that claims no build-pool slot is not worth single-flighting:
-    /// `rebuild:false` spawns from an existing slot exe / the LKG, and two such
-    /// callers legitimately want two runners.
-    #[test]
-    fn spawn_dedup_key_is_none_without_rebuild() {
-        use super::{spawn_dedup_key as k, SpawnBuildSource};
-        assert!(k(Some("agent-1"), false, false, &SpawnBuildSource::LiveTree).is_none());
-    }
-
-    /// Every distinct build target is its own single flight: the four sources,
-    /// the operands of the two that carry one, and the `frontend_only` variant
-    /// of a tree (which would otherwise be handed the stale dist it asked to
-    /// have replaced).
-    #[test]
-    fn spawn_dedup_key_distinguishes_every_build_target() {
-        use super::{spawn_dedup_key as k, SpawnBuildSource};
-        let key = |rebuild, frontend_only, source: &SpawnBuildSource| {
-            k(Some("agent-1"), rebuild, frontend_only, source).expect("keyed")
-        };
-        let targets: Vec<String> = vec![
-            key(true, false, &SpawnBuildSource::DefaultOriginMain),
-            key(true, false, &SpawnBuildSource::LiveTree),
-            key(true, false, &SpawnBuildSource::ExplicitRef("feat/x".into())),
-            key(true, false, &SpawnBuildSource::ExplicitRef("feat/y".into())),
-            key(true, false, &SpawnBuildSource::WorktreePath("D:/a".into())),
-            key(true, false, &SpawnBuildSource::WorktreePath("D:/b".into())),
-            key(true, true, &SpawnBuildSource::DefaultOriginMain),
-        ]
-        .into_iter()
-        .map(|k| k.build_target)
-        .collect();
-
-        let unique: std::collections::HashSet<&String> = targets.iter().collect();
-        assert_eq!(
-            unique.len(),
-            targets.len(),
-            "every distinct build target must be its own single flight: {targets:?}"
-        );
-
-        // ...while the SAME request twice is the same key — that is the join.
-        assert_eq!(
-            key(true, false, &SpawnBuildSource::DefaultOriginMain),
-            key(true, false, &SpawnBuildSource::DefaultOriginMain)
-        );
-        // A different requester on the same target is a different key.
-        assert_ne!(
-            k(
-                Some("agent-1"),
-                true,
-                false,
-                &SpawnBuildSource::DefaultOriginMain
-            ),
-            k(
-                Some("agent-2"),
-                true,
-                false,
-                &SpawnBuildSource::DefaultOriginMain
-            )
-        );
-    }
-
-    /// End-to-end through the handler: a second `spawn-test` for a key whose
-    /// build is still running returns 202 + `deduplicated: true` carrying the
-    /// EXISTING `build_id`, runner id and port — and starts no build, so the
-    /// test is deterministic (this path returns before any port reservation).
-    #[tokio::test]
-    async fn spawn_test_joins_an_in_flight_build_instead_of_claiming_a_second_slot() {
-        use axum::extract::State;
-        use axum::response::IntoResponse;
-        let state = make_state();
-
-        // A live build for (agent-1, origin_main) — what a plain
-        // `{requester_id, rebuild:true}` request resolves to.
-        let existing_id = uuid::Uuid::new_v4();
-        state
-            .build_submissions
-            .insert(crate::build_submissions::BuildSubmission {
-                id: existing_id,
-                worktree_path: std::path::PathBuf::from("/tmp/test/src-tauri"),
-                source: None,
-                build_kind: crate::build_submissions::BuildKind::Build,
-                agent_id: Some("agent-1".to_string()),
-                package: None,
-                features: vec![],
-                base_ref: None,
-                submitted_at: chrono::Utc::now(),
-                status: crate::build_submissions::BuildStatus::Running {
-                    started_at: chrono::Utc::now(),
-                },
-                cache_key: None,
-                cache_outcome: None,
-                cache_hit: false,
-                stdout_tail: vec![],
-                stderr_tail: vec![],
-                spawn: None,
-                detached: None,
-            })
-            .await;
-        state.spawn_test_inflight.write().await.insert(
-            crate::state::SpawnDedupKey {
-                requester_id: "agent-1".to_string(),
-                build_target: "origin_main".to_string(),
-            },
-            crate::state::SpawnInflight {
-                submission_id: existing_id,
-                runner_id: "test-abc".to_string(),
-                port: 9880,
-            },
-        );
-
-        let resp = super::spawn_test(
-            State(state.clone()),
-            axum::http::HeaderMap::new(),
-            axum::Json(serde_json::json!({"requester_id": "agent-1", "rebuild": true})),
-        )
-        .await
-        .expect("handler ok")
-        .into_response();
-
-        let status = resp.status().as_u16();
-        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .expect("collect body");
-        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("JSON body");
-
-        assert_eq!(
-            status, 202,
-            "a joined request is an accept, not a new build"
-        );
-        assert_eq!(body["deduplicated"], true);
-        assert_eq!(
-            body["build_id"], body["submission_id"],
-            "build_id IS the submission id — one build identity"
-        );
-        assert_eq!(
-            body["build_id"],
-            existing_id.to_string(),
-            "the joiner must be handed the EXISTING build_id, not a fresh one"
-        );
-        assert_eq!(body["id"], "test-abc", "and the existing runner");
-        assert_eq!(body["port"], 9880);
-
-        // No second runner was reserved: the registry still holds only the
-        // configured primary, and the index still points at the one build.
-        assert_eq!(
-            state.spawn_test_inflight.read().await.len(),
-            1,
-            "joining must not record a second in-flight build"
-        );
-    }
-}
+mod tests;

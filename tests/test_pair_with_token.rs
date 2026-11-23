@@ -29,13 +29,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
+use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::routing::post;
-use axum::Router;
+use axum::{Json, Router};
 use tower::ServiceExt;
 
 use qontinui_supervisor::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
-use qontinui_supervisor::routes::runners_pair::pair_with_token;
+use qontinui_supervisor::routes::runners_pair::{
+    pair_with_token, pair_with_token_copying_into, PairWithTokenRequest, PRIVATE_CLI_COPY_PREFIX,
+};
 use qontinui_supervisor::state::{SharedState, SupervisorState};
 
 fn test_config() -> SupervisorConfig {
@@ -60,10 +63,13 @@ fn test_config() -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: BuildPoolConfig { pool_size: 1 },
+        build_pool: BuildPoolConfig::fixed(1),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_boot_id: qontinui_supervisor::config::AmbientBootId::Ignore,
     }
 }
 
@@ -73,6 +79,31 @@ fn build_app() -> (Router, SharedState) {
         .route("/runners/pair-with-token", post(pair_with_token))
         .with_state(state.clone());
     (router, state)
+}
+
+/// A router whose pair handler writes its private CLI copies under
+/// `copy_root` instead of the live supervisor's per-user data dir. Every test
+/// that reaches the spawn goes through this, so none writes outside its own
+/// tempdir.
+fn build_app_copying_into(state: SharedState, copy_root: PathBuf) -> Router {
+    Router::new()
+        .route(
+            "/runners/pair-with-token",
+            post(
+                move |State(state): State<SharedState>, Json(body): Json<PairWithTokenRequest>| {
+                    let copy_root = copy_root.clone();
+                    async move { pair_with_token_copying_into(state, body, copy_root).await }
+                },
+            ),
+        )
+        .with_state(state)
+}
+
+/// A fresh private-copy root inside `tmp`.
+fn copy_root_in(tmp: &std::path::Path) -> PathBuf {
+    let root = tmp.join("pair-cli-copies");
+    std::fs::create_dir_all(&root).expect("mkdir copy root");
+    root
 }
 
 async fn post_json(app: Router, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
@@ -267,8 +298,12 @@ async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
     // which the stub command ignores. The stub exits non-zero, and we
     // assert the response carries the discriminator + exit_code + the
     // captured (empty) stderr.
-    let stub_path = pick_failing_stub();
-    let (app, _state) = build_app();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    // Per-test private dir: a fixed path in the shared temp dir is rewritten
+    // by concurrent cargo runs (other worktrees), which races exec (ETXTBSY).
+    let stub_path = pick_failing_stub(tmp.path());
+    let state = Arc::new(SupervisorState::new(test_config()));
+    let app = build_app_copying_into(state, copy_root_in(tmp.path()));
     let (status, body) = post_json(
         app,
         serde_json::json!({
@@ -294,22 +329,179 @@ async fn cli_exit_nonzero_surfaces_as_pair_cli_failed() {
     assert!(body["stderr"].is_string(), "stderr must be a string");
 }
 
+/// S2 (review round 1): the RESOLVED `qontinui_profile` must never run in
+/// place. A running image locks its file on Windows, and a build that then
+/// lands in that slot panics in tauri-build's `remove_file().unwrap()`. The
+/// handler runs a private copy instead.
+///
+/// The slot's file here is non-empty but not a runnable image, so the spawn
+/// fails on every platform and the `pair_cli_spawn_failed` message names the
+/// path that was actually executed — which must not be the slot's file.
+#[tokio::test]
+async fn resolved_qontinui_profile_is_not_executed_in_place() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runner = tmp.path().join("qontinui-runner");
+    let src_tauri = runner.join("src-tauri");
+    std::fs::create_dir_all(&src_tauri).expect("mkdir src-tauri");
+    let slot_debug = runner.join("target-pool").join("slot-0").join("debug");
+    std::fs::create_dir_all(&slot_debug).expect("mkdir slot debug");
+    let exe_name = if cfg!(windows) {
+        "qontinui_profile.exe"
+    } else {
+        "qontinui_profile"
+    };
+    let slot_binary = slot_debug.join(exe_name);
+    std::fs::write(&slot_binary, b"not-a-runnable-image").expect("write slot binary");
+
+    let mut config = test_config();
+    config.project_dir = src_tauri;
+    let state = Arc::new(SupervisorState::new(config));
+    let copy_root = copy_root_in(tmp.path());
+    let app = build_app_copying_into(state, copy_root.clone());
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "body: {body}");
+    assert_eq!(body["error"], "pair_cli_spawn_failed", "body: {body}");
+    let message = body["message"].as_str().expect("message");
+    let canonical_slot = slot_binary.canonicalize().expect("canonical slot binary");
+    for executed_in_place in [
+        format!("failed to spawn {:?}", slot_binary),
+        format!("failed to spawn {:?}", canonical_slot),
+    ] {
+        assert!(
+            !message.starts_with(&executed_in_place),
+            "the slot's qontinui_profile was executed in place: {message}"
+        );
+    }
+    // POSITIVE: what was spawned is a private copy under the root the handler
+    // was given. Both sides are Debug renderings of paths built from the same
+    // `copy_root` value, so no canonical/8.3/verbatim form can make this pass
+    // or fail spuriously: the spawned path's rendering begins with the root's
+    // (minus its closing quote), then the private-copy directory prefix.
+    let root_rendered = format!("{:?}", copy_root);
+    let root_rendered = root_rendered.trim_end_matches('"');
+    let expected_prefix = format!("failed to spawn {root_rendered}");
+    assert!(
+        message.starts_with(&expected_prefix),
+        "the spawned file must sit under the private copy root {root_rendered}: {message}"
+    );
+    assert!(
+        message[expected_prefix.len()..].contains(PRIVATE_CLI_COPY_PREFIX),
+        "the spawned file must sit in a `{PRIVATE_CLI_COPY_PREFIX}*` directory: {message}"
+    );
+    assert!(
+        slot_binary.exists(),
+        "the slot's file must be left where it was"
+    );
+}
+
+/// S2, behaviourally: the pair CLI that actually RUNS is a private copy, not
+/// the file the route was handed. The stub prints its own full path to stderr
+/// and exits 2, so the 502 body's `stderr` says which file executed —
+/// independent of how any error message is worded. Driven through the
+/// override, which takes the same private-copy path as a resolved binary.
+#[tokio::test]
+async fn the_pair_cli_that_runs_is_a_private_copy() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let build_dir = tmp.path().join("target-pool").join("slot-0").join("debug");
+    std::fs::create_dir_all(&build_dir).expect("mkdir build dir");
+    let stub = write_self_reporting_stub(&build_dir);
+    let copy_root = copy_root_in(tmp.path());
+
+    let state = Arc::new(SupervisorState::new(test_config()));
+    let app = build_app_copying_into(state, copy_root.clone());
+    let (status, body) = post_json(
+        app,
+        serde_json::json!({
+            "token": "some-token",
+            "tenant_id": "11111111-1111-4111-8111-111111111111",
+            "qontinui_profile_path_override": stub.to_string_lossy(),
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "body: {body}");
+    assert_eq!(body["error"], "pair_cli_failed", "body: {body}");
+    let ran = PathBuf::from(body["stderr"].as_str().expect("stderr").trim());
+    assert!(
+        ran.file_name().is_some(),
+        "the stub must have reported its own path: {body}"
+    );
+    assert_eq!(
+        ran.file_name(),
+        stub.file_name(),
+        "the copy keeps the file name"
+    );
+    let canonical_build_dir = build_dir.canonicalize().expect("canonical build dir");
+    assert!(
+        !ran.starts_with(&build_dir) && !ran.starts_with(&canonical_build_dir),
+        "the build directory's file was executed in place: {}",
+        ran.display()
+    );
+    // POSITIVE: the stub ran from a `qontinui-supervisor-pair-cli-*` directory
+    // directly under the root the handler was given. Compared by component
+    // NAMES, so an 8.3 or `\\?\` spelling of the tempdir cannot matter.
+    let private_dir = ran.parent().expect("the stub ran from a directory");
+    let private_dir_name = private_dir
+        .file_name()
+        .expect("private dir name")
+        .to_string_lossy();
+    assert!(
+        private_dir_name.starts_with(PRIVATE_CLI_COPY_PREFIX),
+        "the stub must run from a `{PRIVATE_CLI_COPY_PREFIX}*` directory, ran from {}",
+        ran.display()
+    );
+    assert_eq!(
+        private_dir.parent().and_then(|p| p.file_name()),
+        copy_root.file_name(),
+        "the private copy directory must sit directly under the given root: {}",
+        ran.display()
+    );
+    assert!(stub.exists(), "the handed file is left where it was");
+}
+
+/// A stub that prints its own full path to stderr and exits 2.
 #[cfg(windows)]
-fn pick_failing_stub() -> PathBuf {
+fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
+    let stub = dir.join("qontinui_profile_stub.cmd");
+    std::fs::write(&stub, b"@echo %~f0 1>&2\r\n@exit /b 2\r\n").expect("write stub");
+    stub
+}
+
+#[cfg(not(windows))]
+fn write_self_reporting_stub(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let stub = dir.join("qontinui_profile_stub.sh");
+    std::fs::write(&stub, b"#!/bin/sh\necho \"$0\" >&2\nexit 2\n").expect("write stub");
+    let mut perms = std::fs::metadata(&stub).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&stub, perms).expect("set perms");
+    stub
+}
+
+#[cfg(windows)]
+fn pick_failing_stub(dir: &std::path::Path) -> PathBuf {
     // On Windows there's no `/bin/false`. Use a small .bat file written to
     // a tempdir that exits with code 2 regardless of args. We can't use
     // `cmd /c exit 2` directly as the override because tokio's Command
     // expects a binary, not a shell built-in (it would try to exec
     // "/bin/cmd" or similar).
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.cmd");
+    let tmp = dir.join("failing_stub.cmd");
     std::fs::write(&tmp, b"@exit /b 2\r\n").expect("write stub");
     tmp
 }
 
 #[cfg(not(windows))]
-fn pick_failing_stub() -> PathBuf {
+fn pick_failing_stub(dir: &std::path::Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
-    let tmp = std::env::temp_dir().join("qontinui_supervisor_failing_stub.sh");
+    let tmp = dir.join("failing_stub.sh");
     std::fs::write(&tmp, b"#!/bin/sh\nexit 2\n").expect("write stub");
     let mut perms = std::fs::metadata(&tmp).expect("metadata").permissions();
     perms.set_mode(0o755);

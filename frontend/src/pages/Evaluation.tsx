@@ -307,7 +307,10 @@ export default function Evaluation() {
           )}
         </div>
       </div>
-      <p className="page-desc">Benchmark workflow generation quality — run test prompts and score across structural, command, and completeness dimensions.</p>
+      <p className="page-desc">
+        Benchmark workflow generation quality — run test prompts and score across structural,
+        command, and completeness dimensions.
+      </p>
 
       {/* Status bar */}
       {status?.running && (
@@ -527,7 +530,12 @@ export default function Evaluation() {
           }}
         >
           <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
-            <label htmlFor="eval-category-filter" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Category:</label>
+            <label
+              htmlFor="eval-category-filter"
+              style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}
+            >
+              Category:
+            </label>
             <select
               id="eval-category-filter"
               value={categoryFilter}
@@ -556,7 +564,12 @@ export default function Evaluation() {
             </select>
           </div>
           <div style={{ display: 'flex', gap: '0.35rem', alignItems: 'center' }}>
-            <label htmlFor="eval-complexity-filter" style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Complexity:</label>
+            <label
+              htmlFor="eval-complexity-filter"
+              style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}
+            >
+              Complexity:
+            </label>
             <select
               id="eval-complexity-filter"
               value={complexityFilter}

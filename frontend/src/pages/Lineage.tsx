@@ -216,153 +216,153 @@ export default function Lineage() {
         </div>
       ) : (
         <>
-      {/* Stats tiles */}
-      <div className="card-grid" style={{ marginBottom: '1rem' }}>
-        <div className="card">
-          <div className="card-title">Commits</div>
-          <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.commits ?? '—'}</div>
-          <div className="text-muted" style={{ fontSize: '0.75rem' }}>
-            {totals ? `${totals.attributed} attributed (${attributionPct}%)` : 'no data'}
+          {/* Stats tiles */}
+          <div className="card-grid" style={{ marginBottom: '1rem' }}>
+            <div className="card">
+              <div className="card-title">Commits</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.commits ?? '—'}</div>
+              <div className="text-muted" style={{ fontSize: '0.75rem' }}>
+                {totals ? `${totals.attributed} attributed (${attributionPct}%)` : 'no data'}
+              </div>
+            </div>
+            <div className="card">
+              <div className="card-title">Sessions</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.sessions ?? '—'}</div>
+            </div>
+            <div className="card">
+              <div className="card-title">Repos</div>
+              <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.repos ?? '—'}</div>
+            </div>
+            <div className="card">
+              <div className="card-title">By source</div>
+              <div className="flex gap-2" style={{ flexWrap: 'wrap', marginTop: '0.3rem' }}>
+                {stats && stats.by_source.length > 0 ? (
+                  stats.by_source.map((s) => (
+                    <span
+                      key={s.source}
+                      className="badge"
+                      style={{ fontSize: '0.7rem', background: 'var(--bg-tertiary)' }}
+                      title={`${s.commits} commits`}
+                    >
+                      {s.source}: {s.commits}
+                    </span>
+                  ))
+                ) : (
+                  <span className="text-muted">—</span>
+                )}
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="card">
-          <div className="card-title">Sessions</div>
-          <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.sessions ?? '—'}</div>
-        </div>
-        <div className="card">
-          <div className="card-title">Repos</div>
-          <div style={{ fontSize: '1.6rem', fontWeight: 600 }}>{totals?.repos ?? '—'}</div>
-        </div>
-        <div className="card">
-          <div className="card-title">By source</div>
-          <div className="flex gap-2" style={{ flexWrap: 'wrap', marginTop: '0.3rem' }}>
-            {stats && stats.by_source.length > 0 ? (
-              stats.by_source.map((s) => (
-                <span
-                  key={s.source}
-                  className="badge"
-                  style={{ fontSize: '0.7rem', background: 'var(--bg-tertiary)' }}
-                  title={`${s.commits} commits`}
-                >
-                  {s.source}: {s.commits}
-                </span>
-              ))
+
+          {/* Top sessions */}
+          <div className="card" style={{ marginBottom: '1rem' }}>
+            <div className="card-header">
+              <span className="card-title">Top sessions</span>
+            </div>
+            {stats && stats.top_sessions.length > 0 ? (
+              <div className="table-container" style={{ marginTop: '0.5rem' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Session</th>
+                      <th>Commits</th>
+                      <th>Last commit</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stats.top_sessions.map((s) => (
+                      <tr key={s.agent_session_id}>
+                        <td>
+                          <SessionChip
+                            sessionId={s.agent_session_id}
+                            sessionName={s.session_name}
+                            jwt={jwt}
+                          />
+                        </td>
+                        <td>{s.commits}</td>
+                        <td>{formatTs(s.last_commit_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : (
-              <span className="text-muted">—</span>
+              <div className="text-muted" style={{ marginTop: '0.5rem' }}>
+                No session attribution yet.
+              </div>
             )}
           </div>
-        </div>
-      </div>
 
-      {/* Top sessions */}
-      <div className="card" style={{ marginBottom: '1rem' }}>
-        <div className="card-header">
-          <span className="card-title">Top sessions</span>
-        </div>
-        {stats && stats.top_sessions.length > 0 ? (
-          <div className="table-container" style={{ marginTop: '0.5rem' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Session</th>
-                  <th>Commits</th>
-                  <th>Last commit</th>
-                </tr>
-              </thead>
-              <tbody>
-                {stats.top_sessions.map((s) => (
-                  <tr key={s.agent_session_id}>
-                    <td>
-                      <SessionChip
-                        sessionId={s.agent_session_id}
-                        sessionName={s.session_name}
-                        jwt={jwt}
-                      />
-                    </td>
-                    <td>{s.commits}</td>
-                    <td>{formatTs(s.last_commit_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          {/* Recent commits */}
+          <div className="card">
+            <div className="card-header">
+              <span className="card-title">Recent commits</span>
+              <span className={`badge ${rows.length > 0 ? 'badge-success' : 'badge-warning'}`}>
+                {rows.length}
+              </span>
+            </div>
+            {rows.length > 0 ? (
+              <div className="table-container" style={{ marginTop: '0.5rem' }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Commit</th>
+                      <th>Repo</th>
+                      <th>Branch</th>
+                      <th>PR</th>
+                      <th>Session</th>
+                      <th>Source</th>
+                      <th>When</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r) => (
+                      <tr key={r.commit_sha}>
+                        <td className="text-mono">
+                          <a
+                            href={`${GITHUB}/${r.repo}/commit/${r.commit_sha}`}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {shortSha(r.commit_sha)}
+                          </a>
+                        </td>
+                        <td className="text-mono">{r.repo}</td>
+                        <td className="text-mono">{r.branch ?? '—'}</td>
+                        <td>{r.pr_number != null ? `#${r.pr_number}` : '—'}</td>
+                        <td>
+                          <SessionChip
+                            sessionId={r.agent_session_id}
+                            sessionName={r.session_name}
+                            jwt={jwt}
+                          />
+                        </td>
+                        <td>
+                          <span
+                            className="badge"
+                            style={{ fontSize: '0.68rem', background: 'var(--bg-tertiary)' }}
+                          >
+                            {r.source}
+                          </span>
+                        </td>
+                        <td>{formatTs(r.recorded_at)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="text-muted" style={{ marginTop: '0.5rem' }}>
+                {loading
+                  ? 'Loading…'
+                  : error
+                    ? 'Could not load lineage — see the banner above.'
+                    : hasFetched
+                      ? 'No lineage rows. Coord is reachable but has no recorded commits yet.'
+                      : 'Press Refresh to load lineage.'}
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="text-muted" style={{ marginTop: '0.5rem' }}>
-            No session attribution yet.
-          </div>
-        )}
-      </div>
-
-      {/* Recent commits */}
-      <div className="card">
-        <div className="card-header">
-          <span className="card-title">Recent commits</span>
-          <span className={`badge ${rows.length > 0 ? 'badge-success' : 'badge-warning'}`}>
-            {rows.length}
-          </span>
-        </div>
-        {rows.length > 0 ? (
-          <div className="table-container" style={{ marginTop: '0.5rem' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Commit</th>
-                  <th>Repo</th>
-                  <th>Branch</th>
-                  <th>PR</th>
-                  <th>Session</th>
-                  <th>Source</th>
-                  <th>When</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr key={r.commit_sha}>
-                    <td className="text-mono">
-                      <a
-                        href={`${GITHUB}/${r.repo}/commit/${r.commit_sha}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        {shortSha(r.commit_sha)}
-                      </a>
-                    </td>
-                    <td className="text-mono">{r.repo}</td>
-                    <td className="text-mono">{r.branch ?? '—'}</td>
-                    <td>{r.pr_number != null ? `#${r.pr_number}` : '—'}</td>
-                    <td>
-                      <SessionChip
-                        sessionId={r.agent_session_id}
-                        sessionName={r.session_name}
-                        jwt={jwt}
-                      />
-                    </td>
-                    <td>
-                      <span
-                        className="badge"
-                        style={{ fontSize: '0.68rem', background: 'var(--bg-tertiary)' }}
-                      >
-                        {r.source}
-                      </span>
-                    </td>
-                    <td>{formatTs(r.recorded_at)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <div className="text-muted" style={{ marginTop: '0.5rem' }}>
-            {loading
-              ? 'Loading…'
-              : error
-                ? 'Could not load lineage — see the banner above.'
-                : hasFetched
-                  ? 'No lineage rows. Coord is reachable but has no recorded commits yet.'
-                  : 'Press Refresh to load lineage.'}
-          </div>
-        )}
-      </div>
         </>
       )}
     </div>

@@ -147,15 +147,21 @@ pub fn lkg_stale_from_times(
 /// condition — a wedged or still-booting runner — that this predicate is not
 /// equipped to name. Reporting it as "not down" would hide it; reporting it as
 /// "down" is the false alarm we are removing.
+///
+/// `spawn_up` is the fourth fact (`CachedPortHealth::spawn_up`): the primary's
+/// newest spawn is alive while its port is free. A primary hung (or slow)
+/// before its listener binds has `running` lowered by the health tick, so
+/// without it this reported `True` about a live process.
 pub fn primary_down_from_facts(
     api_responding: bool,
     port_listening: bool,
     registry_running: bool,
+    spawn_up: bool,
 ) -> Eval {
     if api_responding {
         return Eval::False;
     }
-    if port_listening || registry_running {
+    if port_listening || registry_running || spawn_up {
         return Eval::Unknown;
     }
     Eval::True
@@ -245,9 +251,13 @@ pub async fn evaluate_all(state: &SharedState, resolution: SlotResolution) -> Ve
     // flakes under build load; see `primary_down_from_facts`.
     let primary_down = match state.get_primary().await {
         Some(primary) => {
-            let (port_open, cached_responding) = {
+            let (port_open, cached_responding, spawn_up) = {
                 let cached = primary.cached_health.read().await;
-                (cached.runner_port_open, cached.runner_responding)
+                (
+                    cached.runner_port_open,
+                    cached.runner_responding,
+                    cached.spawn_up,
+                )
             };
             if cached_responding {
                 Eval::False
@@ -261,7 +271,7 @@ pub async fn evaluate_all(state: &SharedState, resolution: SlotResolution) -> Ve
                     let r = primary.runner.read().await;
                     r.running || r.pid.is_some()
                 };
-                primary_down_from_facts(live_responding, port_open, registry_running)
+                primary_down_from_facts(live_responding, port_open, registry_running, spawn_up)
             }
         }
         // No primary registered ⇒ can't judge whether it's down.
@@ -416,18 +426,46 @@ mod tests {
     fn primary_down_needs_all_three_facts_to_agree() {
         // Responding ⇒ definitively not down, whatever else says.
         assert_eq!(
-            primary_down_from_facts(true, false, false),
+            primary_down_from_facts(true, false, false, false),
             Eval::False,
             "a responding primary can never be PRIMARY_DOWN"
         );
         // HEADLINE regression: probe says no, but the port is listening /
         // the registry has it running ⇒ the two signals disagree, so the
         // predicate must NOT stamp PRIMARY_DOWN.
-        assert_eq!(primary_down_from_facts(false, true, false), Eval::Unknown);
-        assert_eq!(primary_down_from_facts(false, false, true), Eval::Unknown);
-        assert_eq!(primary_down_from_facts(false, true, true), Eval::Unknown);
+        assert_eq!(
+            primary_down_from_facts(false, true, false, false),
+            Eval::Unknown
+        );
+        assert_eq!(
+            primary_down_from_facts(false, false, true, false),
+            Eval::Unknown
+        );
+        assert_eq!(
+            primary_down_from_facts(false, true, true, false),
+            Eval::Unknown
+        );
         // All three agree it's gone ⇒ the one True case.
-        assert_eq!(primary_down_from_facts(false, false, false), Eval::True);
+        assert_eq!(
+            primary_down_from_facts(false, false, false, false),
+            Eval::True
+        );
+    }
+
+    /// A primary alive on its newest spawn with its port free and its
+    /// `running` lowered by the health tick (hung or slow before it binds) is
+    /// not down: UNKNOWN, as the disagreement case always is.
+    #[test]
+    fn primary_down_is_unknown_while_the_newest_spawn_is_up() {
+        assert_eq!(
+            primary_down_from_facts(false, false, false, true),
+            Eval::Unknown
+        );
+        assert_eq!(
+            primary_down_from_facts(false, false, false, false),
+            Eval::True,
+            "the same facts with the spawn gone are PRIMARY_DOWN"
+        );
     }
 
     #[test]

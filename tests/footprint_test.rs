@@ -41,10 +41,13 @@ fn config_under(base: &std::path::Path) -> SupervisorConfig {
         expo_dir: None,
         expo_port: 8081,
         runners: vec![RunnerConfig::default_primary()],
-        build_pool: qontinui_supervisor::config::BuildPoolConfig { pool_size: 2 },
+        build_pool: qontinui_supervisor::config::BuildPoolConfig::fixed(2),
         no_prewarm: true,
         no_webview: true,
         temp_runner_display: None,
+        ambient_target_dir: qontinui_supervisor::config::AmbientTargetDir::Ignore,
+        ambient_coord: qontinui_supervisor::config::AmbientCoord::Ignore,
+        ambient_boot_id: qontinui_supervisor::config::AmbientBootId::Ignore,
     }
 }
 
@@ -346,6 +349,7 @@ async fn clean_slot_refuses_active_build() {
             started_at: chrono::Utc::now(),
             requester_id: Some("test".to_string()),
             rebuild_kind: "exe".to_string(),
+            mem_gate: None,
         });
     }
 

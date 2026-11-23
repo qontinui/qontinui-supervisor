@@ -6,7 +6,6 @@ const PHASE_LABELS: Record<string, string> = {
   running_tests: 'Running Tests',
   analyzing: 'Analyzing Results',
   fixing: 'Fixing Issues',
-  restarting_frontend: 'Restarting Frontend',
   waiting_frontend: 'Waiting for Frontend',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -18,7 +17,6 @@ const PHASE_COLORS: Record<string, string> = {
   running_tests: 'var(--info)',
   analyzing: 'var(--info)',
   fixing: 'var(--warning)',
-  restarting_frontend: 'var(--warning)',
   waiting_frontend: 'var(--warning)',
   complete: 'var(--success)',
   stopped: 'var(--text-muted)',
@@ -75,10 +73,7 @@ function PhaseBadge({
         border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
       }}
     >
-      {phase === 'running_tests' ||
-      phase === 'fixing' ||
-      phase === 'restarting_frontend' ||
-      phase === 'waiting_frontend' ? (
+      {phase === 'running_tests' || phase === 'fixing' || phase === 'waiting_frontend' ? (
         <span className="spinner" style={{ width: 12, height: 12 }} />
       ) : null}
       {label}
@@ -199,7 +194,10 @@ export default function VelocityImprovement() {
           />
         )}
       </div>
-      <p className="page-desc">Automated loop that runs velocity tests, analyzes bottlenecks, applies fixes, and tracks score improvements.</p>
+      <p className="page-desc">
+        Automated loop that runs velocity tests, analyzes bottlenecks, applies fixes, and tracks
+        score improvements.
+      </p>
 
       {/* Controls */}
       <div className="card" style={{ padding: 20, marginBottom: 24 }}>

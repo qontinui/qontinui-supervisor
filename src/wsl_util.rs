@@ -207,6 +207,26 @@ fn distro_override() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+/// Pure: the distro `wsl -e` targets. The env override wins and the snapshot is
+/// then never consulted (it can spawn `wsl --list` when its cache has lapsed);
+/// otherwise the default distro as the gate last read it.
+fn probed_distro_from(
+    env_override: Option<String>,
+    snapshot_target: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    env_override.or_else(snapshot_target)
+}
+
+/// The distro `wsl -e` targets: the env override, else the default distro as the
+/// gate last read it. `None` when it cannot be established, which callers must
+/// read as UNKNOWN. Uses the cached snapshot, so a tick that just ran the gate
+/// pays nothing for it.
+pub fn probed_distro() -> Option<String> {
+    probed_distro_from(distro_override(), || {
+        current_snapshot().ok().and_then(|s| s.target)
+    })
+}
+
 /// A `wsl` command aimed at the distro the gate actually asked about.
 ///
 /// When [`DISTRO_ENV`] names a distro we pass `-d <name>`, so the command
@@ -677,5 +697,29 @@ mod tests {
         let before = gated_spawn_count();
         assert!(wsl_command().is_ok());
         assert_eq!(gated_spawn_count(), before + 1);
+    }
+
+    #[test]
+    fn probed_distro_prefers_the_override_and_then_never_reads_the_snapshot() {
+        let consulted = std::cell::Cell::new(false);
+        let got = probed_distro_from(Some("qontinui-ccfg".into()), || {
+            consulted.set(true);
+            Some("Ubuntu-24.04".into())
+        });
+        assert_eq!(got.as_deref(), Some("qontinui-ccfg"));
+        assert!(
+            !consulted.get(),
+            "the snapshot can spawn `wsl --list`; an override must skip it"
+        );
+    }
+
+    #[test]
+    fn probed_distro_falls_back_to_the_snapshot_and_reports_unknown() {
+        assert_eq!(
+            probed_distro_from(None, || Some("Ubuntu-24.04".into())).as_deref(),
+            Some("Ubuntu-24.04")
+        );
+        // Neither source: UNKNOWN, never a guessed default.
+        assert_eq!(probed_distro_from(None, || None), None);
     }
 }

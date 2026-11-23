@@ -25,9 +25,13 @@
 //! - The kill itself uses `libc::kill` with `SIGTERM` first, then escalates
 //!   to `SIGKILL` if the PID is still alive after a short grace window.
 //! - Tree-kill targets the process *group* (`kill(-pgid, ...)`); runners are
-//!   spawned in their own process group (process-wrap sets `SETSID`/group on
-//!   Unix), so killing the group reaps child panes/helpers that would
-//!   otherwise keep the port held.
+//!   spawned as the leader of their own process group
+//!   ([`lead_own_process_group`], called at the runner spawn site in
+//!   `manager::start_exe_mode_for_runner`), so killing the group reaps child
+//!   panes/helpers that would otherwise keep the port held. Before plan
+//!   `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-and-orphans-its-temp-runners`
+//!   Phase 1 the spawn site set a group on Windows only, so `kill(-pid, …)`
+//!   here addressed no group at all.
 
 #![cfg(not(target_os = "windows"))]
 
@@ -39,13 +43,31 @@ use tracing::{debug, info};
 
 /// Poll interval while waiting for a SIGTERM'd process to exit before we
 /// escalate to SIGKILL.
-const TERM_POLL_MS: u64 = 100;
+pub(crate) const TERM_POLL_MS: u64 = 100;
 /// Total grace given to SIGTERM before escalating to SIGKILL.
-const TERM_GRACE_MS: u64 = 1500;
+pub(crate) const TERM_GRACE_MS: u64 = 1500;
+
+/// Make the process `cmd` spawns the leader of a new process group whose id
+/// is its own pid — what [`kill_by_pid_tree`]'s `kill(-pid, …)` addresses.
+///
+/// Called at the runner spawn site. Consequence, intended: a signal sent to the
+/// SUPERVISOR's group (a terminal Ctrl-C on a foreground supervisor) no longer
+/// reaches its runners; the supervisor's shutdown sweep owns stopping its temp
+/// runners, and user-owned runners are not the terminal's to stop.
+///
+/// Known limit: a terminal HANG-UP (SIGHUP) of a hand-run foreground
+/// supervisor kills the supervisor on SIGHUP's default action, without the
+/// sweep, and no longer reaches its runners either; its temp runners then wait
+/// for the next supervisor's ledger-gated reconcile (~30 s after it starts).
+/// `supervisor-verbs.sh start` (a service unit, or `setsid nohup`) has no
+/// controlling terminal, so it never gets a SIGHUP.
+pub fn lead_own_process_group(cmd: &mut Command) {
+    cmd.process_group(0);
+}
 
 /// Return true if `pid` refers to a live process. Uses `kill(pid, 0)` which
 /// performs the permission/existence check without sending a signal.
-fn pid_alive(pid: u32) -> bool {
+pub(crate) fn pid_alive(pid: u32) -> bool {
     // SAFETY: `kill` with signal 0 only probes for existence/permission and
     // never delivers a signal. `pid` is a plain integer; no memory is touched.
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -55,6 +77,20 @@ fn pid_alive(pid: u32) -> bool {
     // errno == EPERM means the process exists but we can't signal it — still
     // "alive" for our purposes. ESRCH means no such process.
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Return true if any process is left in the process group `pgid`
+/// (`kill(-pgid, 0)`; EPERM counts as alive). A group can outlive its leader.
+pub(crate) fn group_alive(pgid: u32) -> bool {
+    // SAFETY: signal 0 only probes; a negative pid names the group. Scalars only.
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Send `signal` to every process in the group `pgid`. Returns whether any
+/// process received it (EPERM counts).
+pub(crate) fn kill_group(pgid: u32, signal: libc::c_int) -> bool {
+    raw_kill_group(pgid, signal)
 }
 
 /// Send `signal` to `pid`. Returns true if the signal was delivered (or the
@@ -183,6 +219,24 @@ async fn find_pids_on_port(port: u16) -> anyhow::Result<Vec<u32>> {
 /// [`find_pids_on_port`] for why `Err` is not `Ok(None)`.
 pub async fn find_pid_on_port(port: u16) -> anyhow::Result<Option<u32>> {
     Ok(find_pids_on_port(port).await?.into_iter().next())
+}
+
+/// Kill every process listening on `port` with a plain per-PID
+/// [`kill_by_pid`] — NEVER a process-group or tree kill. Used by a handoff
+/// stop, where the group would include holder processes the handoff exists to
+/// keep. Same `Err` contract as [`kill_by_port`].
+pub async fn kill_listeners_by_port(port: u16) -> anyhow::Result<bool> {
+    let mut killed_any = false;
+    for pid in find_pids_on_port(port).await? {
+        info!(
+            "kill_listeners_by_port: killing listener PID {} on port {} (no group kill)",
+            pid, port
+        );
+        if kill_by_pid(pid).await.unwrap_or(false) {
+            killed_any = true;
+        }
+    }
+    Ok(killed_any)
 }
 
 /// Kill every process listening on a specific port. Returns true if at least

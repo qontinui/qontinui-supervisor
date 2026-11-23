@@ -7,7 +7,10 @@ import { readFileSync } from 'fs';
 
 const pkg = JSON.parse(readFileSync(path.resolve(__dirname, 'package.json'), 'utf-8'));
 
-const SUPERVISOR = 'http://localhost:9875';
+// The supervisor binds the IPv4 loopback only, and `localhost` can resolve to
+// `::1` first, where nothing listens. The Host and Origin gates admit
+// `127.0.0.1:<port>` exactly as they admit `localhost:<port>`.
+const SUPERVISOR = 'http://127.0.0.1:9875';
 const DEV_PORT = 5174;
 /** This dev server's own origins: the only ones rewritten to the supervisor's. */
 const DEV_ORIGINS = new Set([
@@ -21,7 +24,7 @@ const DEV_ORIGINS = new Set([
  * and Host guard (src/origin_guard.rs).
  *
  * - `changeOrigin` rewrites `Host` from this dev server (`localhost:5174`) to
- *   `localhost:9875`; the Host gate refuses any other port.
+ *   `127.0.0.1:9875`; the Host gate refuses any other port.
  * - The browser sends `Origin: http://localhost:5174` on this page's POSTs.
  *   The supervisor admits only its own origin, so an `Origin` in the fixed
  *   DEV_ORIGINS set (built from `server.port`, never from the request's
@@ -164,16 +167,6 @@ export default defineConfig({
       '/lineage/stats': toSupervisor(),
       '/lineage/sessions': toSupervisor(),
       '/lineage/commits': toSupervisor(),
-      // No supervisor route answers either prefix today, while the dashboard
-      // calls both (`api.devStartStatus` runs on every Dashboard load;
-      // `api.wlStatus`). Kept so the wiring is here if the routes return, and
-      // recorded as its own defect rather than silently deleted: proxied or
-      // not the outcome is the same, and it is NOT a 404 — the SPA fallback
-      // answers `GET /dev-start/status` with 200 + index.html, and the
-      // `get`-only fallback answers `api.devStartAction`'s POST with 405.
-      // Coord finding 91da7570-5d89-4f1e-aafe-2d7104f701d3.
-      '/dev-start': toSupervisor(),
-      '/workflow-loop': toSupervisor(),
     },
   },
 });

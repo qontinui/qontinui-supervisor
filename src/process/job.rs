@@ -23,10 +23,25 @@
 //! ([`crate::process::manager::start_managed_runner`]) and at least three
 //! supervisor exit paths, which is why this is fixed here and not at exit.
 //!
-//! On non-Windows platforms this is a no-op stub. The supervisor only
-//! actually runs on Windows, but compiling cleanly cross-platform keeps
-//! `cargo check` ergonomic and avoids `#[cfg(windows)]` sprinkling at
-//! every call site.
+//! **Off Windows there is no such kernel object, and nothing here reaps.**
+//! The supervisor runs on Linux too (merytshost), where `RunnerJob` is a no-op
+//! stub kept only so call sites need no `#[cfg(windows)]`. Its platform fact,
+//! [`RunnerJob::REAPS_ON_SUPERVISOR_EXIT`], is `false` there, and every log
+//! line about job semantics is derived from it (see the `*_message` builders
+//! below) so none of them claims a reaper that does not run. What does reap a
+//! temp runner off Windows:
+//! - the graceful-shutdown sweep `shutdown_signal` runs at SIGNAL time
+//!   (SIGTERM, Ctrl-C, `POST /supervisor/shutdown`) — see
+//!   [`crate::process::shutdown_sweep`];
+//! - the supervisor's own systemd unit (`KillMode=mixed`), when
+//!   `supervisor-verbs.sh start` launched it in one — that also covers a crash
+//!   or SIGKILL;
+//! - the next supervisor's ledger-gated reconcile sweep
+//!   (`manager::reconcile_orphaned_temp_runners`), which runs once ~30 s after
+//!   startup and every 5 min after.
+//!
+//! User-owned runners leave the supervisor's cgroup on Linux instead of
+//! "never being assigned": see [`crate::process::systemd_scope`].
 
 use qontinui_types::wire::runner_kind::RunnerKind;
 
@@ -133,6 +148,10 @@ mod imp {
     }
 
     impl RunnerJob {
+        /// The kernel terminates every assigned process when the supervisor
+        /// exits, by any path (`KILL_ON_JOB_CLOSE`).
+        pub const REAPS_ON_SUPERVISOR_EXIT: bool = true;
+
         /// Create the job and configure `KILL_ON_JOB_CLOSE | BREAKAWAY_OK`.
         ///
         /// Errors propagate the underlying `GetLastError` value via
@@ -226,15 +245,21 @@ mod imp {
 
 #[cfg(not(windows))]
 mod imp {
-    //! No-op stub for non-Windows targets. The supervisor only runs on
-    //! Windows, but keeping this module cross-compilable lets `cargo check`
-    //! work from any host without `#[cfg(windows)]` decorating every call
-    //! site.
+    //! No-op stub for non-Windows targets. The supervisor DOES run here
+    //! (Linux dev boxes), but there is no kill-on-close kernel object to
+    //! back it: `create` and `assign` succeed and do nothing, and
+    //! [`RunnerJob::REAPS_ON_SUPERVISOR_EXIT`] is `false`, so a temp runner
+    //! "assigned" here is NOT terminated when the supervisor dies. The
+    //! module docs name what reaps it instead.
     use anyhow::Result;
 
     pub struct RunnerJob;
 
     impl RunnerJob {
+        /// Nothing in the OS reaps an "assigned" process when the supervisor
+        /// exits on this platform.
+        pub const REAPS_ON_SUPERVISOR_EXIT: bool = false;
+
         pub fn create() -> Result<Self> {
             Ok(Self)
         }
@@ -274,6 +299,63 @@ pub use imp::RunnerJob;
 /// a lock on its own copy, never on a `target-pool/slot-{k}` binary.
 pub fn should_assign_to_ephemeral_job(kind: &RunnerKind) -> bool {
     kind.is_temp()
+}
+
+/// What reaps a temp runner when the OS does not — named in every job-semantics
+/// line off Windows so the operator reading it knows where to look.
+const OFF_WINDOWS_TEMP_REAPERS: &str = "they are reaped by the graceful-shutdown sweep \
+     (SIGTERM, Ctrl-C or POST /supervisor/shutdown), by the supervisor's systemd unit when \
+     supervisor-verbs.sh launched it in one, and by the next supervisor's ledger-gated \
+     reconcile sweep";
+
+/// The startup line about the runner job, derived from the platform fact
+/// ([`RunnerJob::REAPS_ON_SUPERVISOR_EXIT`]) so it never names a reaper that
+/// does not run.
+pub fn job_created_message(reaps_on_supervisor_exit: bool) -> String {
+    if reaps_on_supervisor_exit {
+        "Created kill-on-exit JobObject for spawned temp runners \
+         (KILL_ON_JOB_CLOSE; user-owned runners are never assigned)"
+            .to_string()
+    } else {
+        format!(
+            "Runner job is a no-op on this platform: the OS does NOT reap temp runners when the \
+             supervisor dies (the kill-on-close job is Windows-only); {OFF_WINDOWS_TEMP_REAPERS}."
+        )
+    }
+}
+
+/// The per-spawn line for a temp runner that was routed to the runner job.
+pub fn temp_assigned_message(reaps_on_supervisor_exit: bool, runner: &str, pid: u32) -> String {
+    if reaps_on_supervisor_exit {
+        format!("Assigned temp runner '{runner}' (PID {pid}) to kill-on-exit JobObject")
+    } else {
+        format!(
+            "Temp runner '{runner}' (PID {pid}): the OS does NOT reap it if the supervisor dies \
+             (no kill-on-close job off Windows); {OFF_WINDOWS_TEMP_REAPERS}."
+        )
+    }
+}
+
+/// The per-spawn line for a user-owned runner (never routed to the job), with
+/// the Linux spawn-isolation verdict beside it.
+pub fn user_owned_spawn_message(
+    reaps_on_supervisor_exit: bool,
+    runner: &str,
+    pid: u32,
+    isolation: &crate::process::systemd_scope::Isolation,
+) -> String {
+    if reaps_on_supervisor_exit {
+        format!(
+            "Runner '{runner}' (PID {pid}) NOT assigned to the kill-on-exit JobObject — \
+             user-owned runners survive supervisor exit."
+        )
+    } else {
+        format!(
+            "Runner '{runner}' (PID {pid}) is user-owned: the shutdown sweep does NOT reap it, and \
+             its survival of the supervisor's exit rests on its isolation — {}.",
+            isolation.describe()
+        )
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +433,68 @@ mod tests {
             imp::LIMIT_FLAGS & JOB_OBJECT_LIMIT_BREAKAWAY_OK,
             0,
             "BREAKAWAY_OK is retained so a child can opt out at CreateProcess time"
+        );
+    }
+
+    /// Off Windows the stub reaps nothing, so no job-semantics line may name a
+    /// kill-on-exit JobObject, and each must say the OS does NOT reap. Before
+    /// plan `2026-11-04-linux-dev-supervisor-…` Phase 1 the Linux log claimed
+    /// "Created kill-on-exit JobObject … (KILL_ON_JOB_CLOSE …)" over a no-op.
+    #[cfg(not(windows))]
+    #[test]
+    // The platform fact IS a constant; asserting it is the point.
+    #[allow(clippy::assertions_on_constants)]
+    fn off_windows_job_messages_claim_no_reaper() {
+        use crate::process::systemd_scope::Isolation;
+        assert!(
+            !RunnerJob::REAPS_ON_SUPERVISOR_EXIT,
+            "the non-Windows stub must not claim to reap on supervisor exit"
+        );
+        let reaps = RunnerJob::REAPS_ON_SUPERVISOR_EXIT;
+        let messages = [
+            job_created_message(reaps),
+            temp_assigned_message(reaps, "test-abc123", 4242),
+            user_owned_spawn_message(
+                reaps,
+                "named-9880",
+                4243,
+                &Isolation::Scoped("qontinui-runner-named-9880-20261104T230000000Z.scope".into()),
+            ),
+            user_owned_spawn_message(
+                reaps,
+                "named-9881",
+                4244,
+                &Isolation::Unscoped("systemd-run is not on PATH".into()),
+            ),
+        ];
+        for msg in &messages {
+            assert!(
+                !msg.contains("kill-on-exit JobObject"),
+                "a non-Windows job-semantics line names a reaper that does not run: {msg}"
+            );
+            assert!(
+                msg.contains("NOT reap"),
+                "a non-Windows job-semantics line must say what is NOT reaped: {msg}"
+            );
+        }
+        // And the temp lines name what DOES reap.
+        for msg in &messages[..2] {
+            assert!(
+                msg.contains("graceful-shutdown sweep") && msg.contains("reconcile sweep"),
+                "the temp-runner lines must name the real reapers: {msg}"
+            );
+        }
+    }
+
+    /// The Windows wording is unchanged: there the job really reaps.
+    #[test]
+    fn windows_job_messages_name_the_job() {
+        use crate::process::systemd_scope::Isolation;
+        assert!(job_created_message(true).contains("KILL_ON_JOB_CLOSE"));
+        assert!(temp_assigned_message(true, "t", 1).contains("kill-on-exit JobObject"));
+        assert!(
+            user_owned_spawn_message(true, "n", 2, &Isolation::NotApplicable)
+                .contains("NOT assigned to the kill-on-exit JobObject")
         );
     }
 

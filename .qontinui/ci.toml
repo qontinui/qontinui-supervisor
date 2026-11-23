@@ -1,0 +1,18 @@
+# Sibling build-dependency declaration, read by coord's POST /agents/allocate
+# (`crates/coord/src/ci_siblings.rs` in qontinui-coord), which materialises
+# each declared sibling beside an allocated worktree. Without it an allocated
+# qontinui-supervisor worktree cannot build: Cargo.toml path-depends on
+# ../qontinui-schemas/{rust,rust-runner-client} (coord finding 85e667ec).
+#
+# There are deliberately NO [[steps]]. This repo's CI runs on GitHub Actions
+# (coord.canonical_repos.ci_lane), so the runner's CI-dispatch lane never
+# reads this file. If this repo is ever moved to the runner lane, the runner's
+# parser refuses a manifest with no [[steps]] ("nothing to run"), which is
+# the signal to add them, not a silent no-op.
+version = 1
+
+# pin-file: the commit recorded in .github/sibling-pins.conf, the same pin
+# the Actions lane checks out through .github/scripts/schemas-pin.sh.
+[[siblings]]
+repo = "qontinui/qontinui-schemas"
+pin = "pin-file"

@@ -29,7 +29,7 @@
 //! | Call site | Seam |
 //! |---|---|
 //! | `build_monitor::run_build_inner` (the pool build) | [`guarded_cargo`] |
-//! | `build_monitor::build_shim_sidecar` | [`guarded_cargo`] |
+//! | `build_monitor::build_sidecars` (`qontinui-shim` / `qontinui-pr` / `qontinui_profile`) | [`guarded_cargo`] |
 //! | `build_monitor::prewarm_single_slot` | [`guarded_cargo`] |
 //! | `build_submissions::run_submission` (`/build/submit`, `submit_detached`, `submit_spawn`) | [`degrade_cargo_env_if_s3`] |
 //!
@@ -355,7 +355,7 @@ const DEGRADE_ENV: (&str, &str) = ("RUSTC_WRAPPER", "");
 ///
 /// **Every `GuardedCommand`-based cargo spawn goes through this** rather than
 /// `GuardedCommand::new("cargo", …)` — one shared helper is what keeps the pool
-/// build, the shim sidecar build and the prewarm from drifting into three
+/// build, the sidecar build and the prewarm from drifting into three
 /// different postures (they had no posture at all before Phase 1.3). The fourth
 /// compiling spawn, `build_submissions::run_submission`, is a bare
 /// `tokio::process::Command` and uses [`degrade_cargo_env_if_s3`] instead; see

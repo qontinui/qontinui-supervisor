@@ -238,9 +238,14 @@ pub enum DiagnosticEventKind {
         /// The runner's PID when the registry or the port listener knew it.
         pid: Option<u32>,
         port: u16,
-        /// `now - UnresponsiveSince(at)` at decision time — the same stamp
-        /// `/runners` publishes, never a tick count.
-        silent_for_secs: u64,
+        /// How long the API had been silent at decision time, in seconds:
+        /// `process::manager::serving_silence_secs` (since the last answer or
+        /// this spawn's start, whichever is later) for a wedge; since this
+        /// boot's `started_at` for a never-answered event; how long the spawn
+        /// has been up for a never-bound one. `null` where nothing was
+        /// measured (a never-answered runner with no recorded start), never a
+        /// made-up 0. Never a tick count.
+        silent_for_secs: Option<u64>,
         census: Option<serde_json::Value>,
         /// The error string for `RestartFailed`, the disarm reason for
         /// `Disarmed`, free text otherwise.
@@ -342,9 +347,24 @@ pub enum ServingEvent {
     /// threshold. Alert-only by Design decision 4 — the supervisor cannot
     /// back a restart on a classification it has never confirmed.
     NeverAnsweredSinceAdoption,
+    /// A runner this supervisor started holds its port and has not answered
+    /// during its current spawn. Either it reads `RunnerLiveness::Unknown`
+    /// (never seen answering), which is alert-only for the same reason as
+    /// above, or it reads `UnresponsiveSince` through an earlier boot's stamp,
+    /// in which case the serving restart decision still runs on it.
+    NeverAnsweredSinceSpawn,
+    /// A user-managed runner this supervisor started is alive on its newest
+    /// spawn, has not answered during it, and does not hold its port, past the
+    /// first-healthy budget. Alert-only: no other watchdog reports this shape,
+    /// because the escalation loop needs a held port and the first-healthy
+    /// watchdog stands down for a runner whose `running` follows the probe.
+    NeverBoundSinceSpawn,
     /// The census found zero live `claude` sessions and the restart was
-    /// issued. The only irreversible event in the set.
+    /// issued. Irreversible.
     RestartTaken,
+    /// The first-healthy watchdog killed a spawn that gave it no answer within its
+    /// budget. Irreversible. A crash-watchdog-armed runner then reads this as a crash.
+    FirstHealthyKill,
     /// The census (or the runner's own verdict) counted live sessions, so the
     /// restart was refused. The `census` payload names them.
     RestartRefusedSessionsLive,
@@ -358,12 +378,20 @@ pub enum ServingEvent {
 }
 
 impl ServingEvent {
+    /// Whether this event reports an act that cannot be undone.
+    pub fn is_irreversible(&self) -> bool {
+        matches!(self, Self::RestartTaken | Self::FirstHealthyKill)
+    }
+
     /// The snake_case wire token — identical to the serde rename.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Threshold => "threshold",
             Self::NeverAnsweredSinceAdoption => "never_answered_since_adoption",
+            Self::NeverAnsweredSinceSpawn => "never_answered_since_spawn",
+            Self::NeverBoundSinceSpawn => "never_bound_since_spawn",
             Self::RestartTaken => "restart_taken",
+            Self::FirstHealthyKill => "first_healthy_kill",
             Self::RestartRefusedSessionsLive => "restart_refused_sessions_live",
             Self::RestartFailed => "restart_failed",
             Self::Disarmed => "disarmed",
@@ -768,7 +796,7 @@ mod tests {
                 event: ServingEvent::RestartRefusedSessionsLive,
                 pid: Some(48544),
                 port: 9876,
-                silent_for_secs: 301,
+                silent_for_secs: Some(301),
                 census: Some(serde_json::json!({
                     "source": "supervisor_subtree_census",
                     "verdict": "busy",
@@ -809,7 +837,16 @@ mod tests {
                 ServingEvent::NeverAnsweredSinceAdoption,
                 "never_answered_since_adoption",
             ),
+            (
+                ServingEvent::NeverAnsweredSinceSpawn,
+                "never_answered_since_spawn",
+            ),
+            (
+                ServingEvent::NeverBoundSinceSpawn,
+                "never_bound_since_spawn",
+            ),
             (ServingEvent::RestartTaken, "restart_taken"),
+            (ServingEvent::FirstHealthyKill, "first_healthy_kill"),
             (
                 ServingEvent::RestartRefusedSessionsLive,
                 "restart_refused_sessions_live",
@@ -837,7 +874,7 @@ mod tests {
             event: ServingEvent::Threshold,
             pid: None,
             port: 9876,
-            silent_for_secs: 300,
+            silent_for_secs: Some(300),
             census: None,
             detail: None,
         });

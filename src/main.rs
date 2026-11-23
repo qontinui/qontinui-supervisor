@@ -3,6 +3,7 @@ mod bazel_remote;
 /// out of `build_monitor` so the Linux-only merge gate can test it.
 mod build_diagnostics;
 mod build_monitor;
+mod build_sizing;
 mod build_submissions;
 mod cache_key;
 mod cache_telemetry;
@@ -13,6 +14,7 @@ mod cache_telemetry;
 mod ci_runner_lifecycle;
 mod ci_runner_probe;
 mod config;
+mod coord_client;
 mod dev_action;
 mod diagnostics;
 mod error;
@@ -24,15 +26,11 @@ mod footprint;
 // `max_concurrent_builds` to coord on startup. See
 // `plans/2026-05-14-fleet-topology-and-build-pool-design.md` §3.2.
 mod fleet;
-// Stream E (spec-check v1, plan 05 §10): nightly cron that composes
-// /spec/proposals/scan → /execute (per proposal) → /sweep-pending on the
-// primary runner. No-op when the runner's spec-authoring feature is off
-// (returns 404 → warn-once + skip). See `src/flywheel.rs`.
-mod flywheel;
 mod fs_atomic;
 mod git_provenance;
 mod health_cache;
 mod log_capture;
+mod loopback;
 mod origin_guard;
 mod otel;
 mod pii_scrub;
@@ -57,10 +55,18 @@ mod sdk_features;
 mod self_provenance;
 mod server;
 mod settings;
+/// Test-only: classifies a source file the codemod extracted as test code for
+/// the source-scanning guards (plan 2026-10-01-oversized-source-files-owe-a-decomposition).
+#[cfg(test)]
+mod source_scan;
 mod spawn_worktree;
 mod state;
 #[cfg(test)]
 mod test_clock;
+#[cfg(test)]
+mod test_env;
+#[cfg(test)]
+mod test_ports;
 mod trace_propagation;
 mod velocity;
 mod velocity_improvement;
@@ -169,6 +175,31 @@ async fn main() -> anyhow::Result<()> {
 
     let mut config = SupervisorConfig::from_args(args);
 
+    // Build pool sizing (plan 2026-10-02-cargo-jobs-…): say what was derived,
+    // and name slot dirs a smaller pool no longer walks — they still hold disk.
+    {
+        let pool = &config.build_pool;
+        info!(
+            "Build pool: {} slot(s) (source {:?}), CARGO_BUILD_JOBS per slot {} ({:?})",
+            pool.pool_size, pool.source, pool.jobs.per_slot, pool.jobs.source
+        );
+        let beyond = build_sizing::slot_dirs_beyond_pool(
+            &config.runner_npm_dir().join("target-pool"),
+            pool.pool_size,
+        );
+        if !beyond.is_empty() {
+            warn!(
+                "Build pool is {} slot(s) but {} slot target dir(s) beyond it remain on disk \
+                 and are no longer walked by the footprint or reclaimed by slot cleanup: {:?}. \
+                 Delete them to reclaim the space, or raise QONTINUI_SUPERVISOR_BUILD_POOL_SIZE \
+                 to use them.",
+                pool.pool_size,
+                beyond.len(),
+                beyond
+            );
+        }
+    }
+
     // Load persistent settings to check for saved runner configs
     {
         // Per-instance settings path (namespaced under
@@ -225,6 +256,59 @@ async fn main() -> anyhow::Result<()> {
     // dashboard log stream. Done after Arc-wrapping so the messages flow
     // through the same persistent file writer attached above.
     state.flush_pending_startup_logs().await;
+
+    // Where the temp-runner ledger lives. Said at startup because it decides
+    // what the reconcile sweep may kill: a supervisor resolving the SAME ledger
+    // as another one would treat that one's temp runners as its own. (The
+    // hermetic SIGTERM boot test reads this line to prove its ledger is under
+    // its tempdir.)
+    match process::temp_runner_ledger::ledger_path() {
+        Some(path) => info!("Temp-runner ledger: {}", path.display()),
+        None => warn!(
+            "Temp-runner ledger: UNRESOLVED (no per-user data dir) — the reconcile sweep will \
+             kill nothing"
+        ),
+    }
+
+    // Linux spawn isolation preflight, once at startup, so `/health`
+    // `runner_isolation` answers before the first user-owned spawn (each such
+    // spawn re-probes and refreshes it). Off Linux it records "not Linux"
+    // without running anything.
+    {
+        let state_for_probe = state.clone();
+        tokio::spawn(async move {
+            let probe = process::systemd_scope::probe_systemd().await;
+            let msg = match &probe {
+                // Off Linux there is no cgroup to share; say what does hold
+                // instead (the same wording `/health` serves).
+                _ if !cfg!(target_os = "linux") => format!(
+                    "Runner isolation: {}",
+                    process::systemd_scope::summarize_isolation(false, Some(&probe), &[]).reason
+                ),
+                process::systemd_scope::SystemdProbe::Available { systemd_run } => format!(
+                    "Runner isolation: user-owned runners will be spawned into their own \
+                     transient systemd scope (via {})",
+                    systemd_run.display()
+                ),
+                process::systemd_scope::SystemdProbe::Unavailable(why) => format!(
+                    "Runner isolation: none — {why}. User-owned runners this supervisor spawns \
+                     share its cgroup"
+                ),
+            };
+            info!("{}", msg);
+            state_for_probe
+                .logs
+                .emit(LogSource::Supervisor, LogLevel::Info, msg)
+                .await;
+            // A user-owned spawn re-probes and records its own result. If one
+            // already has, that answer is newer than this startup probe, so
+            // it is kept rather than overwritten by an older reading.
+            process::systemd_scope::record_startup_probe(
+                &mut *state_for_probe.runner_isolation_probe.write().await,
+                probe,
+            );
+        });
+    }
 
     // Visibility for the debug-endpoints gate. When enabled, log loudly so
     // an operator tailing the supervisor log can see that
@@ -299,8 +383,9 @@ async fn main() -> anyhow::Result<()> {
     // max_concurrent_builds derived from CPU + RAM per §3.2) to coord on
     // startup. Fire-and-forget — supervisor never blocks on coord
     // availability. See `fleet.rs::publish_on_startup`.
+    let coord_access = state.config.ambient_coord.clone();
     tokio::spawn(async move {
-        fleet::publish_on_startup().await;
+        fleet::publish_on_startup(&coord_access).await;
     });
 
     // Phase 3b: CI runner health probe loop. Probes WSL-based GitHub
@@ -347,11 +432,12 @@ async fn main() -> anyhow::Result<()> {
     // server + state a few seconds to settle first, mirroring the historical
     // behavior where the boot start showed up ~4s after "Supervisor starting".
     //
-    // Auto-start funnels through `start_runner_by_id` exactly like an operator
+    // Auto-start funnels through `start_managed_runner` exactly like an operator
     // `POST /runners/primary/start`, so the #65 provenance start gate applies:
     // if it refuses (e.g. a foreign slot binary), the error is logged as a
-    // WARN and boot continues — it never crashes startup. This is one-shot:
-    // the supervisor still never restarts a primary that crashes later.
+    // WARN and boot continues — it never crashes startup. Like that door it is a
+    // `spawn` dev-action trial, requested by `boot_start`. This is one-shot: only
+    // the crash watchdog, under `--watchdog`, restarts a primary that crashes later.
     if auto_start {
         let state_for_autostart = state.clone();
         tokio::spawn(async move {
@@ -375,7 +461,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(primary_id) => {
                     info!("auto-start: boot-starting primary runner '{}'", primary_id);
-                    match process::manager::start_runner_by_id(&state_for_autostart, &primary_id)
+                    match process::manager::boot_start_runner(&state_for_autostart, &primary_id)
                         .await
                     {
                         Ok(()) => {
@@ -498,22 +584,12 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Spawn flywheel cron (Stream E — spec coverage-growth loop). Time-driven
-    // (24h cadence by default, env-overridable); targets the primary runner
-    // at port 9876 only. No-op when the runner's `spec-authoring` feature is
-    // compiled out — the loop logs warn-once on 404 and continues to the
-    // next tick. Errors are swallowed; the loop never panics. See
-    // `src/flywheel.rs` for the cron contract.
-    {
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            flywheel::flywheel_loop(state_clone).await;
-        });
-    }
-
     // Build and start HTTP server (with SO_REUSEADDR to handle lingering sockets)
     let router = server::build_router(state.clone());
-    let bind_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+    // The same constant every URL the supervisor builds for itself or a runner
+    // names (`loopback::loopback_base`), so the address a client dials is the
+    // one this listener binds.
+    let bind_addr = std::net::SocketAddr::from((loopback::LOOPBACK_IP, port));
     let listener = {
         let mut attempts = 0;
         loop {
@@ -545,7 +621,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    info!("Supervisor listening on http://127.0.0.1:{}", port);
+    info!("Supervisor listening on {}", loopback::loopback_base(port));
 
     // Spawn the ambient dashboard WebView2 window (item B of the post-3J UI
     // Bridge improvements plan). Runs on its own dedicated OS thread so it
@@ -563,7 +639,7 @@ async fn main() -> anyhow::Result<()> {
         if state.config.no_webview {
             info!("Ambient dashboard webview disabled (--no-webview / QONTINUI_SUPERVISOR_NO_WEBVIEW)");
         } else {
-            webview::spawn_webview_thread(format!("http://127.0.0.1:{}/", port));
+            webview::spawn_webview_thread(format!("{}/", loopback::loopback_base(port)));
         }
     }
 
@@ -578,19 +654,17 @@ async fn main() -> anyhow::Result<()> {
 
     // One-shot startup sweep of stale `.spawn-*` scratch worktree containers
     // (deferred #64 Phase 4). Non-blocking — spawned as its own task so a slow
-    // `git worktree remove` of a GB-scale checkout never delays serving. No
-    // build is active at startup, so the active-container exclusion set is
-    // empty. Best-effort: the pruner logs + swallows every failure internally.
+    // `git worktree remove` of a GB-scale checkout never delays serving. It
+    // runs concurrently with whatever the supervisor does next, so it is handed
+    // the container locks: a spawn-test or primary rebuild that has already
+    // taken its container's lock keeps that container, and one that arrives
+    // while the sweep removes it waits for the removal and then materializes
+    // a fresh one. Best-effort: the pruner logs + swallows every failure
+    // internally.
     {
         let state_for_prune = state.clone();
         tokio::spawn(async move {
-            let active = std::collections::HashSet::new();
-            let report = spawn_worktree::prune_spawn_worktrees(
-                &state_for_prune.config.project_dir,
-                &active,
-                std::time::SystemTime::now(),
-            )
-            .await;
+            let report = state_for_prune.sweep_spawn_worktrees(None).await;
             if !report.removed.is_empty() || !report.failed.is_empty() {
                 state_for_prune
                     .logs
@@ -637,7 +711,8 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 let snapshot = state_for_footprint.refresh_footprint().await;
-                resource_sample::publish(&snapshot).await;
+                resource_sample::publish(&state_for_footprint.config.ambient_coord, &snapshot)
+                    .await;
             }
         });
     }
@@ -686,14 +761,24 @@ async fn main() -> anyhow::Result<()> {
     // blocking IO inside spawn_blocking, etc.) keeps the runtime alive past
     // its useful lifetime, this guarantees the process actually goes away.
     //
-    // The supervisor's ephemeral children are covered by the kill-on-job-close
-    // JobObject (`state.ephemeral_job`); temp runners die when *this* process
-    // dies, regardless of whether we stopped them gracefully first. So a hard
-    // exit here cannot leak orphan temp runners — it just skips the polite
-    // "ask everything to stop" step that's already redundant under the
-    // JobObject contract. User-owned runners (primary, named, external) are
-    // deliberately NOT in the job and are expected to keep running across
-    // this exit; the next supervisor's orphan scan adopts them back.
+    // ON WINDOWS the supervisor's ephemeral children are covered by the
+    // kill-on-job-close JobObject (`state.ephemeral_job`); temp runners die
+    // when *this* process dies, regardless of whether we stopped them
+    // gracefully first, so a hard exit here cannot leak them. User-owned
+    // runners (primary, named, external) are deliberately NOT in the job and
+    // keep running across this exit; the next supervisor's orphan scan adopts
+    // them back.
+    //
+    // OFF WINDOWS that job is a no-op stub and the kernel reaps nothing. The
+    // temp runners were already stopped at SIGNAL time, by
+    // `process::shutdown_sweep::sweep_temp_runners_at_shutdown` inside
+    // `shutdown_signal` — there, not here, because an in-flight long-poll can
+    // hold the serve future open past the drain deadline, so this code may
+    // never run. A temp runner that sweep's bound cut off is reaped by the
+    // supervisor's systemd unit (when `supervisor-verbs.sh` launched it in one)
+    // or by the next supervisor's ledger-gated reconcile sweep. User-owned
+    // runners on Linux survive by leaving the supervisor's cgroup at spawn
+    // (`process::systemd_scope`); there is no orphan scan off Windows.
     const HARD_EXIT_DEADLINE_SECS: u64 = 3;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(HARD_EXIT_DEADLINE_SECS)).await;
@@ -717,18 +802,23 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::timeout(std::time::Duration::from_secs(2), expo::stop_expo(&state)).await;
     }
 
-    // NOTE: We deliberately do NOT call `stop_all_temp_runners` here. The
-    // Win32 `RunnerJob` (held in `state.ephemeral_job`) has
-    // `KILL_ON_JOB_CLOSE` set, so every supervisor-spawned *temp* runner is
-    // terminated by the kernel the instant the last handle to the Job closes
-    // — which happens when `state` drops at the end of `main`. (Temps are the
-    // only runners assigned to the job; see
-    // `process::job::should_assign_to_ephemeral_job`.) The previous
-    // `stop_all_temp_runners` call here was the dominant source of
-    // `POST /supervisor/shutdown` latency: it iterated every temp runner with
-    // a 5s graceful-stop poll plus a 5s port-free wait, easily 30+ seconds
-    // wall-clock with several runners attached. The JobObject makes it
-    // redundant.
+    // NOTE: We deliberately do NOT sweep temp runners here, on either
+    // platform.
+    //
+    // - Windows: the Win32 `RunnerJob` (held in `state.ephemeral_job`) has
+    //   `KILL_ON_JOB_CLOSE` set, so every supervisor-spawned *temp* runner is
+    //   terminated by the kernel the instant the last handle to the Job closes
+    //   — which happens when `state` drops at the end of `main`. (Temps are the
+    //   only runners assigned to the job; see
+    //   `process::job::should_assign_to_ephemeral_job`.) The previous
+    //   temp-runner stop sweep here (the since-deleted `stop_all_temp_runners`)
+    //   was the dominant source of `POST /supervisor/shutdown` latency: it
+    //   iterated every temp runner with a 5s graceful-stop poll plus a 5s
+    //   port-free wait, easily 30+ seconds wall-clock with several runners
+    //   attached. The JobObject makes it redundant.
+    // - Off Windows: there is no such job, so `shutdown_signal` already ran a
+    //   bounded (~2.5 s: ≤500 ms read, then 2 s kill) concurrent sweep at
+    //   SIGNAL time — before this point is reached, and even when it never is.
 
     Ok(())
 }
@@ -888,8 +978,29 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
         let _ = shutdown_rx.recv().await;
     };
 
+    // SIGTERM — what `kill <pid>` and `systemctl stop` send. Without this arm
+    // the supervisor died on the default disposition: no `Received shutdown
+    // signal` line, no bounded drain, no temp-runner sweep. A handler that
+    // cannot be installed leaves the arm pending (and says so) rather than
+    // firing a shutdown.
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                sigterm.recv().await;
+            }
+            Err(e) => {
+                warn!("Failed to install the SIGTERM handler ({e}); SIGTERM will not drain");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
     let reason = tokio::select! {
         _ = ctrl_c => "ctrl_c",
+        _ = terminate => "sigterm",
         _ = http_trigger => "http_endpoint",
     };
     info!("Received shutdown signal ({})", reason);
@@ -910,6 +1021,20 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
     // (the latched bool is monotonic and the broadcast is best-effort).
     state.signal_shutdown();
 
+    // Off Windows nothing in the OS reaps temp runners when this process
+    // exits (the runner job is a no-op stub), so stop them NOW, at signal
+    // time: the drain deadline armed below force-exits in 10 s, and an
+    // in-flight long-poll keeps the serve future — and so every post-serve
+    // step — from ever running. Bounded (~2.5 s: ≤500 ms read, then 2 s kill)
+    // and concurrent; temp runners only (`should_assign_to_ephemeral_job`),
+    // never a user-owned runner.
+    #[cfg(not(windows))]
+    process::shutdown_sweep::sweep_temp_runners_at_shutdown(
+        &state,
+        process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,
+    )
+    .await;
+
     // Bounded drain. THIS is armed at signal time, not after the serve future
     // resolves — the watchdog further down in `main` is armed only once
     // `serve_future.await` has already returned, which is useless against the
@@ -928,17 +1053,26 @@ async fn shutdown_signal(state: Arc<SupervisorState>) {
     //
     // Bounding it converts that into a clean handoff: in-flight long-polls get
     // a real answer (see `routes::runners::spawn_test`'s shutdown arm), and
-    // whatever has not drained inside the deadline dies with the process. That
-    // is also what reaps an in-flight cargo build — `GuardedCommand` wraps every
-    // build tree in a `KILL_ON_JOB_CLOSE` job, so process exit is precisely the
-    // thing that terminates it. Staying alive is what orphaned the build; exiting
-    // is what cleans it up.
+    // whatever has not drained inside the deadline dies with the process.
+    //
+    // What that exit does to an in-flight cargo build is PLATFORM-SPECIFIC:
+    // - Windows: `GuardedCommand` wraps every build tree in a
+    //   `KILL_ON_JOB_CLOSE` job, so process exit is precisely the thing that
+    //   terminates it. Staying alive is what orphaned the build; exiting is
+    //   what cleans it up.
+    // - Unix: `GuardedCommand` uses `ProcessGroup::leader().wrap(KillOnDrop)`,
+    //   and `std::process::exit` runs no destructors, so `KillOnDrop` does NOT
+    //   fire and the build's process group OUTLIVES the supervisor. It is
+    //   reaped only by the supervisor's systemd unit (`KillMode=mixed`) when
+    //   `supervisor-verbs.sh` launched it in one; a fallback launch with no
+    //   systemd unit leaks it.
     const SHUTDOWN_DRAIN_DEADLINE_SECS: u64 = 10;
     tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(SHUTDOWN_DRAIN_DEADLINE_SECS)).await;
         eprintln!(
             "qontinui-supervisor: connection drain exceeded {SHUTDOWN_DRAIN_DEADLINE_SECS}s after \
-             the shutdown signal, forcing exit (in-flight builds are reaped with the process)"
+             the shutdown signal, forcing exit (on Windows in-flight builds are reaped with the \
+             process; on Unix only the supervisor's systemd unit reaps them)"
         );
         std::process::exit(0);
     });
@@ -1000,9 +1134,19 @@ mod tests {
     /// the listener socket is released the instant the signal fires, so a
     /// replacement supervisor binds the port and answers from an empty registry
     /// ("Runner not found") while the OLD process stays alive for the rest of
-    /// the build, still compiling, addressable by nobody. Exiting is also what
-    /// REAPS that build: `GuardedCommand` wraps every build tree in a
-    /// `KILL_ON_JOB_CLOSE` job, so staying alive is what orphaned it.
+    /// the build, still compiling, addressable by nobody. On Windows exiting is
+    /// also what REAPS that build: `GuardedCommand` wraps every build tree in a
+    /// `KILL_ON_JOB_CLOSE` job, so staying alive is what orphaned it. On Unix
+    /// it is not — `std::process::exit` runs no destructors, so the build's
+    /// `KillOnDrop` process group outlives the supervisor, and only the
+    /// supervisor's systemd unit reaps it.
+    ///
+    /// It also pins plan `2026-11-04-linux-dev-supervisor-…` Phase 1: the
+    /// signal set includes SIGTERM (`SignalKind::terminate`), and the
+    /// off-Windows temp-runner sweep runs inside this function, after the
+    /// shutdown is latched and BEFORE the drain deadline is armed — the
+    /// post-serve path it would otherwise live in is skipped whenever a
+    /// long-poll holds the serve future open.
     ///
     /// A source assertion because the alternative is a test that waits out a
     /// real deadline and calls `std::process::exit` in the test harness.
@@ -1016,14 +1160,10 @@ mod tests {
         .expect("this source file must be readable")
         .replace("\r\n", "\n");
 
-        let body = this_file
-            .split_once("async fn shutdown_signal(")
-            .map(|(_, after)| after)
+        // Bounded to shutdown_signal's own body (brace matching), so neither
+        // the needles nor their order can be satisfied by a later function.
+        let body = crate::source_scan::fn_body(&this_file, "async fn shutdown_signal(")
             .expect("shutdown_signal must exist — did it get renamed?");
-        let body = body
-            .find("\n#[cfg(test)]")
-            .map(|end| &body[..end])
-            .unwrap_or(body);
 
         assert!(
             body.contains("SHUTDOWN_DRAIN_DEADLINE_SECS"),
@@ -1050,6 +1190,32 @@ mod tests {
         assert!(
             latch < deadline,
             "the drain deadline must be armed after `signal_shutdown()`, not before it"
+        );
+
+        assert!(
+            body.contains("SignalKind::terminate()"),
+            "shutdown_signal no longer selects on SIGTERM. `kill <pid>` and `systemctl stop` then \
+             kill the supervisor on the default disposition — no drain, no sweep, no log line."
+        );
+        assert!(
+            body.contains("_ = terminate => \"sigterm\""),
+            "the SIGTERM arm must be in the select and name its reason `sigterm`, so the \
+             `Received shutdown signal (sigterm)` line says what stopped the supervisor"
+        );
+        let sweep = body
+            .find("sweep_temp_runners_at_shutdown(")
+            .expect("shutdown_signal must run the off-Windows temp-runner sweep at signal time");
+        assert!(
+            latch < sweep && sweep < deadline,
+            "the temp-runner sweep must run after `signal_shutdown()` and before the drain \
+             deadline is armed (latch {latch}, sweep {sweep}, deadline {deadline})"
+        );
+        assert!(
+            body.contains(
+                "sweep_temp_runners_at_shutdown(\n        &state,\n        \
+                 process::shutdown_sweep::SHUTDOWN_SWEEP_BOUND,"
+            ),
+            "the sweep runs with its named kill bound, not an ad-hoc one"
         );
     }
 }

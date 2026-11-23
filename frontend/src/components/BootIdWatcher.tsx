@@ -61,9 +61,12 @@ export function BootIdWatcher() {
         }
         if (seen.current !== id && !cancelled) {
           console.info(
-            '[BootIdWatcher] supervisor boot_id changed (' + seen.current + ' → ' + id +
-            ') — reloading. If this is your first deploy after the persist-boot_id change, ' +
-            'this is the one-time migration; future restarts will not auto-reload.'
+            '[BootIdWatcher] supervisor boot_id changed (' +
+              seen.current +
+              ' → ' +
+              id +
+              ') — reloading. If this is your first deploy after the persist-boot_id change, ' +
+              'this is the one-time migration; future restarts will not auto-reload.',
           );
           window.location.reload();
         }

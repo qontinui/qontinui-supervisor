@@ -159,24 +159,6 @@
   .toggle input:checked + .slider { background: var(--primary); }
   .toggle input:checked + .slider::before { transform: translateX(16px); }
 
-  /* Port list */
-  .port-list { list-style: none; }
-  .port-list li {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 2px 0;
-    font-size: 12px;
-    font-family: var(--font-code);
-  }
-  .port-dot {
-    width: 6px; height: 6px;
-    border-radius: 50%;
-    flex-shrink: 0;
-  }
-  .port-dot.up { background: var(--success); }
-  .port-dot.down { background: var(--border); }
-
   /* Log viewer */
   .log-viewer {
     background: var(--bg);
@@ -255,20 +237,6 @@
   .notify-toggle:hover { border-color: var(--text-secondary); }
   .notify-toggle.active { color: var(--warning); border-color: var(--warning); }
 
-  /* AI output */
-  .ai-output {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    font-family: var(--font-code);
-    font-size: 12px;
-    height: 180px;
-    overflow-y: auto;
-    padding: 8px;
-    color: var(--text-secondary);
-  }
-  .ai-output .line { padding: 1px 0; white-space: pre-wrap; word-break: break-all; }
-
   /* Toolbar */
   .toolbar {
     display: flex;
@@ -300,198 +268,6 @@
     font-family: var(--font-ui);
   }
 
-  /* Workflow Loop panel */
-  .wl-panel {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 16px;
-  }
-  @media (max-width: 700px) {
-    .wl-panel { grid-template-columns: 1fr; }
-  }
-  .wl-section-title {
-    font-size: 11px;
-    font-weight: 600;
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-    margin-bottom: 6px;
-  }
-  .wl-add-row {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 10px;
-  }
-  .wl-add-row select { flex: 1; min-width: 0; }
-  .wl-queue {
-    list-style: none;
-    min-height: 48px;
-    border: 1px dashed var(--border);
-    border-radius: var(--radius);
-    padding: 6px;
-    margin-bottom: 10px;
-  }
-  .wl-queue.has-items { border-style: solid; }
-  .wl-queue-empty {
-    text-align: center;
-    color: var(--text-secondary);
-    font-size: 12px;
-    padding: 12px;
-  }
-  .wl-queue-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    margin-bottom: 4px;
-    font-size: 12px;
-    cursor: grab;
-  }
-  .wl-queue-item:last-child { margin-bottom: 0; }
-  .wl-queue-item:active { cursor: grabbing; }
-  .wl-queue-item.dragging { opacity: 0.4; }
-  .wl-queue-item.drag-over { border-color: var(--primary); background: rgba(74, 144, 217, 0.08); }
-  .wl-queue-num {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px; height: 20px;
-    border-radius: 50%;
-    background: var(--primary);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 700;
-    flex-shrink: 0;
-  }
-  .wl-queue-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wl-queue-steps { color: var(--text-secondary); font-size: 11px; flex-shrink: 0; }
-  .wl-queue-remove {
-    background: none; border: none; color: var(--text-secondary); cursor: pointer;
-    font-size: 14px; line-height: 1; padding: 0 2px; flex-shrink: 0;
-  }
-  .wl-queue-remove:hover { color: var(--error); }
-  .wl-config-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 4px 0;
-    font-size: 12px;
-  }
-  .wl-config-row .label { color: var(--text-secondary); }
-  .wl-config-row select, .wl-config-row input[type=number] {
-    width: 140px;
-    padding: 3px 6px;
-    font-size: 12px;
-  }
-  .wl-config-row input[type=number] {
-    background: var(--surface-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    width: 60px;
-    text-align: center;
-  }
-  .wl-textarea {
-    width: 100%;
-    min-height: 60px;
-    padding: 6px 8px;
-    font-size: 12px;
-    font-family: var(--font-ui);
-    background: var(--surface-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    resize: vertical;
-  }
-  .wl-textarea:focus { outline: 1px solid var(--primary); }
-  .wl-textarea::placeholder { color: var(--text-secondary); }
-  .wl-config-row input[type=text] {
-    width: 140px;
-    padding: 3px 6px;
-    font-size: 12px;
-    background: var(--surface-2);
-    color: var(--text);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-  }
-  .wl-checkbox-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 0;
-    font-size: 12px;
-    color: var(--text-secondary);
-  }
-  .wl-checkbox-row input[type=checkbox] { margin: 0; }
-  .wl-status-phase {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 10px;
-    font-size: 11px;
-    font-weight: 600;
-    font-family: var(--font-code);
-  }
-  .wl-status-phase.idle { background: var(--surface-2); color: var(--text-secondary); }
-  .wl-status-phase.running_workflow { background: rgba(74, 144, 217, 0.2); color: var(--primary); }
-  .wl-status-phase.evaluating_exit { background: rgba(229, 168, 75, 0.2); color: var(--warning); }
-  .wl-status-phase.between_iterations { background: rgba(179, 157, 219, 0.2); color: #b39ddb; }
-  .wl-status-phase.waiting_for_runner { background: rgba(229, 168, 75, 0.2); color: var(--warning); }
-  .wl-status-phase.complete { background: rgba(77, 184, 157, 0.2); color: var(--success); }
-  .wl-status-phase.stopped { background: var(--surface-2); color: var(--text-secondary); }
-  .wl-status-phase.error { background: rgba(217, 74, 74, 0.2); color: var(--error); }
-  .wl-status-phase.building_workflow { background: rgba(229, 168, 75, 0.2); color: var(--warning); }
-  .wl-status-phase.reflecting { background: rgba(179, 157, 219, 0.2); color: #b39ddb; }
-  .wl-status-phase.implementing_fixes { background: rgba(255, 138, 101, 0.2); color: #ff8a65; }
-  .wl-history {
-    max-height: 140px;
-    overflow-y: auto;
-    font-family: var(--font-code);
-    font-size: 11px;
-    margin-top: 6px;
-  }
-  .wl-history-item {
-    padding: 3px 0;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  .wl-history-item:last-child { border-bottom: none; }
-  .wl-history-iter { color: var(--primary); font-weight: 600; flex-shrink: 0; }
-  .wl-history-reason { color: var(--text-secondary); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wl-history-exit { flex-shrink: 0; }
-  .wl-history-exit.yes { color: var(--success); }
-  .wl-history-exit.no { color: var(--warning); }
-  .wl-progress {
-    height: 4px;
-    background: var(--surface-2);
-    border-radius: 2px;
-    margin: 8px 0;
-    overflow: hidden;
-  }
-  .wl-progress-bar {
-    height: 100%;
-    background: var(--primary);
-    border-radius: 2px;
-    transition: width 0.5s ease;
-  }
-  .wl-badge {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    min-width: 18px;
-    height: 18px;
-    padding: 0 5px;
-    border-radius: 9px;
-    background: var(--primary);
-    color: #fff;
-    font-size: 10px;
-    font-weight: 700;
-    margin-left: 6px;
-  }
 
   /* Toast notifications */
   .toast-container {
@@ -577,7 +353,7 @@
 <!-- Status Bar -->
 <div class="status-bar">
   <div class="left">
-    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span></span>
+    <span><span class="status-dot" id="statusDot"></span><span id="statusText">Connecting...</span><span id="statusReason" style="color:var(--warning);margin-left:8px;font-size:0.85em"></span></span>
     <span style="color:var(--text-secondary)">Supervisor <span id="supervisorVersion">v?.?.?</span></span>
   </div>
   <div class="right">
@@ -606,16 +382,6 @@
         <button class="btn primary" onclick="postAction('/runner/restart',{rebuild:false})">Restart</button>
         <button class="btn" onclick="postAction('/runner/restart',{rebuild:true})">Rebuild</button>
       </div>
-    </div>
-  </div>
-
-  <!-- Ports Card -->
-  <div class="card">
-    <div class="card-header">Ports</div>
-    <div class="card-body">
-      <ul class="port-list" id="portList">
-        <li><span class="port-dot down"></span>Loading...</li>
-      </ul>
     </div>
   </div>
 
@@ -651,17 +417,6 @@
         <select id="aiProvider" onchange="setAiProvider()"></select>
       </div>
       <div class="row"><span class="label">Running</span><span class="value" id="aiRunning">--</span></div>
-      <div class="row">
-        <span class="label">Auto-debug</span>
-        <label class="toggle">
-          <input type="checkbox" id="autoDebugToggle" onchange="toggleAutoDebug()">
-          <span class="slider"></span>
-        </label>
-      </div>
-      <div class="btn-group">
-        <button class="btn primary" onclick="postAction('/ai/debug',{})">Debug</button>
-        <button class="btn danger" onclick="postAction('/ai/stop')">Stop</button>
-      </div>
     </div>
   </div>
 
@@ -672,28 +427,6 @@
       <div class="row"><span class="label">Editing</span><span class="value" id="codeEditing">--</span></div>
       <div class="row"><span class="label">Ext Claude</span><span class="value" id="codeExtClaude">--</span></div>
       <div class="row"><span class="label">Pending Debug</span><span class="value" id="codePending">--</span></div>
-    </div>
-  </div>
-
-  <!-- Dev-Start Controls -->
-  <div class="card two-col">
-    <div class="card-header">Dev-Start Controls</div>
-    <div class="card-body">
-      <div class="btn-group">
-        <button class="btn success" onclick="postAction('/dev-start/backend')">Backend</button>
-        <button class="btn success" onclick="postAction('/dev-start/frontend')">Frontend</button>
-        <button class="btn success" onclick="postAction('/dev-start/docker')">Docker</button>
-        <button class="btn success" onclick="postAction('/dev-start/all')">All</button>
-        <button class="btn danger" onclick="postAction('/dev-start/stop')">Stop All</button>
-        <button class="btn" onclick="postAction('/dev-start/clean')">Clean</button>
-        <button class="btn" onclick="postAction('/dev-start/fresh')">Fresh</button>
-        <button class="btn" onclick="postAction('/dev-start/migrate')">Migrate</button>
-      </div>
-      <div class="btn-group" style="margin-top:6px;">
-        <button class="btn danger" onclick="postAction('/dev-start/backend/stop')">Stop Backend</button>
-        <button class="btn danger" onclick="postAction('/dev-start/frontend/stop')">Stop Frontend</button>
-        <button class="btn danger" onclick="postAction('/dev-start/docker/stop')">Stop Docker</button>
-      </div>
     </div>
   </div>
 
@@ -723,127 +456,6 @@
       <div class="btn-group">
         <button class="btn primary" onclick="refreshUiBridge()">Refresh</button>
         <button class="btn" onclick="window.open('/ui-bridge/control/snapshot','_blank')">View JSON</button>
-      </div>
-    </div>
-  </div>
-
-  <!-- Workflow Loop -->
-  <div class="card full-width">
-    <div class="card-header">
-      <span>Workflow Loop<span class="wl-badge" id="wlQueueBadge" style="display:none">0</span></span>
-      <span class="wl-status-phase idle" id="wlPhaseTag">idle</span>
-    </div>
-    <div class="card-body">
-      <div class="wl-panel">
-        <!-- Left: Queue & Config -->
-        <div>
-          <div class="wl-section-title">Mode</div>
-          <div class="wl-config-row">
-            <label><input type="radio" name="wlMode" value="simple" checked onchange="wlModeChange()"> Simple</label>
-            <label style="margin-left:12px"><input type="radio" name="wlMode" value="pipeline" onchange="wlModeChange()"> Pipeline</label>
-          </div>
-
-          <div id="wlSimpleConfig">
-            <div class="wl-section-title" style="margin-top:10px">Add Workflow</div>
-            <div class="wl-add-row">
-              <select id="wlWorkflowSelect"><option value="">Loading workflows...</option></select>
-              <button class="btn primary" onclick="wlAddToQueue()">+ Add</button>
-              <button class="btn" onclick="wlRefreshWorkflows()" title="Refresh workflow list">&#x21bb;</button>
-            </div>
-
-            <div class="wl-section-title">Queue</div>
-            <ul class="wl-queue" id="wlQueue">
-              <li class="wl-queue-empty">No workflows queued</li>
-            </ul>
-
-            <div class="wl-section-title" style="margin-top:10px">Configuration</div>
-            <div class="wl-config-row">
-              <span class="label">Exit Strategy</span>
-              <select id="wlExitStrategy">
-                <option value="fixed_iterations">Fixed Iterations</option>
-                <option value="reflection">Reflection (0 fixes = exit)</option>
-                <option value="workflow_verification">Verification (pass on 1st = exit)</option>
-              </select>
-            </div>
-          </div>
-
-          <div id="wlPipelineConfig" style="display:none">
-            <div class="wl-section-title" style="margin-top:10px">Pipeline Configuration</div>
-
-            <div style="margin-bottom:8px">
-              <div class="wl-config-row"><span class="label">Build Description</span></div>
-              <textarea id="wlPipelineBuildDesc" class="wl-textarea" placeholder="Describe the workflow to generate..." rows="3"></textarea>
-            </div>
-
-            <div style="margin-bottom:8px">
-              <div class="wl-config-row"><span class="label">Build Context (optional)</span></div>
-              <textarea id="wlPipelineBuildContext" class="wl-textarea" placeholder="Additional context for the builder..." rows="2"></textarea>
-            </div>
-
-            <div class="wl-config-row">
-              <span class="label">Execute Workflow (fallback)</span>
-              <select id="wlPipelineExecId" style="width:160px">
-                <option value="">None (use build)</option>
-              </select>
-            </div>
-
-            <div class="wl-checkbox-row" style="margin-top:6px">
-              <input type="checkbox" id="wlPipelineEnableFixes" onchange="wlToggleFixConfig()">
-              <span>Enable Fix Implementation</span>
-            </div>
-
-            <div id="wlFixConfig" style="display:none;margin-top:6px">
-              <div style="margin-bottom:8px">
-                <div class="wl-config-row"><span class="label">Fix Additional Context (optional)</span></div>
-                <textarea id="wlPipelineFixContext" class="wl-textarea" placeholder="Extra instructions for the fix agent..." rows="2"></textarea>
-              </div>
-              <div class="wl-config-row">
-                <span class="label">Fix Timeout (seconds)</span>
-                <input type="number" id="wlPipelineFixTimeout" value="600" min="60" max="3600">
-              </div>
-            </div>
-          </div>
-
-          <div class="wl-config-row" style="margin-top:10px">
-            <span class="label">Between Iterations</span>
-            <select id="wlBetween">
-              <option value="restart_on_signal">Restart on Signal (rebuild)</option>
-              <option value="restart_on_signal_no_rebuild">Restart on Signal (no rebuild)</option>
-              <option value="restart_runner">Always Restart (rebuild)</option>
-              <option value="restart_runner_no_rebuild">Always Restart (no rebuild)</option>
-              <option value="wait_healthy">Wait for Healthy</option>
-              <option value="none">None</option>
-            </select>
-          </div>
-          <div class="wl-config-row">
-            <span class="label">Max Iterations</span>
-            <input type="number" id="wlMaxIter" value="5" min="1" max="50">
-          </div>
-
-          <div class="btn-group" style="margin-top:12px">
-            <button class="btn success" id="wlStartBtn" onclick="wlStart()">Run Loop</button>
-            <button class="btn danger" id="wlStopBtn" onclick="wlStop()" disabled>Stop</button>
-            <button class="btn" id="wlClearBtn" onclick="wlClearQueue()">Clear</button>
-          </div>
-        </div>
-
-        <!-- Right: Status & History -->
-        <div>
-          <div class="wl-section-title">Status</div>
-          <div class="row"><span class="label">Phase</span><span class="value" id="wlPhase">idle</span></div>
-          <div class="row" id="wlPipelinePhaseRow" style="display:none"><span class="label">Pipeline Phase</span><span class="value wl-status-phase" id="wlPipelinePhaseTag" style="font-size:11px">--</span></div>
-          <div class="row"><span class="label">Iteration</span><span class="value" id="wlIteration">--</span></div>
-          <div class="row"><span class="label">Started</span><span class="value" id="wlStarted">--</span></div>
-          <div class="row"><span class="label">Error</span><span class="value" id="wlError" style="color:var(--text-secondary)">none</span></div>
-          <div class="wl-progress" id="wlProgress" style="display:none">
-            <div class="wl-progress-bar" id="wlProgressBar" style="width:0%"></div>
-          </div>
-
-          <div class="wl-section-title" style="margin-top:12px">Iteration History</div>
-          <div class="wl-history" id="wlHistory">
-            <div style="color:var(--text-secondary);font-size:12px;padding:8px 0;text-align:center">No iterations yet</div>
-          </div>
-        </div>
       </div>
     </div>
   </div>
@@ -897,14 +509,6 @@
     <div class="log-viewer" id="logViewer" tabindex="0"></div>
   </div>
 
-  <!-- AI Output -->
-  <div class="card full-width">
-    <div class="card-header">AI Output</div>
-    <div class="ai-output" id="aiOutput">
-      <div class="line" style="color:var(--text-secondary)">No AI output yet.</div>
-    </div>
-  </div>
-
 </div>
 
 <script>
@@ -918,7 +522,6 @@
   let lastHealth = null;
   let watchdogEnabled = false;
   let sseConnected = false;
-  let aiSseConnected = false;
   let wsConnected = false;
   let modelsLoaded = false;
   let aiModels = [];
@@ -930,7 +533,6 @@
   let serverShuttingDown = false;
   let wsReconnectDelay = 3000;   // exponential backoff: 3s → 6s → 12s → 30s max
   let sseReconnectDelay = 3000;
-  let aiSseReconnectDelay = 3000;
   const MAX_RECONNECT_DELAY = 30000;
 
   function nextDelay(current) {
@@ -939,11 +541,8 @@
 
   function closeAllConnections() {
     if (logSSE) { logSSE.close(); logSSE = null; }
-    if (aiSSE) { aiSSE.close(); aiSSE = null; }
     if (ws) { ws.close(); ws = null; }
-    if (wlLoopSSE) { wlLoopSSE.close(); wlLoopSSE = null; }
     sseConnected = false;
-    aiSseConnected = false;
     wsConnected = false;
     updateConnectionIndicators();
   }
@@ -1094,12 +693,10 @@
         showToast(data.message || action + ' completed', 'success');
       }
       // Poll multiple times with increasing delays — ports may not release immediately
-      setTimeout(function() { pollHealth(); pollDevStartStatus(); }, 500);
-      setTimeout(function() { pollDevStartStatus(); }, 2000);
-      setTimeout(function() { pollDevStartStatus(); }, 5000);
+      setTimeout(function() { pollHealth(); }, 500);
     } catch(e) {
       showToast('Request failed: ' + e.message, 'error');
-      setTimeout(function() { pollHealth(); pollDevStartStatus(); }, 500);
+      setTimeout(function() { pollHealth(); }, 500);
     } finally {
       if (btn && btn.classList) {
         setTimeout(function() { btn.classList.remove('loading'); }, 500);
@@ -1132,6 +729,11 @@
     var txt = document.getElementById('statusText');
     dot.className = 'status-dot ' + h.status;
     txt.textContent = h.status.charAt(0).toUpperCase() + h.status.slice(1);
+    // Why the status is not the plain process/API verdict (e.g. the primary's
+    // frontend has been not ready past the grace). Absent = nothing to say.
+    var reasonEl = document.getElementById('statusReason');
+    reasonEl.textContent = h.status_reason ? '— ' + h.status_reason : '';
+    reasonEl.title = h.status_reason || '';
 
     document.getElementById('supervisorVersion').textContent = 'v' + h.supervisor.version;
 
@@ -1167,7 +769,6 @@
     // AI
     document.getElementById('aiRunning').textContent = h.ai.ai_running ? 'Yes' : 'No';
     document.getElementById('aiRunning').style.color = h.ai.ai_running ? 'var(--warning)' : 'var(--text-secondary)';
-    document.getElementById('autoDebugToggle').checked = h.ai.auto_debug_enabled;
 
     // Select the current provider/model combo
     if (modelsLoaded) {
@@ -1202,32 +803,6 @@
 
   // No periodic polling — health comes via WS push or after actions
 
-  // --- Dev-Start Status Polling (ports) ---
-  async function pollDevStartStatus() {
-    try {
-      var data = await fetchJSON('/dev-start/status');
-      updatePortsUI(data);
-    } catch(e) { /* ignore */ }
-  }
-
-  function updatePortsUI(data) {
-    var list = document.getElementById('portList');
-    if (!data.services) return;
-
-    var html = '';
-    for (var i = 0; i < data.services.length; i++) {
-      var svc = data.services[i];
-      var up = svc.available;
-      var dotClass = up ? 'up' : 'down';
-      html += '<li><span class="port-dot ' + dotClass + '"></span>' +
-              svc.port + ' ' + svc.name + '</li>';
-    }
-
-    list.innerHTML = html;
-  }
-
-  // No periodic polling — fetched after actions
-
   // --- AI Models ---
   async function loadModels() {
     try {
@@ -1251,11 +826,6 @@
     var sel = document.getElementById('aiProvider');
     var parts = sel.value.split('/');
     postAction('/ai/provider', { provider: parts[0], model: parts[1] });
-  };
-
-  window.toggleAutoDebug = function() {
-    var checked = document.getElementById('autoDebugToggle').checked;
-    postAction('/ai/auto-debug', { enabled: checked });
   };
 
   window.toggleWatchdog = function() {
@@ -1537,68 +1107,6 @@
     });
   };
 
-  // --- SSE AI Output Stream ---
-  var aiSSE = null;
-
-  function connectAiSSE() {
-    if (serverShuttingDown) return;
-    if (aiSSE) aiSSE.close();
-    aiSSE = new EventSource(BASE + '/ai/output/stream');
-
-    aiSSE.addEventListener('ai_output', function(e) {
-      try {
-        var entries = JSON.parse(e.data);
-        if (Array.isArray(entries) && entries.length > 0) {
-          appendAiOutput(entries);
-        }
-      } catch(err) { /* ignore */ }
-    });
-
-    aiSSE.onopen = function() {
-      aiSseConnected = true;
-      aiSseReconnectDelay = 3000; // reset backoff on success
-      updateConnectionIndicators();
-    };
-
-    aiSSE.onerror = function() {
-      aiSseConnected = false;
-      updateConnectionIndicators();
-      aiSSE.close();
-      if (!serverShuttingDown) {
-        setTimeout(connectAiSSE, aiSseReconnectDelay);
-        aiSseReconnectDelay = nextDelay(aiSseReconnectDelay);
-      }
-    };
-  }
-
-  function appendAiOutput(entries) {
-    var container = document.getElementById('aiOutput');
-    // Clear placeholder
-    if (container.querySelector('.line[style]')) {
-      container.innerHTML = '';
-    }
-
-    for (var i = 0; i < entries.length; i++) {
-      var entry = entries[i];
-      var div = document.createElement('div');
-      div.className = 'line';
-      div.textContent = entry.line;
-      if (entry.stream === 'stderr') {
-        div.style.color = 'var(--error)';
-      }
-      container.appendChild(div);
-    }
-
-    // Keep max 500 lines
-    while (container.children.length > 500) {
-      container.removeChild(container.firstChild);
-    }
-
-    container.scrollTop = container.scrollHeight;
-  }
-
-  connectAiSSE();
-
   // --- WebSocket Health Connection ---
   var ws = null;
   var wsReconnectTimer = null;
@@ -1621,7 +1129,6 @@
       updateConnectionIndicators();
       // Fetch current state on connect
       pollHealth();
-      pollDevStartStatus();
       fetchDiagnostics();
     };
 
@@ -1674,445 +1181,14 @@
 
     // SSE indicator
     var sseEl = document.getElementById('sseIndicator');
-    if (sseConnected && aiSseConnected) {
+    if (sseConnected) {
       sseEl.textContent = 'SSE: Yes';
-      sseEl.className = 'connection-indicator connected';
-    } else if (sseConnected || aiSseConnected) {
-      sseEl.textContent = 'SSE: Partial';
       sseEl.className = 'connection-indicator connected';
     } else {
       sseEl.textContent = 'SSE: No';
       sseEl.className = 'connection-indicator disconnected';
     }
   }
-
-  // --- Workflow Loop ---
-  var wlWorkflows = [];
-  var wlQueueItems = JSON.parse(localStorage.getItem('wl-queue') || '[]');
-  var wlLoopSSE = null;
-  var wlLastStatus = null;
-  var wlStatusPollTimer = null;
-
-  function wlRenderQueue() {
-    var ul = document.getElementById('wlQueue');
-    var badge = document.getElementById('wlQueueBadge');
-    if (wlQueueItems.length === 0) {
-      ul.innerHTML = '<li class="wl-queue-empty">No workflows queued</li>';
-      ul.className = 'wl-queue';
-      badge.style.display = 'none';
-      return;
-    }
-    ul.className = 'wl-queue has-items';
-    badge.style.display = 'inline-flex';
-    badge.textContent = wlQueueItems.length;
-    var html = '';
-    for (var i = 0; i < wlQueueItems.length; i++) {
-      var item = wlQueueItems[i];
-      var steps = item.steps || '?';
-      html += '<li class="wl-queue-item" draggable="true" data-idx="' + i + '"' +
-              ' ondragstart="wlDragStart(event)" ondragover="wlDragOver(event)"' +
-              ' ondragenter="wlDragEnter(event)" ondragleave="wlDragLeave(event)"' +
-              ' ondrop="wlDrop(event)" ondragend="wlDragEnd(event)">' +
-              '<span class="wl-queue-num">' + (i + 1) + '</span>' +
-              '<span class="wl-queue-name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span>' +
-              '<span class="wl-queue-steps">' + steps + ' steps</span>' +
-              '<button class="wl-queue-remove" onclick="wlRemoveFromQueue(' + i + ')">&times;</button>' +
-              '</li>';
-    }
-    ul.innerHTML = html;
-  }
-
-  function wlSaveQueue() {
-    localStorage.setItem('wl-queue', JSON.stringify(wlQueueItems));
-  }
-
-  window.wlAddToQueue = function() {
-    var sel = document.getElementById('wlWorkflowSelect');
-    var id = sel.value;
-    if (!id) return;
-    var wf = wlWorkflows.find(function(w) { return w.id === id; });
-    if (!wf) return;
-    // Don't add duplicates
-    if (wlQueueItems.some(function(q) { return q.id === id; })) {
-      showToast('Workflow already in queue', 'error');
-      return;
-    }
-    var stepCount = 0;
-    if (wf.steps && Array.isArray(wf.steps)) stepCount = wf.steps.length;
-    wlQueueItems.push({ id: wf.id, name: wf.name || wf.id, steps: stepCount });
-    wlSaveQueue();
-    wlRenderQueue();
-  };
-
-  window.wlRemoveFromQueue = function(idx) {
-    wlQueueItems.splice(idx, 1);
-    wlSaveQueue();
-    wlRenderQueue();
-  };
-
-  window.wlClearQueue = function() {
-    wlQueueItems = [];
-    wlSaveQueue();
-    wlRenderQueue();
-  };
-
-  // Drag and drop
-  var wlDragIdx = null;
-  window.wlDragStart = function(e) {
-    wlDragIdx = parseInt(e.currentTarget.dataset.idx);
-    e.currentTarget.classList.add('dragging');
-    e.dataTransfer.effectAllowed = 'move';
-  };
-  window.wlDragOver = function(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; };
-  window.wlDragEnter = function(e) {
-    e.preventDefault();
-    e.currentTarget.classList.add('drag-over');
-  };
-  window.wlDragLeave = function(e) { e.currentTarget.classList.remove('drag-over'); };
-  window.wlDragEnd = function(e) { e.currentTarget.classList.remove('dragging'); };
-  window.wlDrop = function(e) {
-    e.preventDefault();
-    e.currentTarget.classList.remove('drag-over');
-    var toIdx = parseInt(e.currentTarget.dataset.idx);
-    if (wlDragIdx === null || wlDragIdx === toIdx) return;
-    var item = wlQueueItems.splice(wlDragIdx, 1)[0];
-    wlQueueItems.splice(toIdx, 0, item);
-    wlDragIdx = null;
-    wlSaveQueue();
-    wlRenderQueue();
-  };
-
-  async function wlFetchWorkflows() {
-    var sel = document.getElementById('wlWorkflowSelect');
-    try {
-      // Fetch from runner API through proxy or direct
-      var resp = await fetch('http://127.0.0.1:9876/unified-workflows');
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      var data = await resp.json();
-      var list = data.data || data;
-      if (!Array.isArray(list)) list = [];
-      wlWorkflows = list;
-      sel.innerHTML = '<option value="">Select a workflow...</option>';
-      var pipelineExecSel = document.getElementById('wlPipelineExecId');
-      pipelineExecSel.innerHTML = '<option value="">None (use build)</option>';
-      for (var i = 0; i < list.length; i++) {
-        var wf = list[i];
-        var opt = document.createElement('option');
-        opt.value = wf.id;
-        var stepCount = (wf.steps && Array.isArray(wf.steps)) ? wf.steps.length : 0;
-        opt.textContent = (wf.name || wf.id) + ' (' + stepCount + ' steps)';
-        sel.appendChild(opt);
-        // Also add to pipeline exec dropdown
-        var popt = document.createElement('option');
-        popt.value = wf.id;
-        popt.textContent = (wf.name || wf.id) + ' (' + stepCount + ' steps)';
-        pipelineExecSel.appendChild(popt);
-      }
-      // Update queue items with fresh step counts
-      for (var q = 0; q < wlQueueItems.length; q++) {
-        var match = list.find(function(w) { return w.id === wlQueueItems[q].id; });
-        if (match) {
-          wlQueueItems[q].name = match.name || match.id;
-          wlQueueItems[q].steps = (match.steps && Array.isArray(match.steps)) ? match.steps.length : 0;
-        }
-      }
-      wlSaveQueue();
-      wlRenderQueue();
-    } catch(e) {
-      sel.innerHTML = '<option value="">Runner not available</option>';
-    }
-  }
-
-  window.wlModeChange = function() {
-    var mode = document.querySelector('input[name="wlMode"]:checked').value;
-    localStorage.setItem('wl-mode', mode);
-    document.getElementById('wlSimpleConfig').style.display = mode === 'simple' ? '' : 'none';
-    document.getElementById('wlPipelineConfig').style.display = mode === 'pipeline' ? '' : 'none';
-    // Pre-populate sensible defaults when switching to pipeline
-    if (mode === 'pipeline') {
-      var betweenSel = document.getElementById('wlBetween');
-      if (betweenSel.value === 'restart_on_signal' || betweenSel.value === 'restart_on_signal_no_rebuild') {
-        betweenSel.value = 'restart_runner';
-      }
-    }
-  };
-
-  window.wlToggleFixConfig = function() {
-    var checked = document.getElementById('wlPipelineEnableFixes').checked;
-    document.getElementById('wlFixConfig').style.display = checked ? '' : 'none';
-  };
-
-  window.wlRefreshWorkflows = function() {
-    wlFetchWorkflows();
-    showToast('Refreshed workflow list', 'success');
-  };
-
-  window.wlStart = async function() {
-    var mode = document.querySelector('input[name="wlMode"]:checked').value;
-    var betweenSel = document.getElementById('wlBetween').value;
-    var maxIter = parseInt(document.getElementById('wlMaxIter').value) || 5;
-
-    var between;
-    if (betweenSel === 'restart_on_signal') {
-      between = { type: 'restart_on_signal', rebuild: true };
-    } else if (betweenSel === 'restart_on_signal_no_rebuild') {
-      between = { type: 'restart_on_signal', rebuild: false };
-    } else if (betweenSel === 'restart_runner') {
-      between = { type: 'restart_runner', rebuild: true };
-    } else if (betweenSel === 'restart_runner_no_rebuild') {
-      between = { type: 'restart_runner', rebuild: false };
-    } else if (betweenSel === 'wait_healthy') {
-      between = { type: 'wait_healthy' };
-    } else {
-      between = { type: 'none' };
-    }
-
-    var body;
-
-    if (mode === 'pipeline') {
-      var desc = document.getElementById('wlPipelineBuildDesc').value.trim();
-      var ctx = document.getElementById('wlPipelineBuildContext').value.trim();
-      var execId = document.getElementById('wlPipelineExecId').value;
-      var enableFixes = document.getElementById('wlPipelineEnableFixes').checked;
-
-      if (!desc && !execId) {
-        showToast('Pipeline needs a build description or execute workflow ID', 'error');
-        return;
-      }
-
-      var phases = {
-        reflect: { reflection_workflow_id: null }
-      };
-      if (desc) {
-        phases.build = { description: desc };
-        if (ctx) phases.build.context = ctx;
-      }
-      if (execId) {
-        phases.execute_workflow_id = execId;
-      }
-      if (enableFixes) {
-        phases.implement_fixes = {};
-        var fixCtx = document.getElementById('wlPipelineFixContext').value.trim();
-        if (fixCtx) phases.implement_fixes.additional_context = fixCtx;
-        var fixTimeout = parseInt(document.getElementById('wlPipelineFixTimeout').value);
-        if (fixTimeout && fixTimeout !== 600) phases.implement_fixes.timeout_secs = fixTimeout;
-      }
-
-      body = {
-        max_iterations: maxIter,
-        between_iterations: between,
-        phases: phases
-      };
-    } else {
-      // Simple mode
-      if (wlQueueItems.length === 0) {
-        showToast('Add at least one workflow to the queue', 'error');
-        return;
-      }
-      var workflowId = wlQueueItems[0].id;
-      var exitSel = document.getElementById('wlExitStrategy').value;
-
-      var exitStrategy;
-      if (exitSel === 'reflection') {
-        exitStrategy = { type: 'reflection', reflection_workflow_id: null };
-      } else if (exitSel === 'workflow_verification') {
-        exitStrategy = { type: 'workflow_verification' };
-      } else {
-        exitStrategy = { type: 'fixed_iterations' };
-      }
-
-      body = {
-        workflow_id: workflowId,
-        max_iterations: maxIter,
-        exit_strategy: exitStrategy,
-        between_iterations: between
-      };
-    }
-
-    document.getElementById('wlStartBtn').classList.add('loading');
-    try {
-      var resp = await fetch(BASE + '/workflow-loop/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      var data = await resp.json();
-      if (resp.ok) {
-        showToast('Workflow loop started', 'success');
-        wlConnectSSE();
-        wlStartStatusPoll();
-      } else {
-        showToast(data.error || 'Failed to start', 'error');
-      }
-    } catch(e) {
-      showToast('Request failed: ' + e.message, 'error');
-    } finally {
-      document.getElementById('wlStartBtn').classList.remove('loading');
-    }
-  };
-
-  window.wlStop = async function() {
-    try {
-      var resp = await fetch(BASE + '/workflow-loop/stop', { method: 'POST' });
-      var data = await resp.json();
-      if (resp.ok) {
-        showToast('Stop requested', 'success');
-      } else {
-        showToast(data.error || 'Failed to stop', 'error');
-      }
-    } catch(e) {
-      showToast('Request failed: ' + e.message, 'error');
-    }
-  };
-
-  function wlUpdateStatusUI(s) {
-    wlLastStatus = s;
-    var running = s.running;
-
-    // Phase tag
-    var phaseTag = document.getElementById('wlPhaseTag');
-    var phaseText = (s.phase || 'idle').replace(/_/g, ' ');
-    phaseTag.textContent = phaseText;
-    phaseTag.className = 'wl-status-phase ' + (s.phase || 'idle');
-
-    // Status rows
-    document.getElementById('wlPhase').textContent = phaseText;
-    document.getElementById('wlPhase').style.color = running ? 'var(--primary)' : 'var(--text-secondary)';
-
-    // Pipeline phase row — show when phase is a pipeline-specific phase
-    var pipelinePhases = ['building_workflow', 'reflecting', 'implementing_fixes'];
-    var isPipelinePhase = pipelinePhases.indexOf(s.phase) !== -1;
-    var isPipelineMode = isPipelinePhase || (s.config && s.config.phases);
-    var pipelineRow = document.getElementById('wlPipelinePhaseRow');
-    var pipelineTag = document.getElementById('wlPipelinePhaseTag');
-    if (isPipelineMode && running) {
-      pipelineRow.style.display = '';
-      pipelineTag.textContent = phaseText;
-      pipelineTag.className = 'value wl-status-phase ' + (s.phase || 'idle');
-    } else {
-      pipelineRow.style.display = 'none';
-    }
-
-    var maxIter = (s.config && s.config.max_iterations) || '--';
-    document.getElementById('wlIteration').textContent = s.current_iteration + ' / ' + maxIter;
-
-    document.getElementById('wlStarted').textContent = s.started_at ? formatTime(s.started_at) : '--';
-
-    var errEl = document.getElementById('wlError');
-    if (s.error) {
-      errEl.textContent = s.error;
-      errEl.style.color = 'var(--error)';
-    } else {
-      errEl.textContent = 'none';
-      errEl.style.color = 'var(--text-secondary)';
-    }
-
-    // Progress bar
-    var progWrap = document.getElementById('wlProgress');
-    var progBar = document.getElementById('wlProgressBar');
-    if (running && maxIter > 0) {
-      progWrap.style.display = 'block';
-      var pct = Math.min(100, Math.round((s.current_iteration / maxIter) * 100));
-      progBar.style.width = pct + '%';
-    } else if (s.phase === 'complete') {
-      progWrap.style.display = 'block';
-      progBar.style.width = '100%';
-      progBar.style.background = 'var(--success)';
-    } else {
-      progWrap.style.display = 'none';
-      progBar.style.background = 'var(--primary)';
-    }
-
-    // Buttons
-    document.getElementById('wlStartBtn').disabled = running;
-    document.getElementById('wlStopBtn').disabled = !running;
-    document.getElementById('wlClearBtn').disabled = running;
-  }
-
-  function wlUpdateHistory(iterations) {
-    var el = document.getElementById('wlHistory');
-    if (!iterations || iterations.length === 0) {
-      el.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;padding:8px 0;text-align:center">No iterations yet</div>';
-      return;
-    }
-    var html = '';
-    for (var i = 0; i < iterations.length; i++) {
-      var iter = iterations[i];
-      var exit = iter.exit_check || {};
-      var exitClass = exit.should_exit ? 'yes' : 'no';
-      var exitLabel = exit.should_exit ? 'EXIT' : 'CONTINUE';
-      // Pipeline metadata
-      var meta = '';
-      if (iter.fix_count != null) meta += ' fixes=' + iter.fix_count;
-      if (iter.fixes_implemented != null) meta += ' applied=' + (iter.fixes_implemented ? 'yes' : 'no');
-      if (iter.rebuild_triggered) meta += ' rebuild';
-      if (iter.generated_workflow_id) meta += ' built';
-      var reason = escapeHtml(exit.reason || '--') + (meta ? '  [' + meta.trim() + ']' : '');
-      html += '<div class="wl-history-item">' +
-              '<span class="wl-history-iter">#' + iter.iteration + '</span>' +
-              '<span class="wl-history-reason" title="' + escapeHtml(exit.reason || '') + meta + '">' + reason + '</span>' +
-              '<span class="wl-history-exit ' + exitClass + '">' + exitLabel + '</span>' +
-              '</div>';
-    }
-    el.innerHTML = html;
-    el.scrollTop = el.scrollHeight;
-  }
-
-  function wlConnectSSE() {
-    if (wlLoopSSE) wlLoopSSE.close();
-    wlLoopSSE = new EventSource(BASE + '/workflow-loop/stream');
-    wlLoopSSE.addEventListener('status', function(e) {
-      try {
-        var s = JSON.parse(e.data);
-        wlUpdateStatusUI(s);
-      } catch(err) { /* ignore */ }
-    });
-    wlLoopSSE.onerror = function() {
-      wlLoopSSE.close();
-      wlLoopSSE = null;
-    };
-  }
-
-  function wlStartStatusPoll() {
-    if (wlStatusPollTimer) clearInterval(wlStatusPollTimer);
-    wlPollStatus();
-    wlStatusPollTimer = setInterval(wlPollStatus, 3000);
-  }
-
-  async function wlPollStatus() {
-    try {
-      var s = await fetchJSON('/workflow-loop/status');
-      wlUpdateStatusUI(s);
-      // If running, also fetch history + diagnostics
-      if (s.running || s.phase === 'complete' || s.phase === 'error' || s.phase === 'stopped') {
-        var h = await fetchJSON('/workflow-loop/history');
-        wlUpdateHistory(h.iterations || []);
-        fetchDiagnostics();
-      }
-      // Stop polling if no longer running and not in a terminal state we haven't seen
-      if (!s.running && wlLastStatus && !wlLastStatus.running) {
-        // Keep polling at slower rate for catch-up
-      }
-    } catch(e) { /* ignore */ }
-  }
-
-  // Initialize
-  wlRenderQueue();
-  // Restore saved mode from localStorage
-  var savedMode = localStorage.getItem('wl-mode');
-  if (savedMode === 'pipeline') {
-    var radios = document.querySelectorAll('input[name="wlMode"]');
-    for (var i = 0; i < radios.length; i++) {
-      radios[i].checked = radios[i].value === 'pipeline';
-    }
-    wlModeChange();
-  }
-  // Fetch workflows once runner is available (delay slightly)
-  setTimeout(wlFetchWorkflows, 2000);
-  // Start status polling
-  wlStartStatusPoll();
-  // Connect SSE
-  wlConnectSSE();
 
   // --- Diagnostics ---
   var diagEvents = [];

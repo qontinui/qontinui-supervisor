@@ -124,56 +124,179 @@ pub struct PairWithTokenRequest {
 /// gets HTTP 504.
 const PAIR_CLI_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Locate the `qontinui_profile` binary built alongside `qontinui-runner.exe`.
-///
-/// Preference order:
-/// 1. `<runner_npm_dir>/target/debug/qontinui_profile[.exe]` — the canonical
-///    location (matches `runner_exe_path` for the runner binary itself).
-/// 2. Any `<runner_npm_dir>/target-pool/slot-{k}/debug/qontinui_profile[.exe]`
-///    that exists. We pick the first one we find; pair-cli is a thin client
-///    and slot drift here is not load-bearing the way it is for the runner.
-///
-/// Returns an error when no binary exists — the caller should retry after
-/// `POST /runners/spawn-test {rebuild: true}` builds the runner workspace
-/// (cargo build always builds the workspace's bins, so a runner rebuild
-/// produces a fresh `qontinui_profile.exe`).
-pub fn resolve_qontinui_profile_path(state: &SharedState) -> Result<PathBuf, String> {
-    let exe_name = qontinui_profile_exe_name();
-    let npm_dir = state.config.runner_npm_dir();
+/// Name prefix of the private directories [`stage_private_cli_copy`] creates
+/// under [`private_cli_copy_root`].
+pub const PRIVATE_CLI_COPY_PREFIX: &str = "qontinui-supervisor-pair-cli-";
 
-    let canonical = npm_dir.join("target").join("debug").join(&exe_name);
-    if canonical.exists() {
-        return Ok(canonical);
+/// Where the pair route's private copies live: the supervisor's per-user data
+/// dir (the one the temp-runner ledger uses), not the system temp dir — a
+/// Linux `/tmp` mounted `noexec` would make every copy unrunnable. The system
+/// temp dir is only the fallback for a box with no per-user data dir.
+fn private_cli_copy_root() -> PathBuf {
+    dirs::data_local_dir()
+        .map(|d| d.join("com.qontinui.supervisor").join("pair-cli"))
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// A leftover private copy older than this is swept by the next pair call.
+/// Far above [`PAIR_CLI_TIMEOUT`], so a copy still in use is never swept.
+const PRIVATE_CLI_COPY_STALE_AFTER: Duration = Duration::from_secs(3600);
+
+/// A private copy of the `qontinui_profile` binary the pair route executes.
+/// Its directory is removed when this is dropped (best effort — a Windows
+/// image still being torn down can keep it a moment longer; the next pair
+/// call's sweep removes it then).
+struct PrivateCliCopy {
+    dir: PathBuf,
+    exe: PathBuf,
+}
+
+impl Drop for PrivateCliCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
 
+/// Copy `cli` into a fresh private directory under `temp_root` and return the
+/// copy, which is what the pair route executes — never the file it resolved.
+///
+/// Why: the resolved `qontinui_profile` lives in a build slot, the non-pool
+/// `target/debug/` or the LKG dir. A running image locks its file on Windows,
+/// and a build that lands in that directory meanwhile panics in tauri-build's
+/// `remove_file().unwrap()` over it. Running a copy leaves every build
+/// directory unlocked.
+///
+/// The copy keeps the source's file name (so a `.cmd` test stub stays one) and
+/// its bytes are checked: a copy of ZERO bytes — the source rewritten with
+/// tauri-build's placeholder since it was resolved — is refused.
+fn stage_private_cli_copy(cli: &Path, temp_root: &Path) -> Result<PrivateCliCopy, String> {
+    sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
+    let file_name = cli
+        .file_name()
+        .ok_or_else(|| format!("{:?} has no file name to copy", cli))?;
+    let dir = temp_root.join(format!(
+        "{}{}",
+        PRIVATE_CLI_COPY_PREFIX,
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create private copy dir {:?}: {e}", dir))?;
+    let copy = PrivateCliCopy {
+        exe: dir.join(file_name),
+        dir,
+    };
+    let bytes = std::fs::copy(cli, &copy.exe)
+        .map_err(|e| format!("copy {:?} -> {:?}: {e}", cli, copy.exe))?;
+    if bytes == 0 {
+        return Err(format!(
+            "{:?} was ZERO-LENGTH when copied (a build placeholder, not a binary) — refused \
+             to run it",
+            cli
+        ));
+    }
+    Ok(copy)
+}
+
+/// Remove private copies older than [`PRIVATE_CLI_COPY_STALE_AFTER`] (as of
+/// `now`) left under `temp_root` by earlier pair calls. Best effort.
+fn sweep_stale_private_cli_copies(temp_root: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(PRIVATE_CLI_COPY_PREFIX)
+        {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > PRIVATE_CLI_COPY_STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
+/// Locate a REAL `qontinui_profile` binary built from the runner workspace.
+/// The pair route never executes the path returned here in place — it runs a
+/// private copy ([`stage_private_cli_copy`]).
+///
+/// Preference order, taking the first candidate that is a NON-EMPTY file:
+/// 1. `<runner_npm_dir>/target/debug/qontinui_profile[.exe]` — the non-pool
+///    local build (matches `runner_exe_path` for the runner binary itself).
+/// 2. Each `<runner_npm_dir>/target-pool/<dir>/debug/qontinui_profile[.exe]`,
+///    in directory-name order (`slot-0`, `slot-1`, …). Pair-cli is a thin
+///    client, so slot drift here is not load-bearing the way it is for the
+///    runner.
+/// 3. `<runner_npm_dir>/target-pool/lkg/qontinui_profile[.exe]` — the copy the
+///    LKG promotion carries (`build_monitor::update_lkg_after_success`).
+///
+/// A ZERO-LENGTH candidate is skipped, never returned. The runner's `build.rs`
+/// writes a 0-byte `binaries/qontinui_profile-<triple>` placeholder and
+/// tauri-build copies it over `<target>/<profile>/qontinui_profile` on every
+/// build-script run, so a 0-byte file is routinely what sits at candidate 1:
+/// executing it spawns nothing useful and the pair would fail with an opaque
+/// error rather than this function's actionable one.
+///
+/// A runner build does NOT produce this binary by itself: the supervisor's
+/// pool build is `cargo build --bin qontinui-runner`, which builds no other
+/// bin. The fail-open sidecar build that follows it
+/// (`build_monitor::SIDECAR_BUILD_ARGS`) is what builds `qontinui_profile`
+/// into the slot. So the remedy the error names is a supervisor rebuild
+/// (`POST /runners/spawn-test {rebuild: true}`), whose sidecar step produces
+/// a fresh one.
+pub fn resolve_qontinui_profile_path(state: &SharedState) -> Result<PathBuf, String> {
+    resolve_qontinui_profile_in(&state.config.runner_npm_dir())
+}
+
+/// [`resolve_qontinui_profile_path`] against an explicit runner workspace
+/// root (`runner_npm_dir`), so the candidate order and the non-empty rule are
+/// testable against a tempdir.
+fn resolve_qontinui_profile_in(npm_dir: &Path) -> Result<PathBuf, String> {
+    let exe_name = crate::build_monitor::PROFILE_CLI_EXE_FILENAME;
+    let canonical = npm_dir.join("target").join("debug").join(exe_name);
     let pool_root = npm_dir.join("target-pool");
+
+    let mut candidates = vec![canonical.clone()];
     if let Ok(entries) = std::fs::read_dir(&pool_root) {
-        for entry in entries.flatten() {
-            let candidate = entry.path().join("debug").join(&exe_name);
-            if candidate.exists() {
-                return Ok(candidate);
-            }
+        let mut pool_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        pool_dirs.sort();
+        candidates.extend(pool_dirs.iter().map(|d| d.join("debug").join(exe_name)));
+    }
+    candidates.push(pool_root.join("lkg").join(exe_name));
+
+    let mut zero_length = Vec::new();
+    for candidate in candidates {
+        match crate::build_monitor::SidecarFile::inspect(&candidate) {
+            crate::build_monitor::SidecarFile::Present { .. } => return Ok(candidate),
+            crate::build_monitor::SidecarFile::Empty => zero_length.push(candidate),
+            crate::build_monitor::SidecarFile::Missing => {}
         }
     }
 
+    let skipped = if zero_length.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Skipped {} ZERO-LENGTH candidate(s) — build placeholders, not binaries: {:?}.",
+            zero_length.len(),
+            zero_length
+        )
+    };
     Err(format!(
-        "qontinui_profile binary not found at {:?} or under {:?}. \
-         Run a runner build first (e.g. POST /runners/spawn-test {{\"rebuild\": true}}).",
-        canonical, pool_root
+        "qontinui_profile binary not found at {:?}, under {:?}/*/debug or in {:?}.{} \
+         Run a supervisor runner build first (e.g. POST /runners/spawn-test {{\"rebuild\": true}}); \
+         its sidecar step builds qontinui_profile into the slot.",
+        canonical,
+        pool_root,
+        pool_root.join("lkg"),
+        skipped
     ))
-}
-
-/// Platform-specific binary name. Mirrors `runner_exe_path`'s logic — the
-/// runner workspace builds Windows .exe files; everything else gets the
-/// extension-less name.
-#[cfg(windows)]
-fn qontinui_profile_exe_name() -> String {
-    "qontinui_profile.exe".to_string()
-}
-
-#[cfg(not(windows))]
-fn qontinui_profile_exe_name() -> String {
-    "qontinui_profile".to_string()
 }
 
 /// Path to `~/.qontinui/machine.json` — the persistent device-identity file
@@ -201,13 +324,16 @@ pub(crate) fn paired_user_json_path(target_dir: Option<&Path>) -> Option<PathBuf
 
 /// Resolve the per-instance secure-storage dir for `target_runner_id`.
 ///
-/// Delegates to [`crate::process::instance_config_dir`] — the documented
+/// Delegates to [`crate::process::instance_root::instance_secure_storage_dir`]
+/// — the one answer the spawn's env block exports as
+/// `QONTINUI_SECURE_STORAGE_DIR` — which resolves through
+/// [`crate::process::instance_config_dir`], the documented
 /// single source of truth for that path (the spawn side, the profile-write
 /// side, and the removal side all funnel through it) — so this route can
 /// never diverge from the dir `start_exe_mode_for_runner` points the runner
 /// itself at.
 pub(crate) fn pair_target_instance_dir(runner_id: &str) -> Result<PathBuf, String> {
-    crate::process::instance_config_dir(runner_id).ok_or_else(|| {
+    crate::process::instance_root::instance_secure_storage_dir(runner_id).ok_or_else(|| {
         format!(
             "could not resolve the per-instance config dir \
              <config_dir>/com.qontinui.runner/instances/{runner_id} for runner '{runner_id}': \
@@ -232,6 +358,18 @@ pub async fn pair_with_token(
     State(state): State<SharedState>,
     Json(body): Json<PairWithTokenRequest>,
 ) -> impl IntoResponse {
+    pair_with_token_copying_into(state, body, private_cli_copy_root()).await
+}
+
+/// [`pair_with_token`] with the directory its private CLI copies go under
+/// passed in, so a caller — the integration tests — can keep them out of the
+/// live supervisor's per-user data dir. Deliberately a function parameter and
+/// not a request field: no HTTP caller chooses where the supervisor writes.
+pub async fn pair_with_token_copying_into(
+    state: SharedState,
+    body: PairWithTokenRequest,
+    copy_root: PathBuf,
+) -> axum::response::Response {
     // Body validation. We surface 400 with a structured error body so
     // callers can branch on the `error` discriminator instead of parsing
     // freeform messages.
@@ -346,22 +484,38 @@ pub async fn pair_with_token(
         },
     };
 
+    // Run a private copy, never the resolved file: a running image would lock
+    // a build directory's file (see `stage_private_cli_copy`). Held until the
+    // child has been reaped; its directory is removed on drop.
+    let private_copy = match stage_private_cli_copy(&cli_path, &copy_root) {
+        Ok(copy) => copy,
+        Err(message) => {
+            return server_error("qontinui_profile_copy_failed", &message);
+        }
+    };
+    let exec_path = private_copy.exe.clone();
+
     state
         .logs
         .emit(
             LogSource::Supervisor,
             LogLevel::Info,
             format!(
-                "pair-with-token: invoking {:?} with tenant_id={} web_base_url={:?} \
-                 target_runner_id={:?} secure_storage_dir={:?}",
-                cli_path, body.tenant_id, body.web_base_url, body.target_runner_id, target_dir
+                "pair-with-token: invoking {:?} (private copy of {:?}) with tenant_id={} \
+                 web_base_url={:?} target_runner_id={:?} secure_storage_dir={:?}",
+                exec_path,
+                cli_path,
+                body.tenant_id,
+                body.web_base_url,
+                body.target_runner_id,
+                target_dir
             ),
         )
         .await;
 
     // Spawn the CLI. Captured stdout/stderr feed the response body on
     // failure; on success we read the on-disk artifacts.
-    let mut cmd = tokio::process::Command::new(&cli_path);
+    let mut cmd = tokio::process::Command::new(&exec_path);
     cmd.arg("device")
         .arg("pair")
         .arg("--auth-token")
@@ -371,36 +525,93 @@ pub async fn pair_with_token(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .stdin(std::process::Stdio::null())
+        // A pair call that times out drops the child; without this it would
+        // keep running, unbounded, after the 504 was answered.
+        .kill_on_drop(true)
         // Don't let inherited Claude Code markers leak into the child;
         // mirrors what manager.rs does on runner spawn.
         .strip_inherited_claude_markers();
     if let Some(web_base) = &body.web_base_url {
         cmd.env("QONTINUI_WEB_BASE", web_base);
     }
-    // Point the child at the target runner's instance dir. The runner lib's
-    // `persist_pairing` (and `SecureStorage::new`) resolve their output dir
-    // from this env var, so both credential halves — `auth_tokens.enc` and
-    // `paired_user.json` — land in the dir the target runner actually reads.
-    // Create it first: the target runner may never have started.
+    // Point the child at the target runner's instance ROOT, through the same
+    // env block the runner spawn gets (`InstanceRoot::apply_env`). The runner
+    // lib's `persist_pairing` (and `SecureStorage::new`) resolve their output
+    // dir from `QONTINUI_SECURE_STORAGE_DIR`, so both credential halves —
+    // `auth_tokens.enc` and `paired_user.json` — land in the dir the target
+    // runner actually reads; `QONTINUI_CONFIG_DIR` makes the CLI's tier
+    // promotion write the TARGET's `settings.json`, not the primary's; and
+    // `QONTINUI_DISABLE_KEYCHAIN` keeps the fresh tokens out of the OS keychain
+    // entry every runner on the box shares. Creates the dirs first: the target
+    // runner may never have started.
+    //
+    // A `fresh_device_identity` target (plan
+    // `2026-10-17-runner-credential-for-every-account-tenant` Phase 8b) is
+    // given the same identity treatment its spawn got: no harness
+    // `machine.json`, no inherited `QONTINUI_MACHINE_ID` — otherwise pairing
+    // it would hand it the harness's device id. The pair CLI only READS
+    // `machine.json` (it never mints one), so a flagged target that has not
+    // yet started and minted its own id is refused up front with a typed 409
+    // rather than failing inside the CLI.
+    let target_identity = match body.target_runner_id.as_deref() {
+        Some(runner_id) => state.get_runner(runner_id).await.map_or(
+            crate::process::instance_root::DeviceIdentity::Harness,
+            |m| {
+                crate::process::instance_root::DeviceIdentity::from_fresh_flag(
+                    m.config.fresh_device_identity,
+                )
+            },
+        ),
+        None => crate::process::instance_root::DeviceIdentity::Harness,
+    };
+    let target_home = body
+        .target_runner_id
+        .as_deref()
+        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .map(|root| root.home_dir());
+    if let Some(refusal) = fresh_target_not_yet_minted(target_identity, target_home.as_deref()) {
+        return (StatusCode::CONFLICT, Json(refusal)).into_response();
+    }
     if let Some(dir) = &target_dir {
-        if let Err(e) = std::fs::create_dir_all(dir) {
+        let root = body
+            .target_runner_id
+            .as_deref()
+            .and_then(crate::process::instance_root::InstanceRoot::for_runner);
+        let applied = match &root {
+            Some(root) if root.secure_storage_dir() == *dir => root
+                .apply_env(
+                    &mut cmd,
+                    crate::process::instance_root::harness_qontinui_dir().as_deref(),
+                    target_identity,
+                )
+                .map(|_| ()),
+            _ => Err(format!(
+                "the instance root of the target runner does not hold its secure-storage dir {}",
+                dir.display()
+            )),
+        };
+        if let Err(e) = applied {
             return server_error(
                 "instance_dir_create_failed",
                 &format!(
-                    "failed to create instance secure-storage dir {}: {e}",
+                    "failed to prepare the instance root for secure-storage dir {}: {e}",
                     dir.display()
                 ),
             );
         }
-        cmd.env("QONTINUI_SECURE_STORAGE_DIR", dir);
     }
 
     let output_fut = async {
+        // Name the program the Command actually holds, not a variable beside
+        // it, so the message can never claim a different file than the one
+        // that was spawned.
+        let spawned = PathBuf::from(cmd.as_std().get_program());
         let child = cmd.spawn().map_err(|e| {
             format!(
-                "failed to spawn {:?}: {e} (path exists? {})",
+                "failed to spawn {:?}: {e} (private copy of {:?}; path exists? {})",
+                spawned,
                 cli_path,
-                cli_path.exists()
+                spawned.exists()
             )
         })?;
         child
@@ -436,6 +647,8 @@ pub async fn pair_with_token(
         }
     };
 
+    drop(private_copy);
+
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
@@ -469,7 +682,15 @@ pub async fn pair_with_token(
     // artifacts. Anything missing here is a CLI contract violation; we
     // surface it as 500 so the caller knows the pair "succeeded" but the
     // supervisor couldn't read back the expected state.
-    let machine_json = match machine_json_path() {
+    // The device id the CLI paired WITH: the target's provisioned
+    // `<root>/home/machine.json` when a target was given (its `QONTINUI_HOME`),
+    // the harness's otherwise.
+    let target_machine_json = body
+        .target_runner_id
+        .as_deref()
+        .and_then(crate::process::instance_root::InstanceRoot::for_runner)
+        .map(|root| root.home_dir().join("machine.json"));
+    let machine_json = match target_machine_json.or_else(machine_json_path) {
         Some(p) => p,
         None => {
             return server_error(
@@ -543,6 +764,33 @@ fn server_error(error_kind: &str, message: &str) -> axum::response::Response {
 
 /// Read `device_id` from `~/.qontinui/machine.json`. Tolerates the legacy
 /// `machine_id` key via the same serde alias the runner uses.
+/// The 409 body for pairing a `fresh_device_identity` target that has not
+/// minted its own `<root>/home/machine.json` yet (it mints at first start,
+/// runner `pair::ensure_device_initialized`). The pair CLI reads that file and
+/// never creates it, so the pair could only fail — or, were the harness's
+/// file projected, pair the subject under the harness's device id. `None` for
+/// a harness-identity target, and for a fresh one whose id is minted. PURE
+/// apart from the one `is_file` probe.
+pub(crate) fn fresh_target_not_yet_minted(
+    identity: crate::process::instance_root::DeviceIdentity,
+    target_home: Option<&Path>,
+) -> Option<serde_json::Value> {
+    if identity != crate::process::instance_root::DeviceIdentity::Fresh {
+        return None;
+    }
+    let machine_json = target_home.map(|home| home.join("machine.json"));
+    if machine_json.as_deref().is_some_and(Path::is_file) {
+        return None;
+    }
+    Some(json!({
+        "error": "fresh_identity_not_yet_minted",
+        "machine_json": machine_json.map(|p| p.display().to_string()),
+        "message": "the target runner runs under fresh_device_identity and has not minted its \
+                    own device id yet: start it first, wait until its device_identity.status \
+                    reads \"minted\" (GET /runners), then pair it",
+    }))
+}
+
 pub(crate) fn read_machine_device_id(path: &Path) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct MachineFile {
@@ -575,7 +823,178 @@ pub(crate) fn read_paired_user(path: &Path) -> Result<(String, Option<String>), 
 mod tests {
     use super::*;
     use std::fs;
+
+    /// Phase 8b: a fresh-identity pair target with no minted `machine.json` is
+    /// refused with a typed body; once the runner has minted, and for every
+    /// harness-identity target, nothing is refused. MUTATION: drop the call
+    /// from `pair_with_token_copying_into` and
+    /// `pair_route_refuses_an_unminted_fresh_target` goes red; return `None`
+    /// here and this goes red.
+    #[test]
+    fn fresh_target_is_refused_until_it_has_minted() {
+        use crate::process::instance_root::DeviceIdentity;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Harness, Some(&home)).is_none());
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Harness, None).is_none());
+
+        let body = fresh_target_not_yet_minted(DeviceIdentity::Fresh, Some(&home)).expect("409");
+        assert_eq!(body["error"], "fresh_identity_not_yet_minted");
+        assert!(body["machine_json"]
+            .as_str()
+            .unwrap()
+            .ends_with("machine.json"));
+        let body = fresh_target_not_yet_minted(DeviceIdentity::Fresh, None).expect("409");
+        assert_eq!(body["machine_json"], serde_json::Value::Null);
+
+        fs::write(home.join("machine.json"), br#"{"device_id":"dev-own"}"#).unwrap();
+        assert!(fresh_target_not_yet_minted(DeviceIdentity::Fresh, Some(&home)).is_none());
+    }
+
+    /// The handler consults the refusal BEFORE the pair CLI is spawned.
+    #[test]
+    fn pair_route_refuses_an_unminted_fresh_target() {
+        let src = include_str!("runners_pair.rs");
+        let start = src
+            .find("pub async fn pair_with_token_copying_into(")
+            .expect("handler");
+        let body = &src[start..];
+        let guard = body
+            .find("fresh_target_not_yet_minted(target_identity")
+            .expect("the handler must consult fresh_target_not_yet_minted");
+        let spawn = body.find("cmd.spawn()").expect("the CLI spawn");
+        assert!(guard < spawn, "the refusal must precede the CLI spawn");
+    }
     use tempfile::tempdir;
+
+    // `stage_private_cli_copy` — the pair route runs a private copy of the
+    // resolved binary, never the build directory's file.
+
+    #[test]
+    fn private_cli_copy_is_a_byte_identical_copy_outside_the_source_dir() {
+        let root = tempdir().unwrap();
+        let src_dir = root.path().join("target-pool").join("slot-0").join("debug");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&src, b"real-profile").unwrap();
+        let temp_root = root.path().join("tmp");
+        fs::create_dir_all(&temp_root).unwrap();
+
+        let copy = stage_private_cli_copy(&src, &temp_root).expect("staged");
+        assert!(copy.exe.starts_with(&temp_root));
+        assert_eq!(copy.exe.file_name(), src.file_name());
+        assert_eq!(fs::read(&copy.exe).unwrap(), b"real-profile");
+        let dir = copy.dir.clone();
+        drop(copy);
+        assert!(!dir.exists(), "the private copy is removed on drop");
+        assert!(src.exists(), "the source is never touched");
+    }
+
+    #[test]
+    fn private_cli_copy_refuses_zero_bytes() {
+        let root = tempdir().unwrap();
+        let src = root
+            .path()
+            .join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&src, b"").unwrap();
+        let temp_root = root.path().join("tmp");
+        fs::create_dir_all(&temp_root).unwrap();
+
+        let err = match stage_private_cli_copy(&src, &temp_root) {
+            Ok(_) => panic!("a zero-byte copy must be refused"),
+            Err(e) => e,
+        };
+        assert!(err.contains("ZERO-LENGTH"), "{err}");
+        assert_eq!(
+            fs::read_dir(&temp_root).unwrap().count(),
+            0,
+            "a refused copy leaves no directory behind"
+        );
+    }
+
+    #[test]
+    fn private_cli_copy_sweep_removes_only_its_own_stale_copies() {
+        let root = tempdir().unwrap();
+        let temp_root = root.path();
+        let stale = temp_root.join(format!("{PRIVATE_CLI_COPY_PREFIX}stale"));
+        let fresh = temp_root.join(format!("{PRIVATE_CLI_COPY_PREFIX}fresh"));
+        let foreign = temp_root.join("someone-elses-dir");
+        for d in [&stale, &fresh, &foreign] {
+            fs::create_dir_all(d).unwrap();
+        }
+        // As of now, every copy is fresh: nothing is swept.
+        sweep_stale_private_cli_copies(temp_root, std::time::SystemTime::now());
+        assert!(
+            stale.exists() && fresh.exists(),
+            "a copy that may be in use is kept"
+        );
+
+        // Two stale-windows later, both prefixed copies are stale.
+        let later = std::time::SystemTime::now() + PRIVATE_CLI_COPY_STALE_AFTER * 2;
+        sweep_stale_private_cli_copies(temp_root, later);
+        assert!(
+            !stale.exists() && !fresh.exists(),
+            "stale private copies are swept"
+        );
+        assert!(foreign.exists(), "nothing without the prefix is touched");
+    }
+
+    // `resolve_qontinui_profile_in` — a zero-length `qontinui_profile` (the
+    // runner build.rs placeholder that tauri-build copies into
+    // `target/debug/`) is skipped, never handed to the pair CLI spawn.
+
+    fn write_profile(dir: &Path, bytes: &[u8]) -> PathBuf {
+        fs::create_dir_all(dir).expect("mkdir");
+        let p = dir.join(crate::build_monitor::PROFILE_CLI_EXE_FILENAME);
+        fs::write(&p, bytes).expect("write qontinui_profile");
+        p
+    }
+
+    #[test]
+    fn profile_resolution_skips_a_zero_length_canonical_for_a_nonempty_slot() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        write_profile(&npm.join("target").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("slot-0").join("debug"), b"");
+        let real = write_profile(
+            &npm.join("target-pool").join("slot-1").join("debug"),
+            b"real-profile",
+        );
+
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), real);
+    }
+
+    #[test]
+    fn profile_resolution_prefers_a_nonempty_canonical_and_falls_back_to_lkg() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        let lkg = write_profile(&npm.join("target-pool").join("lkg"), b"lkg-profile");
+        assert_eq!(
+            resolve_qontinui_profile_in(npm).unwrap(),
+            lkg,
+            "the LKG copy is the last candidate"
+        );
+
+        let canonical = write_profile(&npm.join("target").join("debug"), b"local-profile");
+        assert_eq!(resolve_qontinui_profile_in(npm).unwrap(), canonical);
+    }
+
+    #[test]
+    fn profile_resolution_errors_when_every_candidate_is_zero_length() {
+        let root = tempdir().unwrap();
+        let npm = root.path();
+        write_profile(&npm.join("target").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("slot-0").join("debug"), b"");
+        write_profile(&npm.join("target-pool").join("lkg"), b"");
+
+        let err = resolve_qontinui_profile_in(npm).expect_err("all candidates are 0-byte");
+        assert!(
+            err.contains("Skipped 3 ZERO-LENGTH candidate(s)"),
+            "the error must say why the files that exist were refused: {err}"
+        );
+    }
 
     #[test]
     fn reads_machine_device_id_canonical() {
@@ -691,5 +1110,44 @@ mod tests {
         let (user_id, tenant_id) = read_paired_user(&path).expect("read");
         assert_eq!(user_id, "33333333-3333-4333-8333-333333333333");
         assert!(tenant_id.is_none());
+    }
+
+    /// main's handler points the pair CLI at the target's instance root
+    /// through `InstanceRoot::apply_env`, the same env block a runner spawn
+    /// gets, and that is what carries `QONTINUI_CONFIG_DIR` to the CLI (the
+    /// S6 defect: a pair whose CLI promoted the PRIMARY's settings.json).
+    /// `apply_env` is tested on its own; nothing drives the handler in a unit
+    /// test, since it spawns the CLI, so this reads its source. A handler that
+    /// set an instance-dir variable by hand instead would leave every other
+    /// test green while the CLI saw a different env.
+    #[test]
+    fn the_pair_handler_exports_the_instance_root_through_apply_env() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("routes")
+                .join("runners_pair.rs"),
+        )
+        .expect("read routes/runners_pair.rs")
+        .replace("\r\n", "\n");
+        // Production code only, so this test's own literals cannot satisfy or
+        // trip the scan; `fn_body` stops at the handler's closing brace.
+        let src = crate::source_scan::production_span(&src).to_string();
+        let handler =
+            crate::source_scan::fn_body(&src, "pub async fn pair_with_token_copying_into(")
+                .expect("pair_with_token_copying_into exists");
+        assert_eq!(
+            handler.matches(".apply_env(").count(),
+            1,
+            "pair_with_token_copying_into must hand the pair CLI its instance root through \
+             InstanceRoot::apply_env, exactly once"
+        );
+        for divergent in ["\"QONTINUI_CONFIG_DIR\"", "\"QONTINUI_SECURE_STORAGE_DIR\""] {
+            assert!(
+                !handler.contains(divergent),
+                "pair_with_token_copying_into sets {divergent} by hand: the pair CLI's \
+                 instance env belongs to InstanceRoot::apply_env"
+            );
+        }
     }
 }

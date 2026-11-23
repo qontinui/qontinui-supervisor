@@ -6,6 +6,9 @@ pub mod early_log;
 pub mod env_forwarders;
 pub mod guarded_command;
 pub mod health_probe;
+/// The instance root a non-primary spawn is given (`QONTINUI_INSTANCE_ROOT`) —
+/// plan `2026-10-04-a-subject-runner-must-be-fully-isolated-from-the-harness-runner`.
+pub mod instance_root;
 pub mod job;
 pub mod manager;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
@@ -25,6 +28,10 @@ pub mod panic_log;
 pub mod port;
 pub mod proc_kill;
 pub mod restate_port;
+/// The temp-runner sweep `shutdown_signal` runs at signal time off Windows,
+/// where the runner job reaps nothing. Its selection is cross-platform so the
+/// Linux-only merge gate covers it.
+pub mod shutdown_sweep;
 /// Cross-platform on purpose — see the module docs. CI is Linux-only, and the
 /// slot-kill predicate must be covered by the gate that blocks merges.
 pub mod slot_territory;
@@ -49,6 +56,10 @@ pub mod stopped_cache;
 /// consumes it and removes this attribute.
 #[allow(dead_code)]
 pub mod subtree_census;
+/// Linux spawn isolation: user-owned runners leave the supervisor's cgroup at
+/// spawn, into their own transient systemd scope. Cross-platform on purpose —
+/// the argv decision and the landing check are covered by the Linux-only gate.
+pub mod systemd_scope;
 /// Cross-platform on purpose — the reconcile sweep's ownership decision must be
 /// covered by the Linux-only CI gate that blocks merges. Killing a process the
 /// supervisor never spawned is the failure it exists to prevent, and a
@@ -68,7 +79,9 @@ use std::path::PathBuf;
 /// byte-for-byte:
 ///
 /// 1. **Spawn side** — [`manager::start_exe_mode_for_runner`] exports it to the
-///    child as BOTH `QONTINUI_CONFIG_DIR` and `QONTINUI_SECURE_STORAGE_DIR`.
+///    child as `QONTINUI_INSTANCE_ROOT` (the whole subject lives under it — see
+///    [`instance_root`]) AND as BOTH `QONTINUI_CONFIG_DIR` and
+///    `QONTINUI_SECURE_STORAGE_DIR`.
 ///    The runner prefers those env vars over its
 ///    `dirs::data_local_dir()/com.qontinui.runner` fallback (`auth.rs`,
 ///    `secure_storage.rs`, `pair.rs` all read the env var first), so for a

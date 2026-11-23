@@ -1,0 +1,104 @@
+name: powershell parse
+
+# Parses every tracked `.ps1` and `.psm1` in this repo with the REAL PowerShell
+# parser (`[System.Management.Automation.Language.Parser]::ParseFile`) and
+# fails on any parse error. It is a SYNTAX gate only: no script is ever
+# executed, so it cannot see a missing cmdlet, a bad parameter, or a wrong
+# exit code — only that the file is PowerShell the parser accepts.
+#
+# What it does NOT cover — the 5.1-vs-7 question
+# ---------------------------------------------
+# `pwsh` on `ubuntu-latest` is PowerShell 7. Windows PowerShell 5.1 and 7
+# diverge at RUNTIME (encoding defaults, `$IsWindows`, `-AsHashtable`,
+# ternaries, null-coalescing, `Join-Path` arity, ...), and this job cannot see
+# any of that. This repo has no 5.1 runtime leg at all, so 5.1 semantics are
+# untested here; that is a stated non-goal, not an oversight.
+#
+# Why it exists
+# -------------
+# `qontinui-claude-config` (`powershell-parse` in `qontinui-ci.yml`) and
+# `qontinui-runner` (`.github/workflows/powershell-parse.yml`) parse-gate their
+# PowerShell on every PR. This repo carried 4 PowerShell files with no gate at all, and the
+# fleet authors scripts on Linux boxes with no `pwsh`, so a script could reach
+# review unparsed. Plan: 2026-09-09-parse-gate-for-the-six-other-powershell-carrying-repos.
+#
+# The job body is a COPY of qontinui-runner's workflow (itself a
+# copy of the claude-config job), not a redesign, plus claude-config's later
+# `-Force` fix (#902), which the runner copy originally lacked (fixed there
+# by the same plan): `ubuntu-latest`,
+# `shell: pwsh`, the zero-files-found-is-a-failure guard (a glob that matches
+# nothing must red, not green), the printed per-extension coverage line (a
+# scope that silently collapses back to one extension would otherwise report
+# the same green as one covering both), and the `node_modules|.git` exclusion.
+#
+# The PR that deletes this repo's LAST `.ps1`/`.psm1` must delete this workflow
+# in the same change: the zero-files guard reds by design when there is nothing
+# to parse. The claude-config census (`knowledge-base/qontinui-specific/
+# powershell-corpus.md`, its `parse-gate` column) shows the inverse case, a
+# repo that carries PowerShell and no gate.
+#
+# Trigger / required-check posture
+# --------------------------------
+#   - `pull_request: branches: [main]` plus `workflow_dispatch` for manual
+#     reruns. No `push:` — coord's merge train reads candidate CI from the
+#     repo's own push-triggered workflows, and a parse gate has no business on
+#     `merge-candidate/*` refs.
+#   - NO trigger-level `paths:` filter. A path-filtered workflow is skipped
+#     entirely on non-matching PRs, which for a REQUIRED context is the
+#     "ghost required check" deadlock. The job is a few seconds long; it
+#     simply always runs.
+#   - NOT a required ruleset context. It does not need to be: coord's merge
+#     predicate observes EVERY check, so a red here still stops the train.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+# Least-privilege, stated explicitly rather than inherited from the repo-level
+# `default_workflow_permissions` (an operator-flippable setting invisible in
+# this file). This job checks the tree out and reads files; nothing else.
+permissions:
+  contents: read
+
+jobs:
+  powershell-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Parse every .ps1 and .psm1 with the real PowerShell parser
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # -Force: on Linux, pwsh treats a dot-prefixed entry as HIDDEN and
+          # skips it without this flag, so a script under `.github/`, `.claude/`
+          # or any other dot-directory would never be parsed. qontinui-claude-config
+          # found this in its own log (53 parsed of 55 tracked) and fixed it in
+          # #902. The `.git` exclusion below is what -Force would otherwise let in.
+          $files = Get-ChildItem -Path . -Recurse -File -Force |
+                   Where-Object { $_.Extension -in '.ps1', '.psm1' } |
+                   Where-Object { $_.FullName -notmatch '[\\/](node_modules|\.git)[\\/]' }
+          if ($files.Count -eq 0) {
+            Write-Host '::error::powershell-parse found no .ps1/.psm1 files — the glob is wrong, not the tree.'
+            exit 1
+          }
+          # Coverage is PRINTED per extension: a scope that silently collapses
+          # back to one extension reports the same green as one covering both.
+          $byExt = $files | Group-Object Extension | ForEach-Object { "$($_.Name)=$($_.Count)" }
+          Write-Host "powershell-parse scope: $($byExt -join ' ')"
+          $bad = 0
+          foreach ($f in $files) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              $f.FullName, [ref]$null, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $bad++
+              $rel = Resolve-Path -Relative $f.FullName
+              foreach ($e in $errors) {
+                $line = $e.Extent.StartLineNumber
+                Write-Host "::error file=$rel,line=$line::$($e.Message)"
+              }
+            }
+          }
+          Write-Host "powershell-parse: $($files.Count) file(s) parsed, $bad with errors."
+          if ($bad -gt 0) { exit 1 }

@@ -121,7 +121,9 @@ export default function VelocityEndpoint() {
           {route}
         </h1>
       </div>
-      <p className="page-desc">Latency distribution, trend over time, and recent requests for this endpoint.</p>
+      <p className="page-desc">
+        Latency distribution, trend over time, and recent requests for this endpoint.
+      </p>
 
       {loading && (
         <div className="card">

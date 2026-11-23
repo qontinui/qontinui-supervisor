@@ -253,6 +253,45 @@ mod tests {
         out
     }
 
+    /// Whether `path` is part of this module: `process/claude_env.rs` itself,
+    /// or a file under `process/claude_env/` — where a test module extracted
+    /// from it lands (`claude_env/tests.rs`, plan
+    /// `2026-10-01-oversized-source-files-owe-a-decomposition` Phase 2b). That
+    /// test code builds the banned `env_remove(...)` needles, so a basename
+    /// match on `claude_env.rs` alone would flag the module's own tests the
+    /// moment they move out of this file.
+    fn is_the_strip_module(path: &Path) -> bool {
+        let parts: Vec<&str> = path
+            .components()
+            .filter_map(|c| c.as_os_str().to_str())
+            .collect();
+        parts
+            .windows(2)
+            .any(|w| w[0] == "process" && (w[1] == "claude_env.rs" || w[1] == "claude_env"))
+    }
+
+    #[test]
+    fn the_strip_module_includes_its_extracted_test_files() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert!(is_the_strip_module(
+            &src.join("process").join("claude_env.rs")
+        ));
+        assert!(is_the_strip_module(
+            &src.join("process").join("claude_env").join("tests.rs")
+        ));
+        // Spawn sites stay in scope — including another file that merely
+        // shares the basename.
+        assert!(!is_the_strip_module(
+            &src.join("process").join("manager.rs")
+        ));
+        assert!(!is_the_strip_module(
+            &src.join("other").join("claude_env.rs")
+        ));
+        assert!(!is_the_strip_module(
+            &src.join("process").join("claude_env_extra.rs")
+        ));
+    }
+
     /// Every file in this crate that spawns a child the strip applies to.
     ///
     /// Paths are relative to `src/`. This inventory exists because
@@ -340,7 +379,7 @@ mod tests {
         for path in source_files() {
             // This module is where the strip is implemented, so it is the one
             // place the banned form legitimately appears.
-            if path.file_name().and_then(|n| n.to_str()) == Some("claude_env.rs") {
+            if is_the_strip_module(&path) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&path) else {

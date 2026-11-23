@@ -15,8 +15,10 @@
 //! 3. Computes `max_concurrent_builds = min(memory_gb / 4, cpu_cores / 4)`
 //!    per §3.2.
 //! 4. POSTs the budget to qontinui-coord's `/coord/devices/:id/budget`
-//!    endpoint. The coord URL is sourced from
-//!    `~/.qontinui/profiles.json`'s active profile.
+//!    endpoint. The coord base comes from
+//!    [`crate::coord_client::coord_base`] under the config's
+//!    [`crate::config::AmbientCoord`] — the switch is consulted FIRST, so
+//!    `Ignore` reads no `machine.json` and mints no device JWT.
 //!
 //! Why HTTP not direct PG: the supervisor has no PG dependency today
 //! and adding tokio-postgres + a connection pool is far heavier than
@@ -40,7 +42,7 @@
 //! | `role` | supervisor | it is the only writer of `'build'`, which coord's `build_dispatcher::select_build_machine` requires (`WHERE role = 'build'`) — omitting it would silently disable remote build dispatch |
 //! | `disk_reserved_gb` | either (hardware, not process, state) | both publishers send the same figure; omitting it on both sides would only NULL a real column |
 //! | `hostname` | either (coord already `COALESCE`s it) | read from `machine.json`, identical on both sides |
-//! | `max_concurrent_agents` | **runner** | omitted here |
+//! | `max_concurrent_agents` | **coord** (derived from the runner's `memory_gb`/`cpu_cores`, with its `ci_reserved_gib`; a non-zero runner-sent value is advisory, an explicit `0` is stored verbatim) | omitted here |
 //!
 //! **The CI-runner columns are NOT on this route.** This module used to send
 //! `ci_runner_labels` / `ci_runner_status` in the budget payload. Coord's
@@ -58,16 +60,26 @@
 //! same box and reporting the same number are not in conflict, and dropping
 //! such a field from both sides loses real data for no benefit.
 //!
-//! This omission contract requires coord to declare `max_concurrent_agents`
-//! `Option` and write it `SET col = COALESCE($n, col)` — see the ordering
-//! note on `BudgetPayload`.
+//! This omission contract relies on coord declaring `max_concurrent_agents`
+//! `Option` and writing it `SET col = COALESCE($n, col)`, which the SQL of
+//! coord's `upsert_budget` does (`crates/coord/src/fleet.rs`) — see the note
+//! on `BudgetPayload`. What coord stores is decided by its
+//! `stored_max_concurrent_agents`: its own derivation when the publish
+//! carries a non-zero `max_concurrent_agents` together with non-zero
+//! `memory_gb`/`cpu_cores` and a `ci_reserved_gib`; an explicit `0`
+//! verbatim; otherwise (an omitted key included) nothing, so the column
+//! keeps its last stored value.
+//! In no case is it a number the supervisor could contribute, so it omits
+//! the key.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
 use crate::diagnostics::ServingEvent;
 
 /// §3.2 declared role for the supervisor. Always `Build` from the
@@ -155,58 +167,13 @@ impl MachineFile {
     }
 }
 
-/// `~/.qontinui/profiles.json` — minimum subset we need (the active
-/// profile's `coord_url`). Mirrors `qontinui_runner_lib::profiles` so
-/// we don't pull the whole crate in.
-#[derive(Debug, Clone, Deserialize)]
-struct ProfilesFile {
-    active: Option<String>,
-    profiles: std::collections::HashMap<String, ProfileSubset>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ProfileSubset {
-    coord_url: Option<String>,
-}
-
 fn machine_file_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".qontinui").join("machine.json"))
-}
-
-fn profiles_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".qontinui").join("profiles.json"))
 }
 
 pub fn load_machine_file() -> Option<MachineFile> {
     let bytes = std::fs::read(machine_file_path()?).ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-/// Resolve the coord HTTP base from the active profile's `coord_url`.
-/// Profile stores `ws://host:9870/ws` (the WebSocket upgrade URL); we
-/// convert that to `http://host:9870` so reqwest can POST to
-/// `/coord/devices/:id/budget`. Returns `None` if profiles.json is
-/// missing or the active profile has no coord_url.
-pub fn coord_http_base() -> Option<String> {
-    let bytes = std::fs::read(profiles_path()?).ok()?;
-    let pf: ProfilesFile = serde_json::from_slice(&bytes).ok()?;
-    let active = pf.active.as_deref().unwrap_or("dev");
-    let coord_url = pf.profiles.get(active)?.coord_url.as_deref()?;
-
-    // Strip the `/ws` suffix if present, then swap ws→http and wss→https.
-    // The url crate's parse + scheme swap is overkill for this; explicit
-    // string manipulation keeps it inspectable.
-    let trimmed = coord_url.trim_end_matches("/ws");
-    let with_http = trimmed
-        .strip_prefix("wss://")
-        .map(|rest| format!("https://{rest}"))
-        .or_else(|| {
-            trimmed
-                .strip_prefix("ws://")
-                .map(|rest| format!("http://{rest}"))
-        })
-        .unwrap_or_else(|| trimmed.to_string());
-    Some(with_http)
 }
 
 /// Wire shape of `POST /coord/devices/{device_id}/budget`, carrying ONLY
@@ -218,10 +185,14 @@ pub fn coord_http_base() -> Option<String> {
 /// then unrepresentable-if-wrong rather than one edit away from sending a
 /// zero again.
 ///
-/// **Ordering dependency.** Coord must declare `max_concurrent_agents`
-/// `Option` and write it `SET col = COALESCE($n, col)` before this payload
-/// is deployed — until then `BudgetPublishRequest` declares it mandatory
-/// and a publish that omits it is rejected outright.
+/// **Coord owns the column.** Coord's `BudgetPublishRequest` declares
+/// `max_concurrent_agents` `Option` and `upsert_budget` writes it
+/// `SET col = COALESCE($n, col)`, so an omitted key leaves the column alone.
+/// What coord stores there is decided by its `stored_max_concurrent_agents`
+/// (the module docs give the exact rule): a non-zero value a runner sends is
+/// replaced by coord's derivation or dropped, and an explicit `0` is stored
+/// verbatim — which is why the supervisor must omit the key rather than
+/// send a placeholder.
 #[derive(Debug, Serialize)]
 struct BudgetPayload {
     role: &'static str,
@@ -306,28 +277,147 @@ fn looks_like_jwt(token: &str) -> bool {
     })
 }
 
-/// Mint a device JWT from the **primary** runner's UI Bridge by invoking
-/// the runner's `get_coord_device_token` command. The runner holds the
-/// device credential in its own encrypted `SecureStorage`, which this
-/// process cannot read — asking the runner for one is the only door.
+/// Where a device-authed publish reads this box's identity and credential:
+/// `machine.json` for the device id, then the bearer cascade
+/// ([`resolve_device_bearer`]) whose last rung mints from a runner's UI Bridge.
 ///
-/// `get_coord_device_token`, not `get_access_token_for_websocket`: the
-/// latter is gated by `require_tier_2()` and by a `has_tokens()` check that
-/// wants BOTH the access and refresh slots populated (pairing writes the
-/// refresh slot empty), and it applies no shape check, so on a
-/// pre-migration install it hands back a legacy opaque
-/// `qontinui_runner_<random>` bearer. `get_coord_device_token` is the
-/// purpose-built probe: no tier gate, shape-checked runner-side, and it
-/// distinguishes "unpaired" (`null`) from "store unreadable" (a rejection).
-///
-/// Fixed to `RUNNER_API_PORT` on purpose: the credential being asked for is
-/// the MACHINE's device identity, and the primary is the instance that owns
-/// machine-scoped state. Temp runners on 9877-9899 are not asked.
+/// Consulted only AFTER [`crate::coord_client::coord_base`] resolved a base, so
+/// under [`crate::config::AmbientCoord::Ignore`] none of these is read. Every
+/// publish takes one, so a test can point the identity and the mint at fixtures
+/// and count what each path touches. Production entry points take theirs from
+/// [`DeviceSources::for_access`], so the identity follows the same
+/// [`crate::config::AmbientCoord`] value the base came from.
+#[derive(Debug, Clone)]
+pub(crate) struct DeviceSources {
+    /// Reads the device identity (`~/.qontinui/machine.json` in production).
+    pub(crate) machine: fn() -> Option<MachineFile>,
+    /// Whether the operator-seedable rungs (`$COORD_DEVICE_JWT`,
+    /// `~/.qontinui/coord-device-jwt`) are consulted before the mint.
+    pub(crate) read_seeded: bool,
+    /// The runner whose UI Bridge mints a device JWT; `None` mints nothing.
+    pub(crate) mint_base: Option<String>,
+}
+
+impl DeviceSources {
+    /// The sources a production entry point uses under `access`.
+    ///
+    /// Only [`AmbientCoord::Read`] reads this box's identity
+    /// ([`DeviceSources::ambient`]). Under [`AmbientCoord::At`] the base is a
+    /// planted coord, so the box's `machine.json`, its seeded JWT rungs and the
+    /// primary runner's mint are all foreign to it: none is read, and a path
+    /// that needs an identity skips (a test that wants one passes
+    /// [`DeviceSources`] explicitly). Under [`AmbientCoord::Ignore`] no base
+    /// resolves, so the sources are never consulted; they are the same empty
+    /// set.
+    pub(crate) fn for_access(access: &AmbientCoord) -> Self {
+        match access {
+            AmbientCoord::Read => Self::ambient(),
+            AmbientCoord::At(_) | AmbientCoord::Ignore => Self::none(),
+        }
+    }
+
+    /// No identity, no seeded rungs, no mint.
+    fn none() -> Self {
+        Self {
+            machine: no_machine,
+            read_seeded: false,
+            mint_base: None,
+        }
+    }
+
+    /// This box: `machine.json`, both seeded rungs, and a mint from the
+    /// **primary** runner.
+    ///
+    /// The mint asks the primary runner's UI Bridge by invoking
+    /// the runner's `get_coord_device_token` command. The runner holds the
+    /// device credential in its own encrypted `SecureStorage`, which this
+    /// process cannot read — asking the runner for one is the only door.
+    ///
+    /// `get_coord_device_token`, not `get_access_token_for_websocket`: the
+    /// latter is gated by `require_tier_2()` and by a `has_tokens()` check that
+    /// wants BOTH the access and refresh slots populated (pairing writes the
+    /// refresh slot empty), and it applies no shape check, so on a
+    /// pre-migration install it hands back a legacy opaque
+    /// `qontinui_runner_<random>` bearer. `get_coord_device_token` is the
+    /// purpose-built probe: no tier gate, shape-checked runner-side, and it
+    /// distinguishes "unpaired" (`null`) from "store unreadable" (a rejection).
+    ///
+    /// Fixed to `RUNNER_API_PORT` on purpose: the credential being asked for is
+    /// the MACHINE's device identity, and the primary is the instance that owns
+    /// machine-scoped state. Temp runners on 9877-9899 are not asked.
+    fn ambient() -> Self {
+        // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
+        // first and the runner binds the IPv4 loopback only, so the name form
+        // pays a doomed IPv6 connect before the socket that answers.
+        Self {
+            machine: load_machine_file,
+            read_seeded: true,
+            mint_base: Some(crate::loopback::runner_loopback_base(
+                crate::config::RUNNER_API_PORT,
+            )),
+        }
+    }
+}
+
+/// Test-only: identity sources that read a fixture `machine.json` and skip the
+/// operator-seedable rungs, so the only bearer source left is the mint at
+/// `mint_base` — a stub the test counts connections on.
+#[cfg(test)]
+impl DeviceSources {
+    pub(crate) fn fixture(mint_base: &str) -> Self {
+        Self {
+            machine: fixture_machine,
+            read_seeded: false,
+            mint_base: Some(mint_base.to_string()),
+        }
+    }
+}
+
+/// The machine reader of [`DeviceSources::for_access`] off [`AmbientCoord::Read`].
+fn no_machine() -> Option<MachineFile> {
+    None
+}
+
+/// Test-only: the `machine.json` [`DeviceSources::fixture`] reads.
+#[cfg(test)]
+pub(crate) fn fixture_machine() -> Option<MachineFile> {
+    Some(MachineFile {
+        device_id: Some("6f1c0b52-1d1e-4a35-9f1e-6a8f0e0c2b11".to_string()),
+        machine_id: None,
+        hostname: "fixture-host".to_string(),
+    })
+}
+
+/// Path of the runner's in-process command door for the device-token probe.
+const MINT_INVOKE_PATH: &str = "/ui-bridge/invoke/get_coord_device_token";
+
+/// Path of the WebView evaluation door — the pre-invoke fallback.
+const MINT_EVALUATE_PATH: &str = "/ui-bridge/control/page/evaluate";
+
+/// Mint a device JWT from the runner at `base` ([`DeviceSources::mint_base`];
+/// see [`DeviceSources::ambient`] for why the primary is asked and which
+/// command).
 ///
 /// Returns `None` for every failure mode (no runner, wedged runner,
 /// signed-out runner, non-JWT answer). The token is kept in-process: it is
 /// never written to disk, never placed on a command line, and never logged.
-async fn mint_device_jwt_from_runner() -> Option<String> {
+///
+/// Two doors, in order:
+///
+/// 1. `POST {base}/ui-bridge/invoke/get_coord_device_token` with `{}` — the
+///    runner's in-process command door, answering
+///    `{"success":true,"data":"<jwt>"}`. It needs no WebView, so it also
+///    answers on a HEADLESS runner, where the evaluate door cannot. It is
+///    the door the fleet's cache renderers already prefer.
+/// 2. `POST {base}/ui-bridge/control/page/evaluate` — today's WebView
+///    evaluation of the same command, used **only** when door 1 answers
+///    HTTP 400 or 404, i.e. a runner build that has no invoke entry for it.
+///
+/// Every other door-1 outcome is final. In particular `data: null` means
+/// the runner is UNPAIRED: the evaluate door would ask the same store the
+/// same question, so falling through would only spend a second round trip
+/// on a known answer.
+async fn mint_device_jwt_at(base: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(MINT_TIMEOUT)
         // The mint targets the loopback. reqwest honours `HTTP_PROXY` /
@@ -337,13 +427,32 @@ async fn mint_device_jwt_from_runner() -> Option<String> {
         .no_proxy()
         .build()
         .ok()?;
-    // 127.0.0.1, never `localhost`: Windows resolves `localhost` to ::1
-    // first and the runner binds the IPv4 loopback only, so the name form
-    // pays a doomed IPv6 connect before the socket that answers.
-    let url = format!(
-        "http://127.0.0.1:{}/ui-bridge/control/page/evaluate",
-        crate::config::RUNNER_API_PORT
-    );
+    let base = base.trim_end_matches('/');
+
+    let resp = client
+        .post(format!("{base}{MINT_INVOKE_PATH}"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .ok()?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::BAD_REQUEST || status == reqwest::StatusCode::NOT_FOUND {
+        debug!(
+            "fleet: runner answered the invoke mint door {status} (build without the invoke \
+             entry) — falling back to page/evaluate"
+        );
+        return mint_via_page_evaluate(&client, base).await;
+    }
+    if !status.is_success() {
+        return None;
+    }
+    let value: serde_json::Value = resp.json().await.ok()?;
+    parse_invoked_token(&value, chrono::Utc::now().timestamp())
+}
+
+/// The WebView fallback: evaluate `get_coord_device_token` in the runner's
+/// page. Only reached when the invoke door says it does not exist.
+async fn mint_via_page_evaluate(client: &reqwest::Client, base: &str) -> Option<String> {
     // `PageEvaluateRequest` is `rename_all = "camelCase"` — `await_promise`
     // would be silently dropped (no `deny_unknown_fields`) and default to
     // false. `timeoutMs` bounds the runner-side evaluation so giving up at
@@ -353,35 +462,87 @@ async fn mint_device_jwt_from_runner() -> Option<String> {
         "awaitPromise": true,
         "timeoutMs": MINT_TIMEOUT.as_millis() as u64,
     });
-    let resp = client.post(&url).json(&body).send().await.ok()?;
+    let resp = client
+        .post(format!("{base}{MINT_EVALUATE_PATH}"))
+        .json(&body)
+        .send()
+        .await
+        .ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let value: serde_json::Value = resp.json().await.ok()?;
-    parse_minted_token(&value)
+    parse_minted_token(&value, chrono::Utc::now().timestamp())
 }
 
-/// Pull the minted token out of a UI-Bridge `page/evaluate` response body
-/// (`{data: {result: {value: "<token>"}}}`), returning it only when it is
-/// shaped like a JWT.
-fn parse_minted_token(body: &serde_json::Value) -> Option<String> {
-    let minted = body.pointer("/data/result/value")?.as_str()?.trim();
+/// Pull the minted token out of an invoke-door response body
+/// (`{"success":true,"data":"<token>"}`), returning it only when it is
+/// shaped like a JWT and not expired as of `now`. `data: null` is the
+/// runner's "unpaired" answer and
+/// yields `None` quietly; `success: false` (the command rejected — e.g. the
+/// store is unreadable) yields `None` too.
+fn parse_invoked_token(body: &serde_json::Value, now: i64) -> Option<String> {
+    if body.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        warn!(
+            "fleet: the runner rejected the get_coord_device_token invoke (success=false) — \
+             no minted device JWT."
+        );
+        return None;
+    }
+    let data = body.get("data")?;
+    if data.is_null() {
+        debug!("fleet: the runner answered get_coord_device_token with null (unpaired)");
+        return None;
+    }
+    let minted = data.as_str()?.trim();
     if looks_like_jwt(minted) {
-        return Some(minted.to_string());
+        // The runner's no-tenant arm does NOT check `exp` ("validate expiry
+        // before use and treat an expired token as no credential" —
+        // qontinui-runner `ui_bridge_invoke.rs`), so a minted token gets the
+        // same expiry gate as a seeded one.
+        return usable_token_at(Some(minted), SOURCE_RUNNER_MINT, now);
     }
     if !minted.is_empty() {
         warn!(
-            "fleet::publish_budget: the runner answered the token mint with a non-JWT value \
-             (signed out?) — ignoring it and publishing unauthenticated."
+            "fleet: the runner answered the token mint with a non-JWT value (signed out?) — \
+             ignoring it."
         );
     }
     None
 }
 
+/// Pull the minted token out of a UI-Bridge `page/evaluate` response body
+/// (`{data: {result: {value: "<token>"}}}`), returning it only when it is
+/// shaped like a JWT and not expired as of `now`.
+fn parse_minted_token(body: &serde_json::Value, now: i64) -> Option<String> {
+    let minted = body.pointer("/data/result/value")?.as_str()?.trim();
+    if looks_like_jwt(minted) {
+        // The runner's no-tenant arm does NOT check `exp` ("validate expiry
+        // before use and treat an expired token as no credential" —
+        // qontinui-runner `ui_bridge_invoke.rs`), so a minted token gets the
+        // same expiry gate as a seeded one.
+        return usable_token_at(Some(minted), SOURCE_RUNNER_MINT, now);
+    }
+    if !minted.is_empty() {
+        warn!(
+            "fleet: the runner answered the token mint with a non-JWT value (signed out?) — \
+             ignoring it."
+        );
+    }
+    None
+}
+
+/// Source name reported when the bearer came from `~/.qontinui/coord-device-jwt`.
+pub(crate) const SOURCE_FILE: &str = "~/.qontinui/coord-device-jwt";
+
+/// Source name reported when the bearer was minted by the local runner.
+pub(crate) const SOURCE_RUNNER_MINT: &str = "runner UI Bridge mint";
+
 /// Resolve a coord device JWT, returning it with the name of the source
 /// that produced it (for logging — the token itself is never logged).
 ///
-/// Cascade, most-explicit first:
+/// Cascade, most-explicit first, falling through on **validity, not
+/// presence** (an expired seeded token is skipped — see [`usable_token`]):
 /// 1. `$COORD_DEVICE_JWT`;
 /// 2. `~/.qontinui/coord-device-jwt`;
 /// 3. a mint from the local runner's UI Bridge.
@@ -390,44 +551,375 @@ fn parse_minted_token(body: &serde_json::Value) -> Option<String> {
 /// **build-only box with no runner** authenticate at all, since rung 3
 /// structurally cannot answer there. On a workstation running a signed-in
 /// primary runner, rung 3 is the one that resolves.
-async fn resolve_device_bearer() -> Option<(String, &'static str)> {
-    let env_token = std::env::var(DEVICE_JWT_ENV).ok();
-    if let Some(token) = usable_token(env_token.as_deref(), DEVICE_JWT_ENV) {
-        return Some((token, DEVICE_JWT_ENV));
+///
+/// Rungs 1 and 2 are read only when `sources.read_seeded`; rung 3 asks
+/// `sources.mint_base`, and is skipped when that is `None`.
+///
+/// Private on purpose: every caller goes through [`resolve_device_bearer_for`],
+/// which applies the transport guard first, so no publish can put a device
+/// JWT on a cleartext non-loopback wire.
+async fn resolve_device_bearer(sources: &DeviceSources) -> Option<(String, &'static str)> {
+    if sources.read_seeded {
+        let env_token = std::env::var(DEVICE_JWT_ENV).ok();
+        let file_token = match device_jwt_file_path() {
+            Some(p) => tokio::fs::read_to_string(p).await.ok(),
+            None => None,
+        };
+        if let Some(seeded) = select_seeded_bearer(
+            env_token.as_deref(),
+            file_token.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            return Some(seeded);
+        }
     }
-    let file_token = match device_jwt_file_path() {
-        Some(p) => tokio::fs::read_to_string(p).await.ok(),
-        None => None,
-    };
-    if let Some(token) = usable_token(file_token.as_deref(), "~/.qontinui/coord-device-jwt") {
-        return Some((token, "~/.qontinui/coord-device-jwt"));
-    }
-    mint_device_jwt_from_runner()
+    let mint_base = sources.mint_base.as_deref()?;
+    mint_device_jwt_at(mint_base)
         .await
-        .map(|token| (token, "runner UI Bridge mint"))
+        .map(|token| (token, SOURCE_RUNNER_MINT))
 }
 
-/// Trim a seeded token and accept it only if it is shaped like a JWT.
+/// A resolved device bearer: the token (if any) and the name of its source,
+/// or — when there is no token — why none is sent. The label travels with
+/// the absence so every log and refusal message can name the real cause.
+pub(crate) type ResolvedBearer = (Option<String>, &'static str);
+
+/// Source label reported when no credential resolved at all.
+pub(crate) const SOURCE_NONE: &str = "none (no usable device JWT resolved)";
+
+/// Source label reported when the transport guard withheld the credential.
+pub(crate) const SOURCE_WITHHELD: &str =
+    "none (withheld: coord base is neither https nor loopback)";
+
+/// The device bearer to send to `base`, or `None`, with the name of the
+/// source it came from — or why none was sent — for the caller's log and
+/// refusal message.
+///
+/// [`crate::coord_client::coord_base`] maps `ws://` to plain `http://`, so a profile pointing
+/// at a non-loopback `ws://` host would put a device JWT on the wire in
+/// cleartext. The guard runs BEFORE the cascade: a withheld base consults no
+/// env var, file or runner mint. Every outbound device-authed POST in this
+/// crate (budget publish, resource sample, serving-watchdog notify) resolves
+/// its bearer here, so the guard cannot be forgotten by one of them.
+pub(crate) async fn resolve_device_bearer_for(
+    base: &str,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    match resolve_device_bearer(sources).await {
+        Some((token, source)) => (Some(token), source),
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// What [`resolve_device_bearer_cached_for`] last learned for one set of
+/// sources: a token (with its source label), or that none resolved.
+#[derive(Debug, Clone)]
+enum CachedBearer {
+    Hit {
+        token: String,
+        source: &'static str,
+    },
+    /// No usable token resolved; do not ask again before `until` (unix secs).
+    Miss {
+        until: i64,
+    },
+}
+
+/// The sources a cache entry was resolved from: whether the seeded rungs were
+/// read, and the runner the mint asked.
+type BearerCacheKey = (bool, Option<String>);
+
+/// One slot, process-global. A test that reaches it with sources that read an
+/// identity (`DeviceSources::fixture`) over an https or loopback base must
+/// hold `tests::BEARER_CACHE_TESTS`, or it races the cache tests.
+static BEARER_CACHE: std::sync::Mutex<Option<(BearerCacheKey, CachedBearer)>> =
+    std::sync::Mutex::new(None);
+
+/// How long a failed lookup is remembered, so a box with no usable token (a
+/// signed-out, unpaired or wedged runner and nothing seeded) does not pay the
+/// cascade, a runner mint included, on every dev action and every ingest
+/// attempt. A seeded token or a newly paired runner is picked up within this.
+const NEGATIVE_BEARER_CACHE_SECS: i64 = 60;
+
+/// [`resolve_device_bearer_for`], remembering what it learned for the same
+/// `sources`: a token is reused while its `exp` is more than
+/// [`EXPIRY_SKEW_SECS`] away (a token with no readable `exp` is used once and
+/// not cached), and a miss for [`NEGATIVE_BEARER_CACHE_SECS`].
+///
+/// For the per-action callers (the dev-action expectations fetch and snapshot
+/// ingest). The transport guard still runs first on every call, so a cached
+/// token never goes to a cleartext non-loopback base. Sources that read no
+/// identity (`DeviceSources::for_access` under `At` / `Ignore`) never read or
+/// fill the cache.
+pub(crate) async fn resolve_device_bearer_cached_for(
+    base: &str,
+    sources: &DeviceSources,
+) -> ResolvedBearer {
+    resolve_device_bearer_cached_at(base, sources, chrono::Utc::now().timestamp()).await
+}
+
+async fn resolve_device_bearer_cached_at(
+    base: &str,
+    sources: &DeviceSources,
+    now: i64,
+) -> ResolvedBearer {
+    if !transport_may_carry_bearer(base) {
+        return (None, SOURCE_WITHHELD);
+    }
+    let key: BearerCacheKey = (sources.read_seeded, sources.mint_base.clone());
+    if key == (false, None) {
+        return (None, SOURCE_NONE);
+    }
+    let fresh = |token: &str| jwt_exp(token).is_some_and(|exp| exp > now + EXPIRY_SKEW_SECS);
+    if let Ok(guard) = BEARER_CACHE.lock() {
+        match guard.as_ref() {
+            Some((cached_key, CachedBearer::Hit { token, source }))
+                if *cached_key == key && fresh(token) =>
+            {
+                return (Some(token.clone()), source);
+            }
+            Some((cached_key, CachedBearer::Miss { until }))
+                if *cached_key == key && now < *until =>
+            {
+                return (None, SOURCE_NONE);
+            }
+            _ => {}
+        }
+    }
+    let resolved = resolve_device_bearer(sources).await;
+    let entry = match &resolved {
+        Some((token, source)) if fresh(token) => Some(CachedBearer::Hit {
+            token: token.clone(),
+            source,
+        }),
+        Some(_) => None,
+        None => Some(CachedBearer::Miss {
+            until: now + NEGATIVE_BEARER_CACHE_SECS,
+        }),
+    };
+    if let (Some(entry), Ok(mut guard)) = (entry, BEARER_CACHE.lock()) {
+        *guard = Some((key, entry));
+    }
+    match resolved {
+        Some((token, source)) => (Some(token), source),
+        None => (None, SOURCE_NONE),
+    }
+}
+
+/// [`attach_resolved_bearer`] for a per-request caller: the attach and the
+/// absence are logged at `debug!`, so a request made on every action does not
+/// push real events out of the supervisor's log buffer. Never logs the token.
+pub(crate) fn attach_bearer_quietly(
+    rb: reqwest::RequestBuilder,
+    resolved: ResolvedBearer,
+) -> reqwest::RequestBuilder {
+    match resolved {
+        (Some(token), source) => {
+            debug!("fleet: attaching coord device JWT (source: {source})");
+            rb.header("Authorization", format!("Bearer {token}"))
+        }
+        (None, reason) => {
+            debug!("fleet: no coord device JWT attached: {reason}");
+            rb
+        }
+    }
+}
+
+/// The transport half of [`resolve_device_bearer_for`]: `true` over
+/// `https://` or to a loopback host.
+pub(crate) fn transport_may_carry_bearer(base: &str) -> bool {
+    // Parse with a real URL parser rather than splitting on ':' and '/': a
+    // hand split reads `http://localhost:x@evil.com` as host `localhost` and
+    // would send the device JWT in cleartext to `evil.com`. `url` resolves
+    // the userinfo, IPv6 brackets and ports the way the HTTP client will.
+    let Ok(url) = url::Url::parse(base) else {
+        return false;
+    };
+    if url.scheme() == "https" {
+        return true;
+    }
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
+/// The suffix a device-authed POST appends to its non-2xx error so the one
+/// WARN says what to fix: 401/403 → the credential was refused, naming which
+/// source was sent; 404 → this coord does not serve the route; anything else
+/// → nothing (the status and coord's body already say it). Takes the source
+/// NAME, never the token.
+pub(crate) fn refusal_hint(status: reqwest::StatusCode, source: &str) -> String {
+    match status.as_u16() {
+        401 | 403 => format!(" (credential refused — sent: {source})"),
+        404 => " (route not served by this coord)".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The seeded half of [`resolve_device_bearer`], with the clock and both
+/// raw values passed in, so the env-over-file order and the expiry
+/// fall-through are assertable without mutating process-global env or the
+/// operator's credential file.
+fn select_seeded_bearer(
+    env_token: Option<&str>,
+    file_token: Option<&str>,
+    now: i64,
+) -> Option<(String, &'static str)> {
+    if let Some(token) = usable_token_at(env_token, DEVICE_JWT_ENV, now) {
+        return Some((token, DEVICE_JWT_ENV));
+    }
+    usable_token_at(file_token, SOURCE_FILE, now).map(|token| (token, SOURCE_FILE))
+}
+
+/// A seeded token whose `exp` falls within this many seconds of now is
+/// treated as already expired: it would lapse in flight, or within the
+/// publish's own retry horizon.
+const EXPIRY_SKEW_SECS: i64 = 60;
+
+/// Trim a seeded token and accept it only if it is shaped like a JWT and
+/// not expired, as of the current clock. See [`usable_token_at`].
+#[cfg(test)]
+fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
+    usable_token_at(raw, source, chrono::Utc::now().timestamp())
+}
+
+/// Trim a seeded token and accept it only if it is shaped like a JWT and
+/// its `exp` is more than [`EXPIRY_SKEW_SECS`] after `now`.
 ///
 /// The seeded rungs are shape-checked for the same reason the mint is, plus
 /// one of their own: an operator-authored file or env var can carry a
 /// trailing newline or an outright wrong value, and a header value built
 /// from that makes `RequestBuilder::build()` fail — turning "bad
-/// credential" into "the budget publish stopped happening". Degrading to
-/// the next rung keeps the publish alive and says why.
-fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
+/// credential" into "the publish stopped happening". Degrading to the next
+/// rung keeps the publish alive and says why.
+///
+/// The **expiry** check exists because both seeded rungs are static while
+/// device JWTs live ~4 h, and nothing on a Linux box refreshes the file on a
+/// schedule. Selecting on presence sent an hours-dead token, coord refused
+/// it 403, and the next rung — a live runner mint — was never tried. The
+/// payload is decoded WITHOUT a signature check (coord verifies); only
+/// `exp` is read. A token with no readable `exp` stays accepted: it is
+/// shape-valid and coord decides.
+///
+/// Logs carry the source NAME only, never the token.
+fn usable_token_at(raw: Option<&str>, source: &str, now: i64) -> Option<String> {
     let token = raw?.trim();
     if token.is_empty() {
         return None;
     }
     if !looks_like_jwt(token) {
-        warn!("fleet::publish_budget: {source} holds a non-JWT value — ignoring it.");
+        warn!("fleet: device bearer: {source} holds a non-JWT value — ignoring it.");
         return None;
+    }
+    if let Some(exp) = jwt_exp(token) {
+        if exp <= now.saturating_add(EXPIRY_SKEW_SECS) {
+            note_expired_source(source, &expired_note(source, exp, now));
+            return None;
+        }
     }
     Some(token.to_string())
 }
 
-/// Attach `Authorization: Bearer <device JWT>` when one is resolvable.
+/// The log text for a skipped (expired or about-to-expire) token. Takes the
+/// source NAME and the `exp` claim, never the token. Saturating arithmetic:
+/// `exp` comes from an unverified payload and may be `i64::MIN` (a
+/// `-1e300` saturates to it), and a debug-build overflow panic here would
+/// kill the footprint task that calls the publish.
+fn expired_note(source: &str, exp: i64, now: i64) -> String {
+    let when = if exp <= now {
+        format!("expired {}s ago", now.saturating_sub(exp))
+    } else {
+        format!(
+            "expires in {}s, inside the {EXPIRY_SKEW_SECS}s skew",
+            exp.saturating_sub(now)
+        )
+    };
+    format!(
+        "fleet: device bearer: {source} holds an expired device JWT (exp {exp}, {when}) — \
+         skipping it for the next rung."
+    )
+}
+
+/// Sources that have already had their "expired" WARN this process.
+static EXPIRED_WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Log a skipped expired token: WARN the first time per SOURCE per process,
+/// DEBUG after. On a Linux box an expired `~/.qontinui/coord-device-jwt` is
+/// the normal state (nothing refreshes it), and the resolver runs on every
+/// footprint publish — an unlatched WARN would repeat every cycle even when
+/// the runner mint then succeeds.
+fn note_expired_source(source: &str, note: &str) {
+    let first = match EXPIRED_WARNED.lock() {
+        Ok(mut seen) if !seen.iter().any(|s| s == source) => {
+            seen.push(source.to_string());
+            true
+        }
+        Ok(_) => false,
+        // A poisoned latch must not silence the signal.
+        Err(_) => true,
+    };
+    if first {
+        warn!("{note} Further occurrences for this source log at DEBUG.");
+    } else {
+        debug!("{note}");
+    }
+}
+
+/// Read the `exp` claim of a JWS-compact token WITHOUT verifying it.
+///
+/// `None` when the payload segment is not base64url, not JSON, or carries
+/// no numeric `exp` — all of which the caller treats as "no readable exp".
+fn jwt_exp(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64url_decode(payload)?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let exp = claims.get("exp")?;
+    exp.as_i64().or_else(|| exp.as_f64().map(|f| f as i64))
+}
+
+/// Minimal unpadded base64url decoder (RFC 4648 §5), padding tolerated.
+///
+/// Hand-rolled rather than a `base64` dependency: it is only ever used to
+/// read one claim out of a JWT payload, and this crate declares no base64
+/// crate of its own. `None` on any byte outside the alphabet or an
+/// impossible length (a lone trailing sextet).
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    fn sextet(b: u8) -> Option<u32> {
+        match b {
+            b'A'..=b'Z' => Some(u32::from(b - b'A')),
+            b'a'..=b'z' => Some(u32::from(b - b'a') + 26),
+            b'0'..=b'9' => Some(u32::from(b - b'0') + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let input = input.trim_end_matches('=').as_bytes();
+    if input.len() % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    for chunk in input.chunks(4) {
+        let mut acc: u32 = 0;
+        for &b in chunk {
+            acc = (acc << 6) | sextet(b)?;
+        }
+        // Left-align the chunk's bits into 24, then emit its whole bytes.
+        acc <<= 6 * (4 - chunk.len() as u32);
+        let bytes = [(acc >> 16) as u8, (acc >> 8) as u8, acc as u8];
+        out.extend_from_slice(&bytes[..chunk.len() - 1]);
+    }
+    Some(out)
+}
+
+/// Attach `Authorization: Bearer <device JWT>` when one was resolved by
+/// [`resolve_device_bearer_for`].
 ///
 /// Mirrors the runner's `auth::attach_device_auth` posture: attach when
 /// available, **never fail**. Coord still accepts anonymous budget publishes
@@ -444,32 +936,37 @@ fn usable_token(raw: Option<&str>, source: &str) -> Option<String> {
 /// redact `Authorization`, so a single `{req:?}` in a log or an error would
 /// print the device credential. `the_bearer_never_reaches_the_body_but_debug_would_expose_it`
 /// pins that as measured fact rather than leaving it to be rediscovered.
-/// The publish's own error string formats the URL and the `reqwest::Error`
-/// only, neither of which carries headers.
-pub(crate) async fn attach_device_auth(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-    attach_resolved_bearer(rb, resolve_device_bearer().await)
-}
-
-/// The decision half of [`attach_device_auth`], split out from the
-/// resolution half so both arms are assertable without a network, a
-/// process-global env mutation, or a running runner.
+/// The publishes' own error strings format the URL, the `reqwest::Error`,
+/// coord's response body and the source NAME — none of which carries
+/// headers.
+///
+/// Resolution is the caller's (so the request path stays assertable without
+/// a network, a process-global env mutation, or a running runner).
 fn attach_resolved_bearer(
     rb: reqwest::RequestBuilder,
-    resolved: Option<(String, &'static str)>,
+    resolved: ResolvedBearer,
 ) -> reqwest::RequestBuilder {
     match resolved {
-        Some((token, source)) => {
-            info!("fleet::publish_budget: attaching coord device JWT (source: {source})");
+        (Some(token), source) => {
+            info!("fleet: attaching coord device JWT (source: {source})");
             rb.header("Authorization", format!("Bearer {token}"))
         }
-        None => {
+        (None, reason) => {
             MISSING_BEARER_WARNED.call_once(|| {
-                warn!(
-                    "fleet::publish_budget: no coord device JWT available (no {DEVICE_JWT_ENV}, \
-                     no ~/.qontinui/coord-device-jwt, and the local runner did not mint one) — \
-                     publishing ANONYMOUSLY. Seed one of the two files/vars to authenticate on a \
-                     box with no runner."
-                );
+                if reason == SOURCE_WITHHELD {
+                    warn!(
+                        "fleet: coord device JWT {reason} — publishing ANONYMOUSLY. Point the \
+                         active profile's coord_url at wss:// / https:// (or a loopback host) \
+                         to authenticate."
+                    );
+                } else {
+                    warn!(
+                        "fleet: no usable coord device JWT (no unexpired {DEVICE_JWT_ENV}, no \
+                         unexpired ~/.qontinui/coord-device-jwt, and the local runner did not \
+                         mint one) — publishing ANONYMOUSLY. Seed one of the two files/vars to \
+                         authenticate on a box with no runner."
+                    );
+                }
             });
             rb
         }
@@ -479,12 +976,33 @@ fn attach_resolved_bearer(
 /// Best-effort publish: POST the supervisor's MachineBudget to coord.
 /// Failures log a warning and return `Ok(())` so they don't break
 /// supervisor boot.
-pub async fn publish_budget(
+///
+/// The coord base is resolved FIRST: with no coord (`AmbientCoord::Ignore`,
+/// or no configured coord URL) it returns before `sources` reads
+/// `machine.json` or mints a device JWT.
+pub(crate) async fn publish_budget(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
     role: &'static str,
     resources: Resources,
     disk_reserved_gb: u64,
 ) -> Result<(), String> {
-    let machine = match load_machine_file() {
+    let base = match coord_base(access) {
+        Some(b) => b,
+        None if *access == AmbientCoord::Ignore => {
+            debug!("fleet::publish_budget: ambient coord is Ignore — not publishing");
+            return Ok(());
+        }
+        None => {
+            warn!(
+                "fleet::publish_budget: no coord base (COORD_HTTP_URL unset and \
+                 ~/.qontinui/profiles.json missing or has no coord_url in the active \
+                 profile). Skipping."
+            );
+            return Ok(());
+        }
+    };
+    let machine = match (sources.machine)() {
         Some(m) => m,
         None => {
             warn!(
@@ -509,22 +1027,12 @@ pub async fn publish_budget(
             return Ok(());
         }
     };
-    let base = match coord_http_base() {
-        Some(b) => b,
-        None => {
-            warn!(
-                "fleet::publish_budget: ~/.qontinui/profiles.json missing or has no \
-                 coord_url in the active profile. Skipping."
-            );
-            return Ok(());
-        }
-    };
-
     // The supervisor owns the build-side columns and OMITS the agent cap it
     // does not own — see the module docs. Omission is the only way to say
-    // "leave this column alone": coord writes each budget column with a
-    // straight `SET`, so a placeholder value is a write, not an abstention.
-    // Sending `max_concurrent_agents: 0` used to FLAP the runner's real cap
+    // "leave this column alone": coord writes each budget column as
+    // `COALESCE($n, col)`, so an omitted key leaves it alone but a
+    // placeholder value is a write, not an abstention.
+    // Sending `max_concurrent_agents: 0` used to FLAP the device's real cap
     // to zero on every supervisor publish until the runner's 10-minute
     // republisher re-asserted it. That flap is exactly the 2026-07-28
     // outage's mechanism — a writer emitting a default over another writer's
@@ -538,8 +1046,9 @@ pub async fn publish_budget(
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|e| format!("reqwest builder: {e}"))?;
-    let resp = attach_device_auth(client.post(&url).json(&payload))
-        .await
+    let bearer = resolve_device_bearer_for(&base, sources).await;
+    let bearer_source = bearer.1;
+    let resp = attach_resolved_bearer(client.post(&url).json(&payload), bearer)
         .send()
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
@@ -554,8 +1063,9 @@ pub async fn publish_budget(
         Ok(())
     } else {
         let body = resp.text().await.unwrap_or_default();
+        let hint = refusal_hint(status, bearer_source);
         Err(format!(
-            "coord returned {status} for POST /coord/devices/{device_id}/budget: {body}"
+            "coord returned {status} for POST /coord/devices/{device_id}/budget: {body}{hint}"
         ))
     }
 }
@@ -563,9 +1073,17 @@ pub async fn publish_budget(
 /// Convenience: detect + publish on startup. Spawned from `main.rs`
 /// as a non-blocking task — supervisor boots immediately, fleet
 /// publish settles in the background.
-pub async fn publish_on_startup() {
+pub async fn publish_on_startup(access: &AmbientCoord) {
     let resources = detect_resources();
-    if let Err(e) = publish_budget(ROLE, resources, 0).await {
+    if let Err(e) = publish_budget(
+        access,
+        &DeviceSources::for_access(access),
+        ROLE,
+        resources,
+        0,
+    )
+    .await
+    {
         warn!("fleet::publish_on_startup failed (non-fatal): {e}");
     }
 }
@@ -585,7 +1103,7 @@ pub async fn publish_on_startup() {
 // out. Three occurrences, 12 h to 5 days each, were surfaced only by a
 // session's closeout. The supervisor is the one process on the box that
 // watches the door from outside AND holds a device-authed coord client
-// (`attach_device_auth`), so it is the only honest origin.
+// (`resolve_device_bearer_for`), so it is the only honest origin.
 //
 // Why `POST /coord/agent-notifications` with `action: "other"`: it is the
 // only door on coord `origin/main` that lands in the operator-pull surface
@@ -596,8 +1114,10 @@ pub async fn publish_on_startup() {
 // closed set {publish, force_push, delete, rotate, other}, `artifact` is
 // required, `reversible` ∈ {no, roll-forward, restore} is optional, `checks`
 // is free text, and `repo` / `pr_number` are for PR-shaped events only. The
-// kind is hard-coded server-side to `agent_took_irreversible_action`, which
-// is exact for `RestartTaken` and stretched for the rest — so `checks` opens
+// kind is hard-coded server-side to `agent_took_sensitive_action` (renamed from
+// `agent_took_irreversible_action`; qontinui-coord
+// `crates/coord/src/notifications.rs`), which fits `RestartTaken` and
+// `FirstHealthyKill` and is stretched for the rest — so `checks` opens
 // with `serving_watchdog:<event>` and carries the true class until coord
 // grows a dedicated kind (a Follow-up in the plan).
 //
@@ -649,8 +1169,10 @@ pub struct ServingWatchdogNotice {
     pub event: ServingEvent,
     pub pid: Option<u32>,
     pub port: u16,
-    /// `now - UnresponsiveSince(at)` at decision time.
-    pub silent_for_secs: u64,
+    /// The silence at decision time, as on the diagnostics event: `None`
+    /// where nothing was measured, which the artifact line says rather than
+    /// printing 0. The budget for `FirstHealthyKill`.
+    pub silent_for_secs: Option<u64>,
     /// The census / readiness verdict that backed the decision, verbatim.
     pub census_json: Option<serde_json::Value>,
     /// The error string for `RestartFailed`, the disarm reason for
@@ -672,7 +1194,8 @@ pub enum NotifyOutcome {
     /// Coord's per-tenant notification window is exhausted (429). Nothing was
     /// retried and nothing else was posted: the diagnostics ring on this box
     /// already holds the event, and the next re-escalation interval will try
-    /// again on its own cadence.
+    /// again on its own cadence. A `FirstHealthyKill` has no later interval: the
+    /// port has closed, so for that event this is the ring's record alone.
     RateLimited { retry_after_secs: Option<u64> },
 }
 
@@ -696,14 +1219,18 @@ fn artifact_line(notice: &ServingWatchdogNotice) -> String {
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
+    let silence = match notice.silent_for_secs {
+        Some(secs) => format!("after {secs}s silent"),
+        None => "silence not measured (no recorded start)".to_string(),
+    };
     truncate_field(&format!(
-        "runner {} pid {pid} port {} — {} after {}s silent",
-        notice.runner_id, notice.port, notice.event, notice.silent_for_secs
+        "runner {} pid {pid} port {} — {} {silence}",
+        notice.runner_id, notice.port, notice.event
     ))
 }
 
 /// The `checks` field: the TRUE event class first (coord's kind is hard-coded
-/// to `agent_took_irreversible_action` for every class), then the detail,
+/// to `agent_took_sensitive_action` for every class), then the detail,
 /// then the census/verdict JSON — so a truncation, if one happens, eats the
 /// tail of the census and never the class.
 fn checks_string(notice: &ServingWatchdogNotice) -> String {
@@ -730,9 +1257,10 @@ fn checks_string(notice: &ServingWatchdogNotice) -> String {
 /// — no IO — so the golden test pins the wire shape against the real
 /// construction path.
 ///
-/// The key set is `{action, artifact, checks}` plus `reversible` for
-/// `RestartTaken` ONLY. The door is `deny_unknown_fields`, so one extra key is
-/// a 400 that surfaces nowhere an operator looks; and `reversible` is omitted
+/// The key set is `{action, artifact, checks}` plus `reversible` for an
+/// irreversible event ONLY ([`ServingEvent::is_irreversible`]). The door is
+/// `deny_unknown_fields`, so one extra key is a 400 that surfaces nowhere an
+/// operator looks; and `reversible` is omitted
 /// rather than sent for the non-restart classes because coord renders an
 /// absent value as "unrecorded" — the honest answer for a threshold or a
 /// refusal, which reversed nothing — whereas any present value would be a
@@ -745,7 +1273,7 @@ pub fn build_agent_notification_body(notice: &ServingWatchdogNotice) -> serde_js
         "artifact".to_string(),
         serde_json::Value::from(artifact_line(notice)),
     );
-    if notice.event == ServingEvent::RestartTaken {
+    if notice.event.is_irreversible() {
         body.insert("reversible".to_string(), serde_json::Value::from("no"));
     }
     body.insert(
@@ -779,14 +1307,17 @@ fn build_fallback_finding_body(
 
 /// Alert coord that the serving watchdog decided something about a runner.
 ///
-/// Resolves the coord base from the active profile (`coord_http_base`) and
-/// the device bearer through the usual cascade, then posts. See the block
-/// comment above for why this exists, why it is `action: other`, and why the
-/// caller MUST spawn it rather than await it on the restart path:
+/// Resolves the coord base through [`coord_base`] under `access` FIRST — with
+/// no coord it returns `Err` before reading `machine.json` or minting a device
+/// JWT — then the device bearer through the transport-guarded cascade
+/// ([`resolve_device_bearer_for`] — withheld on a cleartext non-loopback
+/// base), then posts. See the block comment above for why this exists, why it
+/// is `action: other`, and why the caller MUST spawn it rather than await it on
+/// the restart path:
 ///
 /// ```ignore
 /// tokio::spawn(async move {
-///     match fleet::notify_serving_watchdog(&notice).await {
+///     match fleet::notify_serving_watchdog(&access, &notice).await {
 ///         Ok(outcome) => info!(...),
 ///         Err(e) => warn!("serving watchdog: coord alert not delivered: {e}"),
 ///     }
@@ -796,32 +1327,31 @@ fn build_fallback_finding_body(
 /// `Err` means the event did NOT land on coord by either door; the
 /// diagnostics ring event the caller emitted alongside is the record then.
 /// Never logs, formats or returns the `Authorization` value on any path.
-// Wired by Phase 4's `maybe_serving_restart` (`process::manager`), which
-// lands in a separate commit on the same branch; until it does, the lib
-// target reaches this through `lib.rs` and the bin target reports it dead.
-#[allow(dead_code)]
 pub async fn notify_serving_watchdog(
+    access: &AmbientCoord,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    let base = coord_http_base().ok_or_else(|| {
-        "no coord base: ~/.qontinui/profiles.json missing or the active profile has no coord_url"
-            .to_string()
-    })?;
-    notify_serving_watchdog_at(&base, notice).await
+    notify_serving_watchdog_from(access, &DeviceSources::for_access(access), notice).await
 }
 
-/// [`notify_serving_watchdog`] against an explicit coord base — the seam the
-/// tests drive against an in-process server. Resolves the device bearer and
-/// the device id ONCE and hands both to the request path, so the fallback
-/// arm cannot mint a second credential.
-#[allow(dead_code)] // reached through `notify_serving_watchdog`; see its note
-pub async fn notify_serving_watchdog_at(
-    base: &str,
+/// [`notify_serving_watchdog`] with its identity sources passed in — the seam
+/// the counting tests drive. Resolves the device bearer and the device id ONCE
+/// and hands both to the request path, so the fallback arm cannot mint a
+/// second credential.
+pub(crate) async fn notify_serving_watchdog_from(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
     notice: &ServingWatchdogNotice,
 ) -> Result<NotifyOutcome, String> {
-    let bearer = resolve_device_bearer().await;
-    let device_id = load_machine_file().and_then(|m| m.device_id().map(str::to_string));
-    notify_serving_watchdog_with(base, notice, bearer, device_id.as_deref()).await
+    let base = coord_base(access).ok_or_else(|| match access {
+        AmbientCoord::Ignore => "no coord: the ambient coord is Ignore".to_string(),
+        _ => "no coord base: COORD_HTTP_URL unset and ~/.qontinui/profiles.json missing or \
+              the active profile has no coord_url"
+            .to_string(),
+    })?;
+    let bearer = resolve_device_bearer_for(&base, sources).await;
+    let device_id = (sources.machine)().and_then(|m| m.device_id().map(str::to_string));
+    notify_serving_watchdog_with(&base, notice, bearer, device_id.as_deref()).await
 }
 
 /// The request path with credential resolution factored out, so every arm
@@ -831,7 +1361,7 @@ pub async fn notify_serving_watchdog_at(
 async fn notify_serving_watchdog_with(
     base: &str,
     notice: &ServingWatchdogNotice,
-    bearer: Option<(String, &'static str)>,
+    bearer: ResolvedBearer,
     device_id: Option<&str>,
 ) -> Result<NotifyOutcome, String> {
     let base = base.trim_end_matches('/');
@@ -880,9 +1410,9 @@ async fn notify_serving_watchdog_with(
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         warn!(
             "fleet::notify_serving_watchdog: coord refused the device bearer at \
-             {AGENT_NOTIFICATIONS_PATH} ({status}) runner={} event={} — falling back to a \
-             `status` finding on topic operator-notify",
-            notice.runner_id, notice.event
+             {AGENT_NOTIFICATIONS_PATH} ({status}, sent: {}) runner={} event={} — falling back \
+             to a `status` finding on topic operator-notify",
+            bearer.1, notice.runner_id, notice.event
         );
         return post_fallback_finding(&client, base, notice, bearer, device_id).await;
     }
@@ -899,7 +1429,7 @@ async fn post_fallback_finding(
     client: &reqwest::Client,
     base: &str,
     notice: &ServingWatchdogNotice,
-    bearer: Option<(String, &'static str)>,
+    bearer: ResolvedBearer,
     device_id: Option<&str>,
 ) -> Result<NotifyOutcome, String> {
     let url = format!("{base}{AGENT_FINDINGS_PATH}");
@@ -999,18 +1529,22 @@ mod tests {
         .expect("payload serializes")
     }
 
-    /// The live defect this module was changed to fix: coord writes every
-    /// budget column with a straight `SET`, so a `max_concurrent_agents: 0`
-    /// here flapped the runner's real cap to zero on every publish. The
-    /// supervisor does not own that column, and the ONLY way to say so on
-    /// the wire is to omit the key.
+    /// The live defect this module was changed to fix: under coord's earlier
+    /// straight `SET`, a `max_concurrent_agents: 0` here flapped the
+    /// device's real cap to zero on every publish. Coord now COALESCEs each
+    /// budget column, so an omitted key leaves it alone, but an explicit `0` is
+    /// still a write (stored verbatim); a non-zero value is replaced or
+    /// dropped by coord's derivation. Coord owns that column
+    /// (its own derivation from the runner's publish; an explicit `0` is
+    /// still stored verbatim), and the ONLY way for the supervisor to stay
+    /// out of it on the wire is to omit the key.
     #[test]
     fn budget_payload_omits_the_agent_cap_the_supervisor_does_not_own() {
         let v = serialized();
         let obj = v.as_object().expect("payload is a JSON object");
         assert!(
             !obj.contains_key("max_concurrent_agents"),
-            "max_concurrent_agents is the RUNNER's column — sending any value overwrites it: {v}"
+            "max_concurrent_agents is COORD's column (derived from the runner's memory_gb/cpu_cores) — sending a value from the supervisor can overwrite it: {v}"
         );
     }
 
@@ -1098,16 +1632,16 @@ mod tests {
     #[test]
     fn parse_minted_token_takes_a_jwt_and_refuses_every_other_answer() {
         let ok = serde_json::json!({"data": {"result": {"value": "aaa.bbb.ccc"}}});
-        assert_eq!(parse_minted_token(&ok).as_deref(), Some("aaa.bbb.ccc"));
+        assert_eq!(parse_minted_token(&ok, NOW).as_deref(), Some("aaa.bbb.ccc"));
 
         let signed_out = serde_json::json!({"data": {"result": {"value": ""}}});
-        assert_eq!(parse_minted_token(&signed_out), None);
+        assert_eq!(parse_minted_token(&signed_out, NOW), None);
 
         let opaque = serde_json::json!({"data": {"result": {"value": "qontinui_runner_x"}}});
-        assert_eq!(parse_minted_token(&opaque), None);
+        assert_eq!(parse_minted_token(&opaque, NOW), None);
 
         let no_runner_shape = serde_json::json!({"error": "not connected"});
-        assert_eq!(parse_minted_token(&no_runner_shape), None);
+        assert_eq!(parse_minted_token(&no_runner_shape, NOW), None);
     }
 
     /// A seeded rung must not be able to break the publish: an operator
@@ -1127,7 +1661,7 @@ mod tests {
         assert_eq!(usable_token(Some("aaa.bbb.cc c"), "test"), None);
     }
 
-    fn built_request(resolved: Option<(String, &'static str)>) -> reqwest::Request {
+    fn built_request(resolved: ResolvedBearer) -> reqwest::Request {
         let client = reqwest::Client::new();
         let rb = client
             .post("http://127.0.0.1:1/coord/devices/00000000-0000-0000-0000-000000000000/budget")
@@ -1139,7 +1673,7 @@ mod tests {
 
     #[test]
     fn device_auth_attaches_the_bearer_when_a_credential_resolves() {
-        let req = built_request(Some(("aaa.bbb.ccc".to_string(), "test source")));
+        let req = built_request((Some("aaa.bbb.ccc".to_string()), "test source"));
         assert_eq!(
             req.headers()
                 .get("Authorization")
@@ -1151,12 +1685,9 @@ mod tests {
     /// Degrade, never fail: coord still accepts anonymous budget publishes,
     /// so a supervisor with no reachable credential must keep publishing
     /// rather than drop off the fleet.
-    /// Degrade, never fail: coord still accepts anonymous budget publishes,
-    /// so a supervisor with no reachable credential must keep publishing
-    /// rather than drop off the fleet.
     #[test]
     fn device_auth_still_produces_a_well_formed_request_when_no_credential_resolves() {
-        let req = built_request(None);
+        let req = built_request((None, SOURCE_NONE));
         assert!(req.headers().get("Authorization").is_none());
         assert_eq!(req.method(), reqwest::Method::POST);
         assert!(req.url().path().ends_with("/budget"));
@@ -1176,7 +1707,7 @@ mod tests {
     #[test]
     fn the_bearer_never_reaches_the_body_but_debug_would_expose_it() {
         let token = "notatoken.notatoken.notatoken";
-        let req = built_request(Some((token.to_string(), "test source")));
+        let req = built_request((Some(token.to_string()), "test source"));
 
         let body = std::str::from_utf8(
             req.body()
@@ -1206,10 +1737,13 @@ mod tests {
     use axum::{Json, Router};
     use std::sync::{Arc, Mutex};
 
-    const ALL_EVENTS: [ServingEvent; 6] = [
+    const ALL_EVENTS: [ServingEvent; 9] = [
         ServingEvent::Threshold,
         ServingEvent::NeverAnsweredSinceAdoption,
+        ServingEvent::NeverAnsweredSinceSpawn,
+        ServingEvent::NeverBoundSinceSpawn,
         ServingEvent::RestartTaken,
+        ServingEvent::FirstHealthyKill,
         ServingEvent::RestartRefusedSessionsLive,
         ServingEvent::RestartFailed,
         ServingEvent::Disarmed,
@@ -1221,7 +1755,7 @@ mod tests {
             event,
             pid: Some(48544),
             port: 9876,
-            silent_for_secs: 301,
+            silent_for_secs: Some(301),
             census_json: Some(serde_json::json!({
                 "source": "supervisor_subtree_census",
                 "root_pid": 48544,
@@ -1322,9 +1856,7 @@ mod tests {
 
     /// A URL nothing is listening on.
     async fn dead_base() -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        let port = crate::test_ports::reserve_refused_port();
         format!("http://127.0.0.1:{port}")
     }
 
@@ -1342,21 +1874,21 @@ mod tests {
     /// GOLDEN: coord's `AgentNotificationBody` is `deny_unknown_fields`, so
     /// one extra key is a 400 that no operator ever sees. Pin the exact key
     /// set for every event class: `{action, artifact, checks}`, plus
-    /// `reversible` for `RestartTaken` ONLY — absent renders as "unrecorded"
+    /// `reversible` for an irreversible event ONLY — absent renders as "unrecorded"
     /// on coord, and a threshold or refusal reversed nothing. Never `repo`,
     /// `pr_number`, `kind` or `actor`.
     #[test]
     fn notification_body_carries_exactly_the_keys_coord_accepts() {
         for event in ALL_EVENTS {
             let body = build_agent_notification_body(&sample_notice(event));
-            let expected: Vec<&str> = if event == ServingEvent::RestartTaken {
+            let expected: Vec<&str> = if event.is_irreversible() {
                 vec!["action", "artifact", "checks", "reversible"]
             } else {
                 vec!["action", "artifact", "checks"]
             };
             assert_eq!(keys(&body), expected, "event {event}: {body}");
             assert_eq!(body["action"], "other", "event {event}");
-            if event == ServingEvent::RestartTaken {
+            if event.is_irreversible() {
                 assert_eq!(body["reversible"], "no");
             }
             let checks = body["checks"].as_str().unwrap();
@@ -1392,6 +1924,15 @@ mod tests {
             body["checks"],
             "serving_watchdog:restart_failed detail=port 9876 held by live runner pid 48544 \
              census=none"
+        );
+        // A silence nothing measured is said, never printed as 0.
+        let mut notice = sample_notice(ServingEvent::NeverAnsweredSinceSpawn);
+        notice.silent_for_secs = None;
+        let body = build_agent_notification_body(&notice);
+        assert_eq!(
+            body["artifact"],
+            "runner primary pid 48544 port 9876 — never_answered_since_spawn silence not \
+             measured (no recorded start)"
         );
     }
 
@@ -1442,7 +1983,7 @@ mod tests {
         let outcome = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            (Some("aaa.bbb.ccc".to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1466,7 +2007,7 @@ mod tests {
     async fn notify_without_a_credential_still_posts_and_is_notified_on_200() {
         let (base, seen) = spawn_coord_mock(200, None).await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .expect("delivered");
         assert!(
@@ -1484,9 +2025,10 @@ mod tests {
     async fn notify_429_is_rate_limited_and_never_retried() {
         let (base, seen) = spawn_coord_mock(429, Some("30")).await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, Some("dev-1"))
-            .await
-            .expect("a 429 is a delivery outcome, not an error");
+        let outcome =
+            notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), Some("dev-1"))
+                .await
+                .expect("a 429 is a delivery outcome, not an error");
         assert_eq!(
             outcome,
             NotifyOutcome::RateLimited {
@@ -1501,7 +2043,7 @@ mod tests {
 
         // No header → `None`, still no retry.
         let (base, seen) = spawn_coord_mock(429, None).await;
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .unwrap();
         assert_eq!(
@@ -1523,7 +2065,7 @@ mod tests {
         let outcome = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some(("aaa.bbb.ccc".to_string(), "test source")),
+            (Some("aaa.bbb.ccc".to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1560,7 +2102,7 @@ mod tests {
     async fn notify_401_falls_back_and_omits_an_unresolvable_device_key() {
         let (base, seen) = spawn_coord_mock(401, None).await;
         let notice = sample_notice(ServingEvent::Disarmed);
-        let outcome = notify_serving_watchdog_with(&base, &notice, None, None)
+        let outcome = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .unwrap();
         assert!(
@@ -1589,7 +2131,7 @@ mod tests {
         let err = notify_serving_watchdog_with(
             &base,
             &notice,
-            Some((token.to_string(), "test source")),
+            (Some(token.to_string()), "test source"),
             Some("dev-1"),
         )
         .await
@@ -1610,7 +2152,7 @@ mod tests {
     async fn notify_network_error_is_an_error_naming_the_url() {
         let base = dead_base().await;
         let notice = sample_notice(ServingEvent::Threshold);
-        let err = notify_serving_watchdog_with(&base, &notice, None, None)
+        let err = notify_serving_watchdog_with(&base, &notice, (None, SOURCE_NONE), None)
             .await
             .expect_err("nothing is listening");
         assert!(err.starts_with("POST "), "{err}");
@@ -1635,5 +2177,628 @@ mod tests {
             None
         );
         assert_eq!(id_from_body(&serde_json::Value::Null, "finding_id"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Device-bearer validity + the invoke-first mint.
+    // -----------------------------------------------------------------------
+
+    /// Test-only base64url encoder (unpadded), the inverse of
+    /// [`base64url_decode`].
+    fn b64url(bytes: &[u8]) -> String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let mut acc: u32 = 0;
+            for (i, &b) in chunk.iter().enumerate() {
+                acc |= u32::from(b) << (16 - 8 * i);
+            }
+            for i in 0..=chunk.len() {
+                out.push(A[((acc >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    /// A JWS-compact token whose payload is `claims`. Unsigned — the
+    /// supervisor never verifies a signature, coord does.
+    fn jwt_with(claims: serde_json::Value) -> String {
+        format!(
+            "{}.{}.c2ln",
+            b64url(br#"{"alg":"HS256","typ":"JWT"}"#),
+            b64url(claims.to_string().as_bytes())
+        )
+    }
+
+    const NOW: i64 = 1_790_000_000;
+
+    #[test]
+    fn base64url_decode_round_trips_every_tail_length_and_refuses_junk() {
+        let inputs: [&[u8]; 6] = [b"", b"a", b"ab", b"abc", b"abcd", b"\xff\xfe\x00?>"];
+        for input in inputs {
+            assert_eq!(base64url_decode(&b64url(input)).as_deref(), Some(input));
+        }
+        // Padding is tolerated.
+        assert_eq!(base64url_decode("YQ==").as_deref(), Some(&b"a"[..]));
+        // A lone trailing sextet cannot encode a byte.
+        assert_eq!(base64url_decode("YWJjZ"), None);
+        // Standard-alphabet bytes are not base64url.
+        assert_eq!(base64url_decode("a+b/"), None);
+        // Known answer exercising both url-safe symbols: '-'=62 '_'=63 '8'=60
+        // → 111110 111111 111100 → 0xfb 0xff (4 pad bits dropped).
+        assert_eq!(base64url_decode("-_8").as_deref(), Some(&[0xfb, 0xff][..]));
+    }
+
+    #[test]
+    fn jwt_exp_reads_the_claim_and_is_none_when_unreadable() {
+        assert_eq!(
+            jwt_exp(&jwt_with(serde_json::json!({"exp": 123}))),
+            Some(123)
+        );
+        assert_eq!(
+            jwt_exp(&jwt_with(serde_json::json!({"exp": 123.9}))),
+            Some(123)
+        );
+        assert_eq!(jwt_exp(&jwt_with(serde_json::json!({"sub": "x"}))), None);
+        assert_eq!(jwt_exp(&jwt_with(serde_json::json!({"exp": "soon"}))), None);
+        // `bbb` is not a JSON payload.
+        assert_eq!(jwt_exp("aaa.bbb.ccc"), None);
+    }
+
+    #[test]
+    fn an_expired_seeded_token_is_skipped_and_a_near_expiry_one_too() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 1400}));
+        assert_eq!(usable_token_at(Some(&expired), "test", NOW), None);
+        // Within the 60 s skew: would lapse in flight.
+        let lapsing = jwt_with(serde_json::json!({"exp": NOW + EXPIRY_SKEW_SECS}));
+        assert_eq!(usable_token_at(Some(&lapsing), "test", NOW), None);
+        let live = jwt_with(serde_json::json!({"exp": NOW + EXPIRY_SKEW_SECS + 1}));
+        assert_eq!(usable_token_at(Some(&live), "test", NOW), Some(live));
+    }
+
+    /// `exp` is read from an UNVERIFIED payload, so an adversarial or
+    /// corrupt value must not overflow (a debug-build panic would kill the
+    /// footprint task that runs the publish).
+    #[test]
+    fn an_extreme_negative_exp_is_expired_without_overflowing() {
+        let min = jwt_with(serde_json::json!({"exp": i64::MIN}));
+        assert_eq!(usable_token_at(Some(&min), "test", NOW), None);
+        let huge_neg = jwt_with(serde_json::json!({"exp": -1e300}));
+        assert_eq!(jwt_exp(&huge_neg), Some(i64::MIN));
+        assert_eq!(usable_token_at(Some(&huge_neg), "test", NOW), None);
+        assert!(expired_note("test", i64::MIN, i64::MAX).contains("expired"));
+    }
+
+    #[test]
+    fn the_expired_note_says_ago_or_expires_in_and_names_only_the_source() {
+        let past = expired_note("SRC", NOW - 1400, NOW);
+        assert!(
+            past.contains("SRC") && past.contains("expired 1400s ago"),
+            "{past}"
+        );
+        let lapsing = expired_note("SRC", NOW + 30, NOW);
+        assert!(lapsing.contains("expires in 30s"), "{lapsing}");
+        assert!(!lapsing.contains("-30"), "{lapsing}");
+    }
+
+    /// Shape-valid with no readable `exp` stays accepted — coord decides.
+    #[test]
+    fn a_token_with_no_readable_exp_is_accepted() {
+        let no_exp = jwt_with(serde_json::json!({"sub": "device"}));
+        assert_eq!(usable_token_at(Some(&no_exp), "test", NOW), Some(no_exp));
+        assert_eq!(
+            usable_token_at(Some("aaa.bbb.ccc"), "test", NOW).as_deref(),
+            Some("aaa.bbb.ccc")
+        );
+    }
+
+    /// The incident shape: an hours-dead `$COORD_DEVICE_JWT` must not shadow
+    /// a live file token.
+    #[test]
+    fn an_expired_env_token_falls_through_to_a_valid_file_token() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 1400}));
+        let live = jwt_with(serde_json::json!({"exp": NOW + 3600}));
+        assert_eq!(
+            select_seeded_bearer(Some(&expired), Some(&live), NOW),
+            Some((live.clone(), SOURCE_FILE))
+        );
+        // Env still wins when it is live.
+        let env_live = jwt_with(serde_json::json!({"exp": NOW + 7200}));
+        assert_eq!(
+            select_seeded_bearer(Some(&env_live), Some(&live), NOW),
+            Some((env_live, DEVICE_JWT_ENV))
+        );
+        // Both expired → nothing seeded, so the caller goes on to the mint.
+        assert_eq!(
+            select_seeded_bearer(Some(&expired), Some(&expired), NOW),
+            None
+        );
+    }
+
+    /// Captures everything logged on this thread while the guard is held.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLog {
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let sub = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(sub)
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    /// Every log line the seeded rungs and the mint parsers can emit names
+    /// the source and never the token.
+    #[test]
+    fn no_bearer_log_line_carries_the_token() {
+        let log = CapturedLog::default();
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 10}));
+        let non_jwt = "opaque-secret-value-with-no-dots";
+        {
+            let _g = log.install();
+            assert_eq!(usable_token_at(Some(&expired), "SRC_NAME", NOW), None);
+            assert_eq!(usable_token_at(Some(non_jwt), "SRC_NAME", NOW), None);
+            let v = serde_json::json!({"success": true, "data": non_jwt});
+            assert_eq!(parse_invoked_token(&v, NOW), None);
+        }
+        let text = log.text();
+        assert!(
+            text.contains("SRC_NAME") && text.contains("expired"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(&expired),
+            "token leaked into a log line: {text}"
+        );
+        // Neither half of the token, either.
+        for segment in expired.split('.') {
+            assert!(!text.contains(segment), "token segment leaked: {text}");
+        }
+        assert!(
+            !text.contains(non_jwt),
+            "value leaked into a log line: {text}"
+        );
+    }
+
+    /// The runner's no-tenant arm does not check `exp`, so a minted token
+    /// gets the seeded rungs' expiry gate on both doors.
+    #[test]
+    fn a_minted_expired_token_is_no_credential_on_either_door() {
+        let expired = jwt_with(serde_json::json!({"exp": NOW - 5}));
+        let live = jwt_with(serde_json::json!({"exp": NOW + 3600}));
+        let inv = |t: &str| serde_json::json!({"success": true, "data": t});
+        let eval = |t: &str| serde_json::json!({"data": {"result": {"value": t}}});
+        assert_eq!(parse_invoked_token(&inv(&expired), NOW), None);
+        assert_eq!(parse_minted_token(&eval(&expired), NOW), None);
+        assert_eq!(parse_invoked_token(&inv(&live), NOW), Some(live.clone()));
+        assert_eq!(parse_minted_token(&eval(&live), NOW), Some(live));
+    }
+
+    #[test]
+    fn parse_invoked_token_takes_a_jwt_and_refuses_every_other_answer() {
+        let ok = serde_json::json!({"success": true, "data": " aaa.bbb.ccc "});
+        assert_eq!(
+            parse_invoked_token(&ok, NOW).as_deref(),
+            Some("aaa.bbb.ccc")
+        );
+        let unpaired = serde_json::json!({"success": true, "data": null});
+        assert_eq!(parse_invoked_token(&unpaired, NOW), None);
+        let rejected = serde_json::json!({"success": false, "error": "store unreadable"});
+        assert_eq!(parse_invoked_token(&rejected, NOW), None);
+        let opaque = serde_json::json!({"success": true, "data": "qontinui_runner_x"});
+        assert_eq!(parse_invoked_token(&opaque, NOW), None);
+    }
+
+    #[derive(Clone)]
+    struct RunnerMock {
+        invoke_status: u16,
+        invoke_body: serde_json::Value,
+        invoke_hits: Arc<Mutex<u32>>,
+        evaluate_hits: Arc<Mutex<u32>>,
+    }
+
+    const EVALUATE_TOKEN: &str = "eval.minted.token";
+
+    async fn mock_invoke(State(st): State<RunnerMock>) -> axum::response::Response {
+        *st.invoke_hits.lock().unwrap() += 1;
+        (
+            StatusCode::from_u16(st.invoke_status).unwrap(),
+            Json(st.invoke_body.clone()),
+        )
+            .into_response()
+    }
+
+    async fn mock_evaluate(State(st): State<RunnerMock>) -> axum::response::Response {
+        *st.evaluate_hits.lock().unwrap() += 1;
+        Json(serde_json::json!({"data": {"result": {"value": EVALUATE_TOKEN}}})).into_response()
+    }
+
+    /// A runner stand-in on an ephemeral loopback port serving both mint
+    /// doors. Returns the base and the (invoke, evaluate) hit counters.
+    async fn spawn_runner_mock(
+        invoke_status: u16,
+        invoke_body: serde_json::Value,
+    ) -> (String, Arc<Mutex<u32>>, Arc<Mutex<u32>>) {
+        let st = RunnerMock {
+            invoke_status,
+            invoke_body,
+            invoke_hits: Arc::new(Mutex::new(0)),
+            evaluate_hits: Arc::new(Mutex::new(0)),
+        };
+        let (inv, eval) = (Arc::clone(&st.invoke_hits), Arc::clone(&st.evaluate_hits));
+        let app = Router::new()
+            .route(MINT_INVOKE_PATH, post(mock_invoke))
+            .route(MINT_EVALUATE_PATH, post(mock_evaluate))
+            .with_state(st);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://127.0.0.1:{}", addr.port()), inv, eval)
+    }
+
+    /// The bearer cache is process-global, so its tests run one at a time and
+    /// start from an empty cache.
+    static BEARER_CACHE_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn clear_bearer_cache() {
+        *BEARER_CACHE.lock().unwrap() = None;
+    }
+
+    /// A minted token with a live `exp` is reused: two lookups, one mint.
+    /// Sources that read no identity never touch the cache, and a cleartext
+    /// remote base never gets the cached token.
+    #[tokio::test]
+    async fn the_bearer_cache_reuses_a_fresh_token_and_guards_its_transport() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let token = jwt_with(serde_json::json!({"exp": chrono::Utc::now().timestamp() + 3600}));
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": token})).await;
+        let sources = DeviceSources::fixture(&mint);
+        for _ in 0..2 {
+            let (got, source) =
+                resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+            assert_eq!(got.as_deref(), Some(token.as_str()));
+            assert_eq!(source, SOURCE_RUNNER_MINT);
+        }
+        assert_eq!(
+            *inv.lock().unwrap(),
+            1,
+            "the second lookup is served from the cache"
+        );
+
+        let (got, source) =
+            resolve_device_bearer_cached_for("http://coord.example.com", &sources).await;
+        assert!(got.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
+
+        let none = DeviceSources::for_access(&AmbientCoord::Ignore);
+        let (got, source) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &none).await;
+        assert!(got.is_none(), "identity-less sources never read the cache");
+        assert_eq!(source, SOURCE_NONE);
+        // ...nor write it: the cached token is still served without a mint.
+        let (got, _) =
+            resolve_device_bearer_cached_for("https://coord.example.com", &sources).await;
+        assert_eq!(got.as_deref(), Some(token.as_str()));
+        assert_eq!(*inv.lock().unwrap(), 1);
+
+        // Past the token's exp less the skew, the cache asks again.
+        let later = chrono::Utc::now().timestamp() + 3600 - EXPIRY_SKEW_SECS;
+        let _ = resolve_device_bearer_cached_at("https://coord.example.com", &sources, later).await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "a token near its exp is not served from the cache"
+        );
+        clear_bearer_cache();
+    }
+
+    /// A lookup that finds no token is remembered for the negative window, so
+    /// an unpaired runner is asked once per window, not once per action.
+    #[tokio::test]
+    async fn the_bearer_cache_remembers_a_miss_for_its_window() {
+        let _serial = BEARER_CACHE_TESTS.lock().await;
+        clear_bearer_cache();
+        let (mint, inv, _eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": null})).await;
+        let sources = DeviceSources::fixture(&mint);
+        let now = chrono::Utc::now().timestamp();
+        for at in [now, now + NEGATIVE_BEARER_CACHE_SECS - 1] {
+            let (got, source) =
+                resolve_device_bearer_cached_at("https://coord.example.com", &sources, at).await;
+            assert!(got.is_none());
+            assert_eq!(source, SOURCE_NONE);
+        }
+        assert_eq!(*inv.lock().unwrap(), 1, "the miss is remembered");
+        let _ = resolve_device_bearer_cached_at(
+            "https://coord.example.com",
+            &sources,
+            now + NEGATIVE_BEARER_CACHE_SECS,
+        )
+        .await;
+        assert_eq!(
+            *inv.lock().unwrap(),
+            2,
+            "past the window the runner is asked again"
+        );
+        clear_bearer_cache();
+    }
+
+    #[tokio::test]
+    async fn mint_takes_the_invoke_answer_and_never_calls_evaluate() {
+        let (base, inv, eval) = spawn_runner_mock(
+            200,
+            serde_json::json!({"success": true, "data": "inv.minted.token"}),
+        )
+        .await;
+        assert_eq!(
+            mint_device_jwt_at(&base).await.as_deref(),
+            Some("inv.minted.token")
+        );
+        assert_eq!(*inv.lock().unwrap(), 1);
+        assert_eq!(*eval.lock().unwrap(), 0, "evaluate must not be called");
+    }
+
+    #[tokio::test]
+    async fn mint_falls_back_to_evaluate_on_invoke_400_and_404() {
+        for status in [400, 404] {
+            let (base, inv, eval) =
+                spawn_runner_mock(status, serde_json::json!({"error": "unknown command"})).await;
+            assert_eq!(
+                mint_device_jwt_at(&base).await.as_deref(),
+                Some(EVALUATE_TOKEN),
+                "status {status}"
+            );
+            assert_eq!(*inv.lock().unwrap(), 1);
+            assert_eq!(*eval.lock().unwrap(), 1, "status {status}");
+        }
+    }
+
+    /// An expired token from the invoke door is no credential — and not a
+    /// reason to ask the evaluate door, which reads the same store.
+    #[tokio::test]
+    async fn mint_invoke_expired_token_is_no_bearer() {
+        let expired = jwt_with(serde_json::json!({"exp": 1_000}));
+        let (base, _inv, eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": expired})).await;
+        assert_eq!(mint_device_jwt_at(&base).await, None);
+        assert_eq!(*eval.lock().unwrap(), 0);
+    }
+
+    /// Unpaired is an ANSWER: evaluate would ask the same store the same
+    /// question.
+    #[tokio::test]
+    async fn mint_invoke_null_is_no_bearer_and_no_evaluate() {
+        let (base, _inv, eval) =
+            spawn_runner_mock(200, serde_json::json!({"success": true, "data": null})).await;
+        assert_eq!(mint_device_jwt_at(&base).await, None);
+        assert_eq!(*eval.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn mint_invoke_other_failure_is_no_bearer_and_no_evaluate() {
+        // 409 `tenant_required` is the realistic multi-tenant answer.
+        for (status, body) in [
+            (500, serde_json::json!({"error": "x"})),
+            (409, serde_json::json!({"error": "tenant_required"})),
+        ] {
+            let (base, _inv, eval) = spawn_runner_mock(status, body).await;
+            assert_eq!(mint_device_jwt_at(&base).await, None, "status {status}");
+            assert_eq!(*eval.lock().unwrap(), 0, "status {status}");
+        }
+        assert_eq!(mint_device_jwt_at(&dead_base().await).await, None);
+    }
+
+    #[test]
+    fn the_bearer_rides_only_https_or_loopback() {
+        assert!(transport_may_carry_bearer("https://coord.qontinui.io"));
+        assert!(transport_may_carry_bearer("http://127.0.0.1:9870"));
+        assert!(transport_may_carry_bearer("http://localhost:9870/x"));
+        assert!(transport_may_carry_bearer("http://[::1]:9870"));
+        assert!(transport_may_carry_bearer("ws://[::1]"));
+        assert!(transport_may_carry_bearer("http://[::1]/coord"));
+        assert!(!transport_may_carry_bearer("http://[2001:db8::1]:9870"));
+        assert!(!transport_may_carry_bearer("http://coord.example.com"));
+        assert!(!transport_may_carry_bearer("http://10.0.0.5:9870"));
+        // Userinfo must not smuggle a remote host past the loopback test.
+        assert!(!transport_may_carry_bearer("http://localhost:x@evil.com"));
+        // Inputs the old hand split wrongly read as loopback.
+        assert!(!transport_may_carry_bearer("ws://[::1]:x@evil.com"));
+        assert!(!transport_may_carry_bearer("http://[::1]@evil.com"));
+        // Hosts are compared the way the HTTP client resolves them.
+        assert!(transport_may_carry_bearer("http://LOCALHOST:9870"));
+        assert!(!transport_may_carry_bearer("http://localhost.:9870"));
+        assert!(!transport_may_carry_bearer("not a url"));
+    }
+
+    /// Only `Read` reads this box's identity: under `At` a stub the base is
+    /// planted, so the box's `machine.json`, its seeded JWT rungs and the
+    /// primary runner's mint must not ride along to it.
+    #[test]
+    fn device_sources_follow_the_ambient_coord() {
+        for access in [
+            AmbientCoord::At("http://127.0.0.1:1".to_string()),
+            AmbientCoord::Ignore,
+        ] {
+            let sources = DeviceSources::for_access(&access);
+            assert!(!sources.read_seeded, "{access:?} reads the seeded rungs");
+            assert_eq!(sources.mint_base, None, "{access:?} mints");
+            assert!((sources.machine)().is_none(), "{access:?} has an identity");
+        }
+        let read = DeviceSources::for_access(&AmbientCoord::Read);
+        assert!(read.read_seeded);
+        assert_eq!(
+            read.mint_base.as_deref(),
+            Some(format!("http://127.0.0.1:{}", crate::config::RUNNER_API_PORT).as_str())
+        );
+    }
+
+    /// Under `At` no bearer resolves: no seeded rung is read and nothing is
+    /// minted from this box's runner, even on a loopback base.
+    #[tokio::test]
+    async fn no_bearer_resolves_under_at() {
+        let none = DeviceSources::for_access(&AmbientCoord::At("http://127.0.0.1:1".into()));
+        let (bearer, _) = resolve_device_bearer_for("http://127.0.0.1:1", &none).await;
+        assert!(bearer.is_none());
+    }
+
+    /// The withheld arm never reaches the resolver (no env, file or mint is
+    /// consulted), and its label says why nothing was sent.
+    #[tokio::test]
+    async fn a_cleartext_non_loopback_base_withholds_the_bearer() {
+        let (bearer, source) = resolve_device_bearer_for(
+            "http://coord.example.com",
+            &DeviceSources::fixture("http://127.0.0.1:1"),
+        )
+        .await;
+        assert!(bearer.is_none());
+        assert_eq!(source, SOURCE_WITHHELD);
+    }
+
+    #[test]
+    fn refusal_hint_names_the_source_on_401_403_and_the_route_on_404() {
+        let h = refusal_hint(reqwest::StatusCode::FORBIDDEN, SOURCE_FILE);
+        assert!(
+            h.contains("credential refused") && h.contains(SOURCE_FILE),
+            "{h}"
+        );
+        let h = refusal_hint(reqwest::StatusCode::UNAUTHORIZED, SOURCE_WITHHELD);
+        assert!(h.contains(SOURCE_WITHHELD), "{h}");
+        assert_eq!(
+            refusal_hint(reqwest::StatusCode::NOT_FOUND, SOURCE_FILE),
+            " (route not served by this coord)"
+        );
+        assert_eq!(
+            refusal_hint(reqwest::StatusCode::INTERNAL_SERVER_ERROR, SOURCE_FILE),
+            ""
+        );
+    }
+
+    /// Under `Ignore` the budget publish reaches neither coord nor the runner's
+    /// mint and reads no `machine.json`; under `At` it connects to each once.
+    #[tokio::test]
+    async fn budget_publish_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let resources = Resources {
+            cpu_cores: 8,
+            memory_gb: 16,
+            disk_total_gb: 100,
+        };
+
+        publish_budget(&AmbientCoord::Ignore, &sources, ROLE, resources, 0)
+            .await
+            .expect("Ignore is a quiet Ok");
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        publish_budget(
+            &AmbientCoord::At(coord.base.clone()),
+            &sources,
+            ROLE,
+            resources,
+            0,
+        )
+        .await
+        .expect("the stub answers 200");
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint connects to the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The serving-watchdog alert obeys the same switch: `Ignore` is an `Err`
+    /// with no connection to coord or to the mint and no `machine.json` read.
+    #[tokio::test]
+    async fn serving_watchdog_notify_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let notice = sample_notice(ServingEvent::RestartTaken);
+
+        let err = notify_serving_watchdog_from(&AmbientCoord::Ignore, &sources, &notice)
+            .await
+            .expect_err("no coord under Ignore");
+        assert!(err.contains("Ignore"), "{err}");
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        let outcome =
+            notify_serving_watchdog_from(&AmbientCoord::At(coord.base.clone()), &sources, &notice)
+                .await
+                .expect("the stub answers 200");
+        assert!(
+            matches!(outcome, NotifyOutcome::Notified { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint connects to the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
     }
 }

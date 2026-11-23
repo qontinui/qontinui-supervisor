@@ -161,6 +161,10 @@ export interface RecentCrashSummary {
   panicLocation?: string | null;
   panicMessage?: string | null;
   thread?: string | null;
+  /// The pid of the process that crashed, not the one reporting it. Unset when
+  /// the runner does not emit it or the dump names none: the supervisor's own
+  /// routes drop the key, and `/runner-api/health` passes the runner's `null` on.
+  pid?: number | null;
 }
 
 /// Phase 2c (Item 9) stale-binary summary. Surfaced on `/runners` and
@@ -345,8 +349,15 @@ export interface RunnerInstanceHealth {
   /// Optional so a payload from an older supervisor still type-checks. An
   /// ABSENT verdict is unknown, never healthy.
   liveness?: RunnerLivenessWire;
+  /// Whether the API has answered during this boot (since `started_at`).
+  /// `null` is UNKNOWN (no boot recorded), never false. Optional for older
+  /// supervisors.
+  answered_this_boot?: boolean | null;
   last_seen_responding_at?: string | null;
   port_open?: boolean;
+  /// The newest spawn is alive while the port is free and the API silent: a
+  /// runner that has not bound its listener. Optional for older supervisors.
+  spawn_up?: boolean;
 }
 
 /// Watchdog health as surfaced by the supervisor. The top-level
@@ -388,6 +399,17 @@ export interface WatchdogHealthWire {
   /// Set when the SERVING-loop guard self-disarmed. Distinct from
   /// `disabled_reason`, which is the crash arm's.
   serving_disabled_reason?: string;
+  /// The last pre-bind hang alert (`never_bound_since_spawn`): when it was
+  /// sent, and the `started_at` of the spawn it named. Historical — compare the
+  /// spawn with the runner's current `started_at`. `undefined` on a supervisor
+  /// that predates the field, `null` when no such alert was sent.
+  last_prebind_alert_at?: string | null;
+  last_prebind_alert_spawn_started_at?: string | null;
+  /// The `started_at` of the spawn a first-healthy watchdog tracks right now.
+  /// Live, not historical: while it names the current spawn, the serving
+  /// watchdog holds its restart. `undefined` on an older supervisor, `null`
+  /// when no watchdog tracks a spawn.
+  first_healthy_tracked_spawn_started_at?: string | null;
 }
 
 /// `GET /health` → `originGuard` (`src/origin_guard.rs::OriginGuard::health_json`).
@@ -414,8 +436,28 @@ export interface OriginGuardWire {
   admitHostEnv: string;
 }
 
+/** `supervisor.dev_action_ingest` on `GET /health` (`IngestCounters`). */
+export interface DevActionIngestCounters {
+  /** Snapshots coord answered 2xx. */
+  delivered: number;
+  /** Retry attempts sent. */
+  retried: number;
+  /** Refused with a status a resend cannot cure; coord answered, not a drop. */
+  refused: number;
+  /** Dropped after the last retryable attempt failed. */
+  dropped_retries_exhausted: number;
+  /** Dropped because the delivery buffer was full. */
+  dropped_buffer_full: number;
+  /** Snapshots in delivery right now. */
+  pending: number;
+}
+
 export interface HealthResponse {
   status: string;
+  /// Why `status` is not the plain process/API verdict, when it is not (today:
+  /// the primary's frontend has been not ready past the supervisor's grace).
+  /// Absent when there is nothing to say, and on older supervisors.
+  status_reason?: string;
   runner: {
     running: boolean;
     pid?: number;
@@ -423,7 +465,11 @@ export interface HealthResponse {
     api_responding: boolean;
     /// The PRIMARY's liveness verdict. Optional for older supervisors.
     liveness?: RunnerLivenessWire;
+    /// As on `runners[]`; `null` is UNKNOWN.
+    answered_this_boot?: boolean | null;
     last_seen_responding_at?: string | null;
+    /// As on `runners[]`. Optional for older supervisors.
+    spawn_up?: boolean;
   };
   ports: {
     api_port: { port: number; in_use: boolean };
@@ -460,35 +506,38 @@ export interface HealthResponse {
      * stays directly resolvable by git.
      */
     built_from_dirty?: boolean | null;
+    /**
+     * The attribution epoch this binary stamps on every dev-action snapshot.
+     * Absent = unknown: a build can stamp its snapshots and predate this field.
+     */
+    attribution_epoch?: number;
+    /**
+     * Dev-action snapshot delivery counters since this supervisor process
+     * started (`dev_action::ingest::IngestCounters`). Absent = a build that
+     * predates the delivery buffer, never "zero drops".
+     */
+    dev_action_ingest?: DevActionIngestCounters;
   };
   runners?: RunnerInstanceHealth[];
   originGuard?: OriginGuardWire;
 }
 
-export interface DevStartResponse {
-  status: string;
-  flag: string;
-  stdout: string;
-  stderr: string;
-  exit_code: number | null;
-}
-
-export interface LogFileResponse {
-  file: string;
-  type: string;
-  content: string;
-  lines: number;
-}
-
 /// 202 body returned by the detached rebuild paths
 /// (`/runner/restart {rebuild:true}`, `/runners/{id}/restart {rebuild:true}`,
-/// `/runners/{id}/rebuild-and-restart`). The build+restart runs detached; poll
+/// `/runners/{id}/rebuild-and-restart`, `/runner/rebuild-when-idle`,
+/// `/runner/fix-and-rebuild`). The build (+restart) runs detached; poll
 /// `build_id` via `GET /build/{id}/status` for the terminal outcome.
 export interface DetachedBuildResponse {
-  status: string; // "rebuilding" for the 202, "restarted" for the sync no-rebuild path
+  status: string; // 202: "submitted" from /runner/restart, "rebuilding" from /runners/{id}/restart and /runners/{id}/rebuild-and-restart, "watching" from /runner/rebuild-when-idle, "accepted" from /runner/fix-and-rebuild; "restarted" for the sync no-rebuild path
   build_id?: string;
   submission_id?: string;
   poll?: string;
+  /// Which tree the detached rebuild compiles (every route listed above).
+  /// `null` = no runner to build for (unknown id, no configured primary, or the
+  /// primary on `/runners/{id}/rebuild-and-restart`, which refuses it); never
+  /// `null` from rebuild-when-idle, which 404s instead, and always `live_tree`
+  /// from fix-and-rebuild.
+  build_source?: 'origin_main' | 'live_tree' | null;
   message?: string;
 }
 
@@ -635,65 +684,7 @@ export interface MessageResponse {
   message: string;
 }
 
-// Workflow Loop types
-export interface WorkflowLoopStatus {
-  running: boolean;
-  config: WorkflowLoopConfig | null;
-  current_iteration: number;
-  phase: string;
-  started_at: string | null;
-  error: string | null;
-  iteration_count: number;
-  restart_signaled: boolean;
-  build_task_run_id?: string | null;
-  execute_task_run_id?: string | null;
-}
-
-export interface Checkpoint {
-  step_index: number;
-  step_name: string;
-  status: string;
-  phase: string;
-  duration_ms: number | null;
-  error: string | null;
-  stage_index: number;
-}
-
-export interface WorkflowLoopConfig {
-  workflow_id?: string;
-  max_iterations: number;
-  exit_strategy?: { type: string; reflection_workflow_id?: string | null };
-  between_iterations: { type: string; rebuild?: boolean };
-  phases?: PipelinePhases;
-}
-
-export interface PipelinePhases {
-  build?: { description: string; context?: string };
-  execute_workflow_id?: string;
-  reflect: { reflection_workflow_id: string | null };
-  implement_fixes?: {
-    additional_context?: string;
-    timeout_secs?: number;
-  };
-}
-
-export interface IterationResult {
-  iteration: number;
-  started_at: string;
-  completed_at: string | null;
-  task_run_id: string | null;
-  exit_check: { should_exit: boolean; reason: string } | null;
-  generated_workflow_id?: string;
-  reflection_task_run_id?: string;
-  fix_count?: number;
-  fixes_implemented?: boolean;
-  rebuild_triggered?: boolean;
-}
-
-export interface WorkflowLoopHistory {
-  iterations: IterationResult[];
-}
-
+// Runner-direct workflow type
 export interface UnifiedWorkflow {
   id: string;
   name: string;
@@ -837,12 +828,7 @@ export interface VelocityImprovementHistory {
 //   - `server_mode`   -> the `Runner.server_mode` column was dropped as
 //                        unpopulated when WS became the sole dispatch transport
 //   - `restate_enabled` / `restate_healthy` -> never existed on this entity
-export type WebFleetDeviceStatus =
-  | 'healthy'
-  | 'degraded'
-  | 'offline'
-  | 'starting'
-  | 'errored';
+export type WebFleetDeviceStatus = 'healthy' | 'degraded' | 'offline' | 'starting' | 'errored';
 
 export interface WebFleetDevice {
   id: string;
@@ -1020,18 +1006,7 @@ export const api = {
   vtTrend: (limit?: number) =>
     fetchJson<VtTrendPoint[]>(`/velocity-tests/trend${limit ? `?limit=${limit}` : ''}`),
 
-  // Workflow Loop
-  wlStatus: () => fetchJson<WorkflowLoopStatus>('/workflow-loop/status'),
-  wlHistory: () => fetchJson<WorkflowLoopHistory>('/workflow-loop/history'),
-  wlStart: (config: Record<string, unknown>) =>
-    fetchJson<unknown>('/workflow-loop/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    }),
-  wlStop: () => fetchJson<unknown>('/workflow-loop/stop', { method: 'POST' }),
-  wlCheckpoints: (taskRunId: string) =>
-    fetchJson<{ checkpoints: Checkpoint[] }>(`/workflow-loop/checkpoints/${taskRunId}`),
+  // Workflow-loop's server routes were removed (c415c5f); this one call goes to the runner.
   wlWorkflows: () =>
     fetch('http://127.0.0.1:9876/unified-workflows')
       .then((r) => r.json())
@@ -1073,12 +1048,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({}),
     }),
-  devStartStatus: () =>
-    fetchJson<{
-      services: { name: string; port: number; available: boolean }[];
-    }>('/dev-start/status'),
-  devStartAction: (action: string) =>
-    fetchJson<DevStartResponse>(`/dev-start/${action}`, { method: 'POST' }),
   runnerStop: () => fetchJson<unknown>('/runner/stop', { method: 'POST' }),
   listRunners: () =>
     fetchJson<
@@ -1104,8 +1073,13 @@ export const api = {
         /// `GET /health`. Optional for an older supervisor; an absent verdict
         /// is unknown, never healthy.
         liveness?: RunnerLivenessWire;
+        /// Whether the API has answered during this boot; `null` is UNKNOWN.
+        answered_this_boot?: boolean | null;
         last_seen_responding_at?: string | null;
         port_open?: boolean;
+        /// The newest spawn is alive while the port is free and the API
+        /// silent (not bound yet): the runner is up, so no Start is offered.
+        spawn_up?: boolean;
       }[]
     >('/runners'),
   protectRunner: (id: string, isProtected: boolean) =>
@@ -1166,16 +1140,6 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(opts),
     }),
-  runnerFixAndRebuild: (prompt: string) =>
-    fetchJson<unknown>('/runner/fix-and-rebuild', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt }),
-    }),
-
-  // Logs
-  logFile: (type: string, tailLines?: number) =>
-    fetchJson<LogFileResponse>(`/logs/file/${type}${tailLines ? `?tail_lines=${tailLines}` : ''}`),
 
   // Runner Monitor (proxied to runner at port 9876)
   runnerHealth: () => fetchJson<Record<string, unknown>>('/runner-api/health'),

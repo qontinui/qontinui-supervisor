@@ -26,6 +26,7 @@
 //! whole-store lock.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
@@ -57,11 +58,26 @@ pub const ACTION_STORE_CAP: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionKind {
-    /// A primary-runner restart (`POST /runner/restart`).
+    /// A restart with no rebuild: `POST /runner/restart`,
+    /// `POST /runners/{id}/restart`, the serving watchdog's.
     Restart,
-    /// A temp/named runner spawn (`POST /runners/spawn-test` / `spawn-named`).
+    /// A [`Self::Restart`] that ran the last-known-good exe instead of the
+    /// freshest slot exe: the LKG route is a treatment, so its trials are kept
+    /// out of `restart`'s statistics, which would otherwise credit the LKG
+    /// exe's boots to "restart under these states" and settle the white-screen
+    /// rate at the routing threshold (the research record's theory §6.5,
+    /// performativity). Never minted directly: a restart is minted as
+    /// `restart`, before the door decides on the LKG exe, and re-keyed with
+    /// [`ActionRecord::rekey_restart_to_lkg`] once that start has run the LKG
+    /// exe (a refused or failed restart ran none and stays `restart`). Coord's
+    /// expectations are still fetched for `restart`.
+    RestartLkg,
+    /// A start of a runner that is down: `POST /runners/spawn-test` /
+    /// `spawn-named`, `POST /runners/{id}/start`, the crash watchdog's restart,
+    /// the boot auto-start.
     Spawn,
-    /// A live-tree rebuild (`POST /runner/fix-and-rebuild`).
+    /// A rebuild: `POST /runner/fix-and-rebuild`, `POST /runner/rebuild-when-idle`,
+    /// `POST /runners/{id}/rebuild-and-restart`, a `rebuild: true` restart.
     Build,
 }
 
@@ -71,10 +87,67 @@ impl ActionKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             ActionKind::Restart => "restart",
+            ActionKind::RestartLkg => "restart_lkg",
             ActionKind::Spawn => "spawn",
             ActionKind::Build => "build",
         }
     }
+
+    /// Every kind, for the tables keyed on one.
+    pub const ALL: [ActionKind; 4] = [
+        ActionKind::Restart,
+        ActionKind::RestartLkg,
+        ActionKind::Spawn,
+        ActionKind::Build,
+    ];
+
+    fn to_u8(self) -> u8 {
+        match self {
+            ActionKind::Restart => 0,
+            ActionKind::RestartLkg => 1,
+            ActionKind::Spawn => 2,
+            ActionKind::Build => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        Self::ALL[usize::from(value)]
+    }
+}
+
+/// An [`ActionRecord`]'s kind, which one door changes after the record is
+/// stored ([`ActionRecord::rekey_restart_to_lkg`]) while the attribution
+/// watcher holds the same `Arc`. An atomic rather than a lock: the value is
+/// one byte and every read is a copy.
+#[derive(Debug)]
+struct ActionKindCell(AtomicU8);
+
+impl ActionKindCell {
+    fn new(kind: ActionKind) -> Self {
+        Self(AtomicU8::new(kind.to_u8()))
+    }
+
+    fn get(&self) -> ActionKind {
+        ActionKind::from_u8(self.0.load(Ordering::Acquire))
+    }
+}
+
+impl Serialize for ActionKindCell {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.get().serialize(serializer)
+    }
+}
+
+/// What a mint served the initiator ([`ActionRecord::served`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServedAtMint {
+    /// The ACK's `predicted` array, as served (at most
+    /// [`crate::dev_action::expectations::ACK_PREDICTED_TOP_K`] rows).
+    pub predicted: Vec<crate::dev_action::expectations::PredictedSignature>,
+    /// The live rule's `route_lkg` advice
+    /// ([`crate::dev_action::policy::ActionRisk::route_lkg`]). Advice only: which
+    /// exe a restart actually ran is `use_lkg`, read off the kind at the stamp.
+    pub route_lkg: bool,
 }
 
 /// The recorded outcome of an action, folded in by the attribution watcher
@@ -163,7 +236,9 @@ impl ActionRunResult {
 #[derive(Debug, Serialize)]
 pub struct ActionRecord {
     pub action_id: Uuid,
-    pub kind: ActionKind,
+    /// Read it with [`Self::kind`]: a restart that ran the LKG exe is re-keyed
+    /// after it is stored ([`Self::rekey_restart_to_lkg`]).
+    kind: ActionKindCell,
     /// Caller identity (the existing `requester_id` already threaded through
     /// the spawn routes; `None` for callers that didn't supply one). Q8.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,6 +247,29 @@ pub struct ActionRecord {
     /// the snapshot stays small; the durable ledger (Phase 3) carries the full
     /// param set.
     pub params_digest: String,
+    /// coord's top-level `evidence_basis` for this action's kind and active
+    /// states at the mint ([`FetchedExpectations::basis`]). With `predicted: []`
+    /// it separates an answer with no rows (`prior_only`) from no answer at all
+    /// (`null`), which `risk: null` cannot.
+    ///
+    /// [`FetchedExpectations::basis`]: crate::dev_action::expectations::FetchedExpectations::basis
+    pub expectations_basis: Option<String>,
+    /// The `route_lkg` expected-loss shadow over coord's expectations at the
+    /// mint ([`crate::dev_action::policy::assess_route_lkg_shadow`]), stamped
+    /// into the snapshot's `metadata.route_lkg_shadow`. Set for a `restart`
+    /// whose expectations coord answered; `None` otherwise (another kind, or
+    /// no answer, which the shadow could not score).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_lkg_shadow: Option<crate::dev_action::policy::RouteLkgShadow>,
+    /// What the mint SERVED to the initiator: the ACK's `predicted` rows and
+    /// the live `route_lkg` verdict, stamped into the snapshot's
+    /// `metadata.served` beside `use_lkg` (plan
+    /// `2026-10-27-bayesian-consequence-model-for-the-dev-twin` Phase 5, S2).
+    /// Set by [`crate::dev_action::prepare_action`]; `None` for a record made
+    /// any other way, which then stamps no `served` block. Not part of this
+    /// record's own wire form (the ACK already carries both).
+    #[serde(skip)]
+    pub served: Option<ServedAtMint>,
     /// The dev-states evaluated `True` at action time. Stored as the typed
     /// shared [`DevState`] enum (Phase 2b) but serialized by canonical id via
     /// [`serialize_states_as_ids`] so the wire form stays an array of canonical
@@ -185,6 +283,14 @@ pub struct ActionRecord {
     #[serde(serialize_with = "serialize_states_as_ids")]
     pub states_unknown: Vec<DevState>,
     pub started_at: DateTime<Utc>,
+    /// The trial's start on the tokio clock (the commit, for a committed
+    /// trial), the one the attribution window's
+    /// deadlines run on. The window's tail cap is measured from it rather
+    /// than from the wall-clock [`Self::started_at`], so both ends of that
+    /// subtraction read the same clock (a paused test clock included). Not
+    /// part of the wire form.
+    #[serde(skip)]
+    pub started_instant: tokio::time::Instant,
     /// The folded outcome, or `None` while the attribution window is still
     /// open. Serializes inline as `outcome: null | {..}` via the custom
     /// serializer below (a bare `RwLock` is not `Serialize`).
@@ -199,7 +305,7 @@ pub struct ActionRecord {
     pub run_result: RwLock<Option<ActionRunResult>>,
     /// Signalled once when [`Self::record_run_result`] takes the first write, so
     /// the attribution watcher can wait for the action's real end instead of a
-    /// flat 30-second guess. Not part of the wire form.
+    /// flat guess. Not part of the wire form.
     #[serde(skip)]
     pub run_signal: tokio::sync::Notify,
 }
@@ -283,16 +389,46 @@ impl ActionRecord {
             .collect();
         Self {
             action_id: Uuid::new_v4(),
-            kind,
+            kind: ActionKindCell::new(kind),
             requester_id,
             params_digest,
+            expectations_basis: None,
+            route_lkg_shadow: None,
+            served: None,
             states_active,
             states_unknown,
             started_at: Utc::now(),
+            started_instant: tokio::time::Instant::now(),
             outcome: RwLock::new(None),
             run_result: RwLock::new(None),
             run_signal: tokio::sync::Notify::new(),
         }
+    }
+
+    /// The action's kind as it is now: the minted kind, or
+    /// [`ActionKind::RestartLkg`] once [`Self::rekey_restart_to_lkg`] took.
+    pub fn kind(&self) -> ActionKind {
+        self.kind.get()
+    }
+
+    /// Re-key a `restart` to [`ActionKind::RestartLkg`], for the door that
+    /// pointed the restart's start at the last-known-good exe, once that start
+    /// has run. Call it before recording the action's run result: the
+    /// attribution watcher's window closes only after that result, and it
+    /// reads the kind when it ingests the snapshot at window close, so it sees
+    /// the treatment the restart ran under. Only a `restart` is re-keyed: returns `true` when this call
+    /// changed the kind, `false` for any other kind (a `restart_lkg` already
+    /// re-keyed included).
+    pub fn rekey_restart_to_lkg(&self) -> bool {
+        self.kind
+            .0
+            .compare_exchange(
+                ActionKind::Restart.to_u8(),
+                ActionKind::RestartLkg.to_u8(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Record the action's terminal result. **First write wins**: an action has
@@ -327,6 +463,53 @@ impl ActionRecord {
             Ok(guard) => guard.clone(),
             Err(_) => None,
         }
+    }
+}
+
+/// The reason token a [`RunResultGuard`] records when the future that owned it
+/// ended with no terminal result. Not `spawn_abandoned`, which already names
+/// spawn-test's answered shutdown (`routes::runners::spawn_abandoned_body`).
+pub const ACTION_ABANDONED: &str = "action_abandoned";
+
+/// Records `Errored { "action_abandoned: <context>" }` on its action when it is
+/// dropped, so a minted action whose executing future ends with no terminal
+/// result (a panic in the exec task, a handler future dropped when its client
+/// disconnects) still closes on a recorded result instead of its backstop.
+///
+/// [`ActionRecord::record_run_result`] is first-write-wins, so once the
+/// executing path has recorded its own result the guard's write loses and
+/// changes nothing: there is no disarm. Hand the guard to whatever records last
+/// (the detached health wait, when the verdict is deferred to it) so it drops
+/// after that write. It reaches the ledger as `Failure` with the reason as its
+/// evidence, which coord can discount; dropping the minted row instead would
+/// be a silent absence. Modelled on `SpawnInFlightGuard`.
+#[must_use = "a guard dropped at once records the action abandoned"]
+pub struct RunResultGuard {
+    record: Arc<ActionRecord>,
+    context: &'static str,
+}
+
+impl RunResultGuard {
+    /// Arm a guard over `record`. `context` names the future it guards, for
+    /// the reason it records.
+    pub fn arm(record: Arc<ActionRecord>, context: &'static str) -> Self {
+        Self { record, context }
+    }
+
+    /// The action this guard covers.
+    pub fn record(&self) -> &Arc<ActionRecord> {
+        &self.record
+    }
+}
+
+impl Drop for RunResultGuard {
+    fn drop(&mut self) {
+        self.record.record_run_result(ActionRunResult::Errored {
+            reason: format!(
+                "{ACTION_ABANDONED}: {} ended with no terminal result",
+                self.context
+            ),
+        });
     }
 }
 
@@ -451,6 +634,38 @@ mod tests {
         }
     }
 
+    /// T1-6. A guard dropped with no result recorded records the action
+    /// abandoned; one dropped after the executing path recorded leaves that
+    /// result alone (first write wins).
+    #[test]
+    fn a_dropped_run_result_guard_records_abandoned_and_never_overwrites() {
+        let abandoned = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "p".to_string(),
+            &[],
+        ));
+        drop(RunResultGuard::arm(abandoned.clone(), "the test future"));
+        match abandoned.run_result() {
+            Some(ActionRunResult::Errored { reason }) => {
+                assert!(reason.contains(ACTION_ABANDONED), "{reason}");
+                assert!(reason.contains("the test future"), "{reason}");
+            }
+            other => panic!("an armed guard dropped must record abandoned, got {other:?}"),
+        }
+
+        let ran = Arc::new(ActionRecord::new(
+            ActionKind::Spawn,
+            None,
+            "p".to_string(),
+            &[],
+        ));
+        let guard = RunResultGuard::arm(ran.clone(), "the test future");
+        assert!(guard.record().record_run_result(ActionRunResult::Ran));
+        drop(guard);
+        assert_eq!(ran.run_result(), Some(ActionRunResult::Ran));
+    }
+
     /// The record's wire form gains `run_result` — `null` while the action has
     /// not reported, then the internally-tagged variant.
     #[test]
@@ -474,9 +689,43 @@ mod tests {
 
     #[test]
     fn action_kind_as_str_matches_serde_wire_form() {
-        for kind in [ActionKind::Restart, ActionKind::Spawn, ActionKind::Build] {
+        for kind in ActionKind::ALL {
             let json = serde_json::to_string(&kind).expect("serialize");
             assert_eq!(json, format!("\"{}\"", kind.as_str()));
+        }
+        assert_eq!(ActionKind::RestartLkg.as_str(), "restart_lkg");
+    }
+
+    /// The byte the kind cell stores maps back to the same kind for every
+    /// kind, so a re-key or a new variant cannot read back as another kind.
+    #[test]
+    fn every_kind_round_trips_through_the_cell() {
+        for kind in ActionKind::ALL {
+            assert_eq!(ActionKind::from_u8(kind.to_u8()), kind);
+            assert_eq!(ActionKindCell::new(kind).get(), kind);
+        }
+    }
+
+    /// Only a `restart` is re-keyed to `restart_lkg`, once, and the stored
+    /// record reads and serializes the new kind afterwards; a spawn or a build
+    /// pointed at the LKG exe keeps its kind.
+    #[test]
+    fn rekey_turns_a_restart_into_restart_lkg_and_nothing_else() {
+        let restart = ActionRecord::new(ActionKind::Restart, None, "p".to_string(), &[]);
+        assert!(restart.rekey_restart_to_lkg(), "a restart is re-keyed");
+        assert_eq!(restart.kind(), ActionKind::RestartLkg);
+        assert!(
+            !restart.rekey_restart_to_lkg(),
+            "a second re-key changes nothing"
+        );
+        assert_eq!(restart.kind(), ActionKind::RestartLkg);
+        let v = serde_json::to_value(&restart).expect("serialize");
+        assert_eq!(v["kind"], "restart_lkg");
+
+        for kind in [ActionKind::Spawn, ActionKind::Build] {
+            let other = ActionRecord::new(kind, None, "p".to_string(), &[]);
+            assert!(!other.rekey_restart_to_lkg(), "{kind:?} is not re-keyed");
+            assert_eq!(other.kind(), kind);
         }
     }
 
@@ -516,6 +765,12 @@ mod tests {
         // states_active is the canonical-id array, NOT variant names.
         assert_eq!(json["states_active"], serde_json::json!(["LKG_STALE"]));
         assert_eq!(json["states_unknown"], serde_json::json!(["DIST_STALE"]));
+        // Served even before a mint set it: an absent key would have to be
+        // interpreted, and `null` is the UNKNOWN it means.
+        assert_eq!(
+            json.get("expectations_basis"),
+            Some(&serde_json::Value::Null)
+        );
 
         // Fold a Contradiction outcome and confirm the snake_case category +
         // canonical signature strings are preserved on the wire.

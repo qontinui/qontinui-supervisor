@@ -71,6 +71,15 @@ pub struct RecentCrashSummary {
     pub panic_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<String>,
+    /// The pid of the process that wrote the dump: the CRASHED process, not
+    /// the one reporting it (a runner reports the dump it found at startup,
+    /// so the reporter is always a later process). `None` from a runner that
+    /// does not emit it yet (plan
+    /// `2026-11-03-supervisor-dev-action-residuals-coord-resolvers-restart-door-and-pre-fix-ledger-rows`
+    /// Phase 6). When present, the attribution watcher keys a crash to a
+    /// spawn on it (`dev_action::attribution::is_crash_of_spawn`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 /// Raw /health response body shape we care about. Uses `serde(default)` so
@@ -87,7 +96,9 @@ struct RunnerHealthBody {
     #[serde(default)]
     recent_crash: Option<RecentCrashSummary>,
     /// `/health.embeddingService` — one of the inputs that can produce
-    /// `derived_status: "degraded"`.
+    /// `derived_status: "degraded"`. Top-level form; the runner actually
+    /// publishes it under `data` (see [`RunnerHealthData`]) — read through
+    /// [`RunnerHealthBody::embedding_service`].
     #[serde(default, rename = "embeddingService")]
     embedding_service: Option<ReachableFlag>,
     /// `/health.database` — bounded PG liveness, another degraded input.
@@ -98,6 +109,102 @@ struct RunnerHealthBody {
     /// web-integration disabled), which is not a fault.
     #[serde(default, rename = "webIntegration")]
     web_integration: Option<WebIntegrationSummary>,
+    /// `/health.frontendReady` — whether the runner's WebView frontend mounted
+    /// and is answering. A runner whose binary embedded the dev PLACEHOLDER
+    /// frontend reports `false` here while its API answers 2xx (plan
+    /// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`).
+    /// Read here AND under `data` (see [`RunnerHealthData`]): the runner
+    /// publishes it only inside its `data` envelope today.
+    #[serde(default, rename = "frontendReady")]
+    frontend_ready: Option<bool>,
+    /// `/health.frontendState` — WHY `frontendReady` is what it is
+    /// (e.g. `window_not_visible`). Same two locations as `frontend_ready`.
+    #[serde(default, rename = "frontendState")]
+    frontend_state: Option<String>,
+    /// The runner's `data` envelope. Only the fields this supervisor reads
+    /// from it are modelled; everything else is ignored.
+    #[serde(default)]
+    data: Option<RunnerHealthData>,
+}
+
+/// The subset of the runner's `/health.data` envelope read here.
+///
+/// The runner publishes every one of these ONLY inside `data` (qontinui-runner
+/// `src-tauri/src/mcp_api.rs`, the `data` object built at :1428 and wrapped at
+/// :1901, as of origin/main b58a81dce); its top level mirrors only
+/// `derived_status` / `ui_error` / `recent_crash`. Reading them at the top level
+/// alone meant `degraded_reason` never named a cause on a real runner.
+#[derive(Debug, Default, Deserialize)]
+struct RunnerHealthData {
+    #[serde(default, rename = "frontendReady")]
+    frontend_ready: Option<bool>,
+    #[serde(default, rename = "frontendState")]
+    frontend_state: Option<String>,
+    #[serde(default, rename = "embeddingService")]
+    embedding_service: Option<ReachableFlag>,
+    #[serde(default)]
+    database: Option<ReachableFlag>,
+    #[serde(default, rename = "webIntegration")]
+    web_integration: Option<WebIntegrationSummary>,
+}
+
+impl RunnerHealthBody {
+    /// `embeddingService`, preferring a top-level block over the `data` one.
+    fn embedding_service(&self) -> Option<&ReachableFlag> {
+        self.embedding_service.as_ref().or_else(|| {
+            self.data
+                .as_ref()
+                .and_then(|d| d.embedding_service.as_ref())
+        })
+    }
+
+    /// `database`, preferring a top-level block over the `data` one.
+    fn database(&self) -> Option<&ReachableFlag> {
+        self.database
+            .as_ref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.database.as_ref()))
+    }
+
+    /// `webIntegration`, preferring a top-level block over the `data` one.
+    fn web_integration(&self) -> Option<&WebIntegrationSummary> {
+        self.web_integration
+            .as_ref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.web_integration.as_ref()))
+    }
+
+    /// `frontendReady`, preferring a top-level value over the `data` one.
+    fn frontend_ready(&self) -> Option<bool> {
+        self.frontend_ready
+            .or_else(|| self.data.as_ref().and_then(|d| d.frontend_ready))
+    }
+
+    /// `frontendState`, preferring a top-level value over the `data` one.
+    fn frontend_state(&self) -> Option<&str> {
+        self.frontend_state
+            .as_deref()
+            .or_else(|| self.data.as_ref().and_then(|d| d.frontend_state.as_deref()))
+    }
+}
+
+/// The reason text for a runner that self-reported `derived_status: "errored"`.
+///
+/// A bare "derived_status=errored" hid the one fact that mattered on
+/// 2026-10-05: the runner was serving a PLACEHOLDER frontend
+/// (`frontendReady: false`, `frontendState: "window_not_visible"`). When the
+/// body says the frontend is not ready, name it. This changes only the reason,
+/// never which status is derived.
+fn errored_reason(body: &RunnerHealthBody) -> String {
+    let base = "runner reported derived_status=errored";
+    if body.frontend_ready() == Some(false) {
+        return match body.frontend_state() {
+            Some(st) if !st.trim().is_empty() => format!(
+                "{base}; frontend not ready (frontendState={})",
+                truncate_reason(st.trim(), 80)
+            ),
+            _ => format!("{base}; frontend not ready"),
+        };
+    }
+    base.to_string()
 }
 
 /// A `{ "reachable": bool|null }` sub-object on `/health`.
@@ -131,13 +238,13 @@ struct WebIntegrationSummary {
 fn degraded_reason(body: &RunnerHealthBody) -> String {
     let mut causes: Vec<String> = Vec::new();
 
-    if body.embedding_service.as_ref().and_then(|f| f.reachable) == Some(false) {
+    if body.embedding_service().and_then(|f| f.reachable) == Some(false) {
         causes.push("embedding service unreachable".to_string());
     }
-    if body.database.as_ref().and_then(|f| f.reachable) == Some(false) {
+    if body.database().and_then(|f| f.reachable) == Some(false) {
         causes.push("database unreachable".to_string());
     }
-    if let Some(wi) = body.web_integration.as_ref() {
+    if let Some(wi) = body.web_integration() {
         // Only `Some(false)` is a fault. `None` means no relay is expected.
         if wi.connected == Some(false) {
             causes.push(match wi.last_error.as_deref() {
@@ -164,6 +271,14 @@ fn degraded_reason(body: &RunnerHealthBody) -> String {
 pub struct CachedPortHealth {
     pub runner_port_open: bool,
     pub runner_responding: bool,
+    /// Whether the runner's newest spawn is its current one and its pid is
+    /// alive (`manager::newest_spawn_is_up`), observed on this tick. Measured
+    /// only when the API is silent AND the port is free (the one shape where it
+    /// decides anything, and the only one that pays the process query);
+    /// `false` otherwise. The third input to `RunnerState::liveness`, so a
+    /// reader of this cache cannot disagree with the tick about a live spawn
+    /// that has not bound its port.
+    pub spawn_up: bool,
 }
 
 /// Cached per-runner health snapshot, built by the background refresher.
@@ -200,6 +315,11 @@ pub struct CachedRunnerHealth {
     /// pid: null` about a live process it could see holding the port in the
     /// same document. **Render this field, not `running`.**
     pub liveness: crate::state::RunnerLiveness,
+    /// [`crate::state::RunnerState::answered_this_boot`] on this tick: whether
+    /// the API has answered since this boot's `started_at`. `None` = UNKNOWN
+    /// (no boot recorded), never `false`. Beside `liveness` because a `wedged`
+    /// verdict reads the never-cleared stamp, which may be a previous boot's.
+    pub answered_this_boot: Option<bool>,
     /// When the API was last seen responding — `None` if never seen.
     /// Gives "unresponsive since T" an actual T to show.
     pub last_seen_responding_at: Option<DateTime<Utc>>,
@@ -208,6 +328,140 @@ pub struct CachedRunnerHealth {
     /// sync SSE path can publish the derivation alongside the verdict without
     /// re-probing (it has no access to the per-runner `cached_health` lock).
     pub port_open: bool,
+    /// [`CachedPortHealth::spawn_up`] on this tick: the newest spawn is alive
+    /// while the port is free and the API silent. The third input `liveness`
+    /// is derived from.
+    pub spawn_up: bool,
+    /// The runner's own `/health` `frontendReady` on this tick. `None` =
+    /// UNKNOWN (API not answering, body unparseable, or a runner too old to
+    /// publish it) — never read as ready.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_ready: Option<bool>,
+    /// The runner's own `/health` `frontendState` on this tick (why
+    /// `frontendReady` is what it is, e.g. `window_not_visible`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_state: Option<String>,
+    /// When this supervisor FIRST observed `frontendReady == false` in the
+    /// current run for the current pid (UNKNOWN ticks pause the run rather than
+    /// end it). `None` when there is no run. See [`next_frontend_run`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frontend_not_ready_since: Option<DateTime<Utc>>,
+}
+
+/// How long a run of `frontendReady == false` observations survives a
+/// continuous stretch of UNKNOWN ticks (no parseable `/health` body, or a body
+/// with no `frontendReady`) before it is dropped.
+///
+/// UNKNOWN must not END a run on its own: the body fetch has a 3 s timeout and
+/// this fleet has measured the runner's `/health` at up to ~10 s under load, so
+/// a runner that is really stuck on a placeholder frontend would otherwise be
+/// reset by every slow read and never reach the grace. 60 s is 30 refresher
+/// ticks (2 s each) and six times the slowest measured `/health` — long enough
+/// to ride out load, short enough that a run is not carried across a
+/// genuinely unobserved minute. The duration reported still includes such
+/// gaps; nothing in them is evidence of readiness.
+pub(crate) const FRONTEND_RUN_UNKNOWN_GAP_CAP_SECS: i64 = 60;
+
+/// One runner's current run of `frontendReady == false` observations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FrontendRun {
+    /// First `false` observation of the run.
+    pub since: DateTime<Utc>,
+    /// The pid the run was observed on; a different pid starts over.
+    pub pid: Option<u32>,
+    /// Start of the current stretch of UNKNOWN ticks, if in one.
+    pub unknown_since: Option<DateTime<Utc>>,
+    /// The last `frontendState` a `false` observation carried, so an UNKNOWN
+    /// tick can still name it.
+    pub last_state: Option<String>,
+}
+
+/// Advance a runner's frontend run by one tick.
+///
+/// - `Some(false)`: continue the run (same pid) or start one at `now`
+///   (no run, or a new pid = the runner was restarted); clears any UNKNOWN gap.
+/// - `Some(true)`: the frontend is ready; the run ends.
+/// - `None` (UNKNOWN): PAUSES the run. It survives unless the pid changed or
+///   the UNKNOWN stretch has lasted [`FRONTEND_RUN_UNKNOWN_GAP_CAP_SECS`]. No
+///   run is ever STARTED by an UNKNOWN tick.
+pub(crate) fn next_frontend_run(
+    prev: Option<&FrontendRun>,
+    frontend_ready: Option<bool>,
+    frontend_state: Option<&str>,
+    pid: Option<u32>,
+    now: DateTime<Utc>,
+) -> Option<FrontendRun> {
+    match frontend_ready {
+        Some(true) => None,
+        Some(false) => {
+            let since = match prev {
+                Some(r) if r.pid == pid => r.since,
+                _ => now,
+            };
+            Some(FrontendRun {
+                since,
+                pid,
+                unknown_since: None,
+                last_state: frontend_state.map(str::to_string).or_else(|| {
+                    prev.filter(|r| r.pid == pid)
+                        .and_then(|r| r.last_state.clone())
+                }),
+            })
+        }
+        None => {
+            let r = prev?;
+            if r.pid != pid {
+                return None;
+            }
+            let unknown_since = r.unknown_since.unwrap_or(now);
+            if (now - unknown_since).num_seconds() >= FRONTEND_RUN_UNKNOWN_GAP_CAP_SECS {
+                return None;
+            }
+            Some(FrontendRun {
+                unknown_since: Some(unknown_since),
+                ..r.clone()
+            })
+        }
+    }
+}
+
+/// The refresher's per-runner map of [`FrontendRun`]s.
+#[derive(Debug, Default)]
+pub(crate) struct FrontendRunTracker {
+    runs: std::collections::HashMap<String, FrontendRun>,
+}
+
+impl FrontendRunTracker {
+    /// Feed one tick's observation for runner `id`; returns the run after it.
+    pub(crate) fn observe(
+        &mut self,
+        id: &str,
+        frontend_ready: Option<bool>,
+        frontend_state: Option<&str>,
+        pid: Option<u32>,
+        now: DateTime<Utc>,
+    ) -> Option<FrontendRun> {
+        let next = next_frontend_run(self.runs.get(id), frontend_ready, frontend_state, pid, now);
+        match &next {
+            Some(run) => {
+                self.runs.insert(id.to_string(), run.clone());
+            }
+            None => {
+                self.runs.remove(id);
+            }
+        }
+        next
+    }
+
+    /// Drop runs for runners no longer in the registry.
+    pub(crate) fn retain_ids<'a>(&mut self, mut live: impl FnMut(&str) -> bool + 'a) {
+        self.runs.retain(|id, _| live(id));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 /// Truncate a string to at most `max_chars` chars, adding an ellipsis marker
@@ -227,7 +481,7 @@ fn truncate_reason(s: &str, max_chars: usize) -> String {
 /// endpoint is unreachable, the body fails to parse, or the request times
 /// out — callers treat that as "no signal" and fall back to port-level state.
 async fn fetch_runner_health_body(port: u16) -> Option<RunnerHealthBody> {
-    let url = format!("http://127.0.0.1:{}/health", port);
+    let url = format!("{}/health", crate::loopback::runner_loopback_base(port));
     let client = reqwest::Client::builder()
         .timeout(StdDuration::from_secs(3))
         .build()
@@ -293,7 +547,7 @@ fn derive_runner_status(
         if let Some(ds) = body.derived_status.as_deref() {
             if ds.eq_ignore_ascii_case("errored") {
                 return RunnerStatus::Errored {
-                    reason: "runner reported derived_status=errored".to_string(),
+                    reason: errored_reason(body),
                 };
             }
             if ds.eq_ignore_ascii_case("degraded") {
@@ -341,6 +595,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
         // state any consumer should read.
         let mut unresponsive_ticks: std::collections::HashMap<String, u32> =
             std::collections::HashMap::new();
+        // Per-runner run of `frontendReady == false` — see `next_frontend_run`.
+        let mut frontend_runs = FrontendRunTracker::default();
         loop {
             // Wait for either the periodic tick or an immediate refresh notification
             tokio::select! {
@@ -364,11 +620,34 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 let is_primary = kind.is_primary();
 
                 let runner_port_open = port::is_port_listening(runner_port);
+                // Dated BEFORE the probe is issued, and that is the instant an
+                // answer is stamped with below. A probe in flight across a
+                // restart can be answered by the OLD process; stamped after it
+                // returned, that answer would date after the new spawn's
+                // `started_at` and read as this boot's (`answered_this_boot`).
+                // Dated at issue, it dates before the spawn. The cost is that
+                // the stamp is early by at most one probe (3 s timeout).
+                let probe_issued_at = Utc::now();
                 let runner_responding = port::is_runner_responding(runner_port).await;
+
+                // A spawn alive with its port free: a runner hung (or slow)
+                // before its listener binds. Read off the spawn ring, not
+                // `running`, which the tick below lowers from the probe for a
+                // user-managed runner.
+                let spawn_up = if !runner_responding && !runner_port_open {
+                    let started_at = managed.runner.read().await.started_at;
+                    crate::process::manager::newest_spawn_is_up(
+                        started_at,
+                        &*managed.recent_spawns.read().await,
+                    )
+                } else {
+                    false
+                };
 
                 let new_health = CachedPortHealth {
                     runner_port_open,
                     runner_responding,
+                    spawn_up,
                 };
 
                 // 3b — record WHEN it was last seen responding, so the three
@@ -388,7 +667,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // with that flag and is a pure observation of what answered.
                 if runner_responding {
                     let mut runner_state = managed.runner.write().await;
-                    runner_state.last_seen_responding_at = Some(Utc::now());
+                    runner_state.last_seen_responding_at = Some(probe_issued_at);
                 }
 
                 // For user-managed runners (not temp, not named), the supervisor only
@@ -424,8 +703,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         // one is UNKNOWN, and so is this one.
                         //
                         // `pid` is now cleared only on positive evidence of
-                        // absence: the port is closed AND the API is silent.
-                        if !runner_responding && !runner_port_open {
+                        // absence: the port is closed, the API is silent, AND
+                        // the newest spawn is not alive. A spawn that has not
+                        // bound its port yet keeps its pid.
+                        if !runner_responding && !runner_port_open && !spawn_up {
                             runner_state.pid = None;
                         }
 
@@ -520,7 +801,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 // and still escalated; they just say what they are.
                 let liveness_now = {
                     let runner_state = managed.runner.read().await;
-                    runner_state.liveness(runner_port_open, runner_responding)
+                    runner_state.liveness(runner_port_open, runner_responding, spawn_up)
                 };
                 let escalating = runner_port_open
                     && matches!(
@@ -545,23 +826,52 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     // make the effective threshold floor 330 s whatever the
                     // operator configured, so the 60 s clamp floor would be
                     // unreachable. The ALERT keeps `should_escalate`'s slower
-                    // cadence, which is passed in rather than recomputed.
-                    if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
+                    // cadence, which is passed in rather than recomputed, with the
+                    // one exception `maybe_serving_restart` names.
+                    let serving_decision = if *ticks >= UNRESPONSIVE_ESCALATION_TICKS {
                         crate::process::manager::maybe_serving_restart(
                             &state,
                             managed,
                             liveness_now,
                             should_escalate,
                         )
-                        .await;
-                    }
+                        .await
+                    } else {
+                        None
+                    };
+                    let serving_clause =
+                        crate::process::manager::serving_decision_clause(serving_decision);
 
                     if should_escalate {
-                        let (pid, since) = {
+                        let (pid, since, started_at) = {
                             let runner_state = managed.runner.read().await;
-                            (runner_state.pid, runner_state.last_seen_responding_at)
+                            (
+                                runner_state.pid,
+                                runner_state.last_seen_responding_at,
+                                runner_state.started_at,
+                            )
                         };
-                        if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
+                        let answered_this_spawn =
+                            crate::process::manager::answered_during_spawn(since, started_at);
+                        if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_))
+                            && !answered_this_spawn
+                        {
+                            // The stamp is a previous boot's: this spawn has held
+                            // its port and never answered. Liveness still reads
+                            // wedged, but "it stopped answering" would be false.
+                            tracing::warn!(
+                                runner_id = %runner_id,
+                                port = runner_port,
+                                pid = ?pid,
+                                started_at = ?started_at,
+                                last_seen_responding_at = ?since,
+                                silent_for_secs = (*ticks * 2),
+                                "Runner has held port {} for {}s and has NEVER answered its HTTP API during this spawn (an earlier boot last answered). Liveness reads wedged because that stamp survives a restart; most likely a start that has not finished. {}.",
+                                runner_port,
+                                *ticks * 2,
+                                serving_clause
+                            );
+                        } else if matches!(liveness_now, RunnerLiveness::UnresponsiveSince(_)) {
                             tracing::error!(
                                 runner_id = %runner_id,
                                 port = runner_port,
@@ -570,17 +880,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                                 unresponsive_for_secs = (*ticks * 2),
                                 "RUNNER WEDGED: port is held but the HTTP API has not answered \
                                  for {}s. The process is ALIVE and not responding — this is not \
-                                 a stopped runner. Not restarting ({}); capture a thread dump \
-                                 before any manual restart.",
+                                 a stopped runner. {}. Capture a thread dump before any manual \
+                                 restart.",
                                 *ticks * 2,
-                                if is_supervisor_managed {
-                                    "a wedge is not an exit, so the crash-only watchdog does not \
-                                     cover it, and a restart destroys the in-flight work and the \
-                                     evidence"
-                                } else {
-                                    "user-managed runners are observed only, and a restart \
-                                     destroys in-flight sessions"
-                                }
+                                serving_clause
                             );
                             state
                                 .logs
@@ -601,10 +904,10 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         } else {
                             // Port held, and it has NEVER been seen answering.
                             // Not a wedge (there is no "since" — nothing has
-                            // been lost yet) and not stopped either. A start
-                            // that never binds its API is what the
-                            // first-healthy watchdog exists for, and a runner
-                            // stuck in PG bootstrap looks exactly like this.
+                            // been lost yet) and not stopped either. The
+                            // first-healthy watchdog covers a temp or named
+                            // runner here; it has stood down for a primary. A
+                            // runner stuck in PG bootstrap looks exactly like this.
                             tracing::warn!(
                                 runner_id = %runner_id,
                                 port = runner_port,
@@ -638,9 +941,16 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                         }
                     }
                 } else {
-                    // Port not held either — that is a stopped runner,
-                    // not a wedge. Different condition, different signal.
+                    // Port not held either — a stopped runner, not a wedge.
+                    // Different condition, different signal. Unless the newest
+                    // spawn is still alive and has not answered: a user-managed
+                    // runner hung before its listener binds looks like this, and
+                    // no other watchdog reports it (the first-healthy watchdog
+                    // covers temp and named runners, whose `running` is latched).
                     unresponsive_ticks.remove(runner_id);
+                    if !is_supervisor_managed {
+                        crate::process::manager::maybe_alert_prebind_hang(&state, managed).await;
+                    }
                 }
 
                 // If the runner's TCP port is responsive, GET its /health to
@@ -670,11 +980,27 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
 
                 // Build runner snapshot for SSE consumers
                 let runner_state = managed.runner.read().await;
+                // A live spawn that has not bound its port is starting, not
+                // offline, whatever the lowered `running` says.
                 let derived_status = derive_runner_status(
-                    runner_state.running,
+                    runner_state.running || spawn_up,
                     runner_responding,
                     health_body.as_ref(),
                 );
+                let frontend_ready = health_body.as_ref().and_then(|b| b.frontend_ready());
+                let frontend_state = health_body
+                    .as_ref()
+                    .and_then(|b| b.frontend_state().map(str::to_string));
+                let frontend_run = frontend_runs.observe(
+                    &managed.config.id,
+                    frontend_ready,
+                    frontend_state.as_deref(),
+                    runner_state.pid,
+                    Utc::now(),
+                );
+                // An UNKNOWN tick inside a run still names the last state seen.
+                let frontend_state = frontend_state
+                    .or_else(|| frontend_run.as_ref().and_then(|r| r.last_state.clone()));
                 runner_snapshots.push(CachedRunnerHealth {
                     id: managed.config.id.clone(),
                     name: managed.config.name.clone(),
@@ -689,9 +1015,14 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                     watchdog,
                     // Phase 3b — classified from the SAME tick's live listener
                     // probe, never from a remembered or assumed port state.
-                    liveness: runner_state.liveness(runner_port_open, runner_responding),
+                    liveness: runner_state.liveness(runner_port_open, runner_responding, spawn_up),
+                    answered_this_boot: runner_state.answered_this_boot(),
                     last_seen_responding_at: runner_state.last_seen_responding_at,
                     port_open: runner_port_open,
+                    spawn_up,
+                    frontend_ready,
+                    frontend_state,
+                    frontend_not_ready_since: frontend_run.map(|r| r.since),
                 });
                 drop(runner_state);
 
@@ -711,6 +1042,7 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
             // box that spawns temp runners all day. Drop whatever is no longer
             // in the registry: this is per-tick bookkeeping, not state.
             unresponsive_ticks.retain(|id, _| runners.iter().any(|m| &m.config.id == id));
+            frontend_runs.retain_ids(|id| runners.iter().any(|m| m.config.id == id));
 
             // If no runners exist, check legacy ports
             if runners.is_empty() {
@@ -719,6 +1051,8 @@ pub fn spawn_health_cache_refresher(state: Arc<SupervisorState>) -> tokio::task:
                 primary_health = CachedPortHealth {
                     runner_port_open: port::is_port_listening(runner_port),
                     runner_responding: port::is_runner_responding(runner_port).await,
+                    // No registry entry, so no spawn ring to read.
+                    spawn_up: false,
                 };
             }
 
@@ -763,6 +1097,34 @@ mod tests {
     /// `lastError`) rather than a hand-built struct that could drift.
     fn body(json: &str) -> RunnerHealthBody {
         serde_json::from_str(json).expect("health body must parse")
+    }
+
+    /// The REAL runner shape (qontinui-runner origin/main b58a81dce,
+    /// `src-tauri/src/mcp_api.rs`): `embeddingService` / `webIntegration` /
+    /// `database` exist only inside `data`; the top level mirrors only
+    /// `derived_status`. The reason must still name every cause.
+    #[test]
+    fn degraded_reason_names_causes_published_only_under_data() {
+        let b = body(
+            r#"{"success":true,
+                "data":{"status":"degraded",
+                        "embeddingService":{"reachable":false,"url":"http://127.0.0.1:8001"},
+                        "webIntegration":{"relayExpected":true,"connected":false,
+                                          "lastError":"401 Unauthorized"},
+                        "database":{"reachable":false,"arm":"external"},
+                        "derived_status":"degraded"},
+                "derived_status":"degraded"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Degraded { reason } => {
+                assert_eq!(
+                    reason,
+                    "runner degraded: embedding service unreachable; database unreachable; \
+                     backend relay down (401 Unauthorized)"
+                );
+            }
+            other => panic!("expected Degraded, got {:?}", other),
+        }
     }
 
     #[test]
@@ -855,6 +1217,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
+            spawn_up: false,
         };
         let cloned = health.clone();
         assert!(cloned.runner_port_open);
@@ -866,6 +1229,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: false,
+            spawn_up: false,
         };
         let debug_str = format!("{:?}", health);
         assert!(debug_str.contains("runner_port_open: true"));
@@ -877,6 +1241,7 @@ mod tests {
         let health = CachedPortHealth {
             runner_port_open: true,
             runner_responding: true,
+            spawn_up: false,
         };
         assert!(health.runner_port_open);
         assert!(health.runner_responding);
@@ -959,6 +1324,176 @@ mod tests {
         assert!(matches!(status, RunnerStatus::Errored { .. }));
     }
 
+    /// The 2026-10-05 shape: a runner serving the PLACEHOLDER frontend
+    /// answers 2xx with `frontendReady: false` inside its `data` envelope
+    /// (where the runner actually publishes it) and `derived_status: "errored"`
+    /// at the top level. The reason must name the frontend state.
+    #[test]
+    fn test_derive_runner_status_errored_names_frontend_state_from_data_envelope() {
+        let b = body(
+            r#"{"success":true,
+                "data":{"status":"ok","frontendReady":false,
+                        "frontendState":"window_not_visible",
+                        "derived_status":"errored"},
+                "derived_status":"errored"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert!(reason.contains("derived_status=errored"), "{reason}");
+                assert!(reason.contains("frontend not ready"), "{reason}");
+                assert!(reason.contains("window_not_visible"), "{reason}");
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// Same, with the fields at the top level (the camelCase names the brief
+    /// observed) — accepted too, so either placement names the frontend.
+    #[test]
+    fn test_derive_runner_status_errored_names_frontend_state_top_level() {
+        let b = body(
+            r#"{"frontendReady":false,"frontendState":"window_not_visible",
+                "derived_status":"errored"}"#,
+        );
+        assert_eq!(b.frontend_ready(), Some(false));
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert_eq!(
+                    reason,
+                    "runner reported derived_status=errored; frontend not ready \
+                     (frontendState=window_not_visible)"
+                );
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// A ready frontend adds nothing, and the status derived is unchanged.
+    #[test]
+    fn test_derive_runner_status_errored_reason_unchanged_when_frontend_ready() {
+        let b = body(
+            r#"{"data":{"frontendReady":true,"frontendState":"ready"},
+                "derived_status":"errored"}"#,
+        );
+        match derive_runner_status(true, true, Some(&b)) {
+            RunnerStatus::Errored { reason } => {
+                assert_eq!(reason, "runner reported derived_status=errored");
+            }
+            other => panic!("expected Errored, got {:?}", other),
+        }
+    }
+
+    /// `frontendReady: false` on a runner that does NOT say errored must not
+    /// change the derived status — only the errored reason gets richer.
+    #[test]
+    fn test_frontend_not_ready_alone_does_not_derive_errored() {
+        let b = body(r#"{"data":{"frontendReady":false,"frontendState":"booting"}}"#);
+        assert!(matches!(
+            derive_runner_status(true, true, Some(&b)),
+            RunnerStatus::Healthy
+        ));
+    }
+
+    fn secs(t: DateTime<Utc>, n: i64) -> DateTime<Utc> {
+        t + chrono::Duration::seconds(n)
+    }
+
+    #[test]
+    fn frontend_run_keeps_the_first_instant_for_the_same_pid() {
+        let t0 = Utc::now();
+        let first = next_frontend_run(None, Some(false), Some("booting"), Some(7), t0).unwrap();
+        assert_eq!(first.since, t0);
+        let second = next_frontend_run(
+            Some(&first),
+            Some(false),
+            Some("booting"),
+            Some(7),
+            secs(t0, 2),
+        )
+        .unwrap();
+        assert_eq!(second.since, t0, "an unbroken run keeps t0");
+    }
+
+    /// false, UNKNOWN, false keeps the original start — a slow or failed
+    /// `/health` read must not reset the run.
+    #[test]
+    fn frontend_run_unknown_tick_pauses_rather_than_ends() {
+        let t0 = Utc::now();
+        let a = next_frontend_run(None, Some(false), Some("window_not_visible"), Some(7), t0);
+        let b = next_frontend_run(a.as_ref(), None, None, Some(7), secs(t0, 2));
+        let b = b.expect("an UNKNOWN tick must not end the run");
+        assert_eq!(b.since, t0);
+        assert_eq!(b.last_state.as_deref(), Some("window_not_visible"));
+        let c = next_frontend_run(Some(&b), Some(false), None, Some(7), secs(t0, 4)).unwrap();
+        assert_eq!(c.since, t0);
+        assert_eq!(
+            c.unknown_since, None,
+            "a false observation closes the UNKNOWN gap"
+        );
+    }
+
+    /// A continuous UNKNOWN stretch of 60 s or more drops the run; just under
+    /// it does not.
+    #[test]
+    fn frontend_run_unknown_gap_past_cap_resets() {
+        let t0 = Utc::now();
+        let a = next_frontend_run(None, Some(false), None, Some(7), t0);
+        let gap_start = next_frontend_run(a.as_ref(), None, None, Some(7), secs(t0, 2)).unwrap();
+        let at_59 = next_frontend_run(Some(&gap_start), None, None, Some(7), secs(t0, 61));
+        assert!(at_59.is_some(), "59 s of UNKNOWN is inside the cap");
+        let at_60 = next_frontend_run(at_59.as_ref(), None, None, Some(7), secs(t0, 62));
+        assert_eq!(at_60, None, "60 s of continuous UNKNOWN drops the run");
+    }
+
+    #[test]
+    fn frontend_run_ready_resets_and_new_pid_restarts() {
+        let t0 = Utc::now();
+        let run = next_frontend_run(None, Some(false), None, Some(7), t0).unwrap();
+        assert_eq!(
+            next_frontend_run(Some(&run), Some(true), None, Some(7), secs(t0, 2)),
+            None,
+            "a ready frontend ends the run"
+        );
+        let restarted =
+            next_frontend_run(Some(&run), Some(false), None, Some(8), secs(t0, 2)).unwrap();
+        assert_eq!(restarted.since, secs(t0, 2), "a new pid starts a new run");
+        assert_eq!(
+            next_frontend_run(Some(&run), None, None, Some(8), secs(t0, 2)),
+            None,
+            "a new pid during UNKNOWN ends the run"
+        );
+        assert_eq!(
+            next_frontend_run(None, None, None, Some(7), t0),
+            None,
+            "UNKNOWN never starts a run"
+        );
+    }
+
+    /// The refresher's map wiring: observe inserts, a ready tick removes, and
+    /// `retain_ids` drops runners that left the registry.
+    #[test]
+    fn frontend_run_tracker_inserts_removes_and_retains() {
+        let t0 = Utc::now();
+        let mut tr = FrontendRunTracker::default();
+        assert!(tr
+            .observe("primary", Some(false), None, Some(1), t0)
+            .is_some());
+        assert!(tr
+            .observe("temp-1", Some(false), None, Some(2), t0)
+            .is_some());
+        assert_eq!(tr.len(), 2);
+        let again = tr
+            .observe("primary", Some(false), None, Some(1), secs(t0, 2))
+            .unwrap();
+        assert_eq!(again.since, t0, "the tracker carries the run across ticks");
+        assert!(tr
+            .observe("primary", Some(true), None, Some(1), secs(t0, 4))
+            .is_none());
+        assert_eq!(tr.len(), 1);
+        tr.retain_ids(|id| id != "temp-1");
+        assert_eq!(tr.len(), 0);
+    }
+
     #[test]
     fn test_derive_runner_status_degraded_from_derived_status_field() {
         let body = RunnerHealthBody {
@@ -989,6 +1524,7 @@ mod tests {
                 panic_location: Some("src-tauri/src/foo.rs:42:9".to_string()),
                 panic_message: Some("no reactor running".to_string()),
                 thread: Some("main".to_string()),
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1016,6 +1552,7 @@ mod tests {
                 panic_location: None,
                 panic_message: None,
                 thread: None,
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1050,6 +1587,7 @@ mod tests {
                 panic_location: None,
                 panic_message: Some("stale crash".to_string()),
                 thread: None,
+                pid: None,
             }),
             ..Default::default()
         };
@@ -1079,6 +1617,32 @@ mod tests {
         let crash = body.recent_crash.expect("recent_crash present");
         assert_eq!(crash.panic_message.as_deref(), Some("boom"));
         assert_eq!(crash.thread.as_deref(), Some("main"));
+        assert_eq!(crash.pid, None, "a runner that emits no pid parses as None");
+
+        let with_pid = r#"{
+            "recent_crash": {
+                "filePath": "D:/.dev-logs/crash_2.txt",
+                "reportedAt": "2026-04-22T10:15:30Z",
+                "pid": 4242
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(with_pid).expect("should parse");
+        assert_eq!(
+            body.recent_crash.expect("recent_crash present").pid,
+            Some(4242)
+        );
+
+        // A runner that emits the field writes an explicit null for a dump
+        // that names no pid (one written before the dump carried it).
+        let null_pid = r#"{
+            "recent_crash": {
+                "filePath": "D:/.dev-logs/crash_3.txt",
+                "reportedAt": "2026-04-22T10:15:30Z",
+                "pid": null
+            }
+        }"#;
+        let body: RunnerHealthBody = serde_json::from_str(null_pid).expect("should parse");
+        assert_eq!(body.recent_crash.expect("recent_crash present").pid, None);
     }
 
     #[test]
@@ -1226,7 +1790,7 @@ mod tests {
         for marker in [
             [
                 "runner_state.last_seen_responding_at = ",
-                "Some(Utc::now());",
+                "Some(probe_issued_at);",
             ]
             .concat(),
             ["RUNNER ", "WEDGED: port is held"].concat(),
@@ -1247,5 +1811,31 @@ mod tests {
                  while the gated original still runs",
             );
         }
+    }
+
+    /// The responding stamp is dated from BEFORE the probe that saw the answer
+    /// (plan `2026-11-04-a-runner-boot-that-never-answers-is-misclassified-or-unreported`
+    /// D1), so an answer from the previous process to a probe in flight across
+    /// a restart dates before the new spawn and does not count as this boot's.
+    /// Source order is the only thing that can regress here: the instant is
+    /// captured, then the probe is issued, then the instant is assigned.
+    #[test]
+    fn the_responding_stamp_is_dated_from_before_the_probe() {
+        let src = include_str!("health_cache.rs");
+        // Assembled at runtime so this test's own text is not what it finds.
+        let capture = ["let probe_issued_at = ", "Utc::now();"].concat();
+        let probe = ["port::is_runner_responding(", "runner_port).await;"].concat();
+        let assign = [
+            "runner_state.last_seen_responding_at = ",
+            "Some(probe_issued_at);",
+        ]
+        .concat();
+        let find = |m: &str| {
+            assert_eq!(src.matches(m).count(), 1, "`{m}` must appear exactly once");
+            src.find(m).unwrap()
+        };
+        let (c, p, a) = (find(&capture), find(&probe), find(&assign));
+        assert!(c < p, "the stamp's instant must be taken before the probe");
+        assert!(p < a, "the stamp is assigned only after the probe answered");
     }
 }

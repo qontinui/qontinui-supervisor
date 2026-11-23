@@ -24,7 +24,9 @@ repos:
 
       - id: cargo-clippy
         name: cargo clippy
-        entry: cargo clippy -- -D warnings
+        # Through the wrapper, not bare cargo: from a linked worktree bare
+        # `cargo clippy` mints a fresh <worktree>/target/ (see the script).
+        entry: bash scripts/pre-commit-cargo.sh clippy -- -D warnings
         language: system
         types: [rust]
         pass_filenames: false

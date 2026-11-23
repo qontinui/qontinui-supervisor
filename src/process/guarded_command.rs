@@ -133,6 +133,9 @@ pub struct GuardedCommand {
     args: Vec<std::ffi::OsString>,
     cwd: Option<PathBuf>,
     envs: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Variables REMOVED from the inherited environment. Applied before
+    /// `envs`, so an explicit `env` of the same key still wins.
+    env_removes: Vec<std::ffi::OsString>,
     timeout: Duration,
     cancel: Option<CancellationToken>,
     /// Whether to wrap the spawned child in a tree-kill job (Windows JobObject)
@@ -181,6 +184,7 @@ impl GuardedCommand {
             args: Vec::new(),
             cwd: None,
             envs: Vec::new(),
+            env_removes: Vec::new(),
             timeout,
             cancel: None,
             job_guarded: true,
@@ -249,6 +253,13 @@ impl GuardedCommand {
         self
     }
 
+    /// Remove one variable from the environment the child would otherwise
+    /// inherit from this process.
+    pub fn env_remove(mut self, key: impl AsRef<OsStr>) -> Self {
+        self.env_removes.push(key.as_ref().to_os_string());
+        self
+    }
+
     /// Attach a cancellation token. When it fires, [`run`](Self::run) kills the
     /// process tree and returns [`GuardedOutcome::Cancelled`].
     ///
@@ -311,6 +322,9 @@ impl GuardedCommand {
             .stdin(Stdio::null());
         if let Some(cwd) = &self.cwd {
             cmd.current_dir(cwd);
+        }
+        for k in &self.env_removes {
+            cmd.env_remove(k);
         }
         for (k, v) in &self.envs {
             cmd.env(k, v);
@@ -719,6 +733,38 @@ fn make_output(status: ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Output {
 mod tests {
     use super::*;
 
+    /// `env_remove` reaches the configured child command as a removal, and an
+    /// explicit `env` of the same key still wins over it.
+    #[test]
+    fn env_remove_is_applied_to_the_child_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = |n: &str| std::fs::File::create(dir.path().join(n)).unwrap();
+        let gc = GuardedCommand::new("cargo", Duration::from_secs(1))
+            .env_remove("QONTINUI_ALLOW_PLACEHOLDER_DIST")
+            .env_remove("SOME_OTHER")
+            .env("SOME_OTHER", "kept");
+        let mut cmd = tokio::process::Command::new("cargo");
+        gc.configure_command(&mut cmd, f("o"), f("e"));
+        let envs: Vec<(String, Option<String>)> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(
+            envs.contains(&("QONTINUI_ALLOW_PLACEHOLDER_DIST".to_string(), None)),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&("SOME_OTHER".to_string(), Some("kept".to_string()))),
+            "{envs:?}"
+        );
+    }
+
     /// Windows-only test helper: is `pid` still a live process? Uses
     /// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetExitCodeProcess`;
     /// a still-running process reports `STILL_ACTIVE` (259). Returns false if the
@@ -896,7 +942,7 @@ mod tests {
 
     /// Tree-kill regression: a command that spawns a detached GRANDCHILD and
     /// then hangs must be killed (tree AND grandchild) by the timeout within ~the
-    /// timeout window, NOT blocked until the grandchild's own 60s sleep elapses.
+    /// timeout window, NOT blocked until the grandchild's own sleep elapses.
     /// The headline is the SECOND assertion: the grandchild PID is gone
     /// afterward, proving the kill was tree-wide (a naive direct-child kill would
     /// leave the detached grandchild alive).
@@ -908,47 +954,72 @@ mod tests {
             "qontinui-guarded-grandchild-{}.pid",
             std::process::id()
         ));
-        let _ = std::fs::remove_file(&marker);
-        let marker_str = marker.to_string_lossy().to_string();
 
-        // Direct child (powershell) launches a separate GRANDCHILD powershell
-        // via Start-Process -PassThru, records its PID to a temp file, then
-        // sleeps 60s. Under a 2s timeout the WHOLE tree must be killed by the
-        // JobObject; we then read the grandchild PID and assert it's dead.
+        // Scaled like both bounds below, which it has to outlast. With the longest
+        // window at 30s, the backstop (window + 60s) and the teardown budget (30s
+        // past the kill) both end before this sleep whatever the scale, so the
+        // grandchild's own exit cannot pass for a tree-kill.
+        let sleep = crate::test_clock::backstop(Duration::from_secs(120));
+        let sleep_secs = sleep.as_secs();
+
+        // Direct child (powershell) launches a separate GRANDCHILD powershell via
+        // Start-Process, then sleeps. The grandchild records its OWN PID to a temp
+        // file, so a recorded PID proves it ran, and then sleeps too. Under the
+        // timeout the WHOLE tree must be killed by the JobObject; we then read the
+        // grandchild PID and assert it's dead. The file's path reaches the grandchild
+        // in the environment, because Start-Process joins its arguments and the
+        // grandchild re-splits them, which would mangle a path with a double space.
+        let marker_env = "QONTINUI_GUARDED_GRANDCHILD_MARKER";
         let script = format!(
-            "$gc = Start-Process powershell -PassThru -WindowStyle Hidden \
-             -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 60'; \
-             $gc.Id | Out-File -Encoding ascii -FilePath '{marker_str}'; \
-             Start-Sleep -Seconds 60"
+            "Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Command',\
+             '$PID | Out-File -Encoding ascii -LiteralPath $env:{marker_env}; \
+             Start-Sleep -Seconds {sleep_secs}'; \
+             Start-Sleep -Seconds {sleep_secs}"
         );
 
-        let start = std::time::Instant::now();
-        let outcome = GuardedCommand::new("powershell", Duration::from_secs(2))
-            .args(["-NoProfile", "-Command", &script])
-            .run()
-            .await
-            .expect("run() should not error");
-        let elapsed = start.elapsed();
+        // The kill has to land after the grandchild recorded itself, or the run
+        // proves nothing about the tree. Two PowerShell cold starts and a file write
+        // have outlasted a short fixed window on a loaded box, and every window costs
+        // its whole length because only the timeout ends the child. So a run the
+        // timeout ended with no PID recorded runs again with a longer window.
+        // Nothing else retries: a wrong outcome or a live grandchild fails at once.
+        let mut run = None;
+        for window in [4, 10, 30].map(Duration::from_secs) {
+            let _ = std::fs::remove_file(&marker);
+            let start = std::time::Instant::now();
+            let outcome = GuardedCommand::new("powershell", window)
+                .args(["-NoProfile", "-Command", &script])
+                .env(marker_env, &marker)
+                .run()
+                .await
+                .expect("run() should not error");
+            let elapsed = start.elapsed();
 
-        // WHICH budget fired is a property of the outcome, not of the clock:
-        // the 2s absolute backstop, never the no-progress arm.
-        match &outcome {
-            GuardedOutcome::TimedOut {
-                kind: TimeoutKind::Absolute,
-                ..
-            } => {}
-            other => panic!("expected TimedOut(Absolute), got {other:?}"),
+            // WHICH budget fired is a property of the outcome, not of the clock:
+            // the absolute backstop, never the no-progress arm.
+            match &outcome {
+                GuardedOutcome::TimedOut {
+                    kind: TimeoutKind::Absolute,
+                    ..
+                } => {}
+                other => panic!("expected TimedOut(Absolute), got {other:?}"),
+            }
+
+            let recorded: Option<u32> = std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|s| s.trim().parse().ok());
+            if let Some(pid) = recorded {
+                run = Some((pid, window, elapsed));
+                break;
+            }
         }
-
-        let grandchild_pid: u32 = std::fs::read_to_string(&marker)
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or_else(|| {
-                panic!(
-                    "grandchild never recorded its PID to {:?} — cannot prove tree-kill",
-                    marker
-                )
-            });
+        let (grandchild_pid, window, elapsed) = run.unwrap_or_else(|| {
+            panic!(
+                "grandchild never recorded its PID to {:?} inside any window — cannot prove \
+                 tree-kill",
+                marker
+            )
+        });
         let _ = std::fs::remove_file(&marker);
 
         // Give the kernel time to finish tearing down the job tree. This is a
@@ -970,17 +1041,18 @@ mod tests {
         // the claim (the absolute budget fired; the detached grandchild is
         // gone), and a clock that reddens before them spends the reader's
         // attention on the box instead of on the code. The bound separates
-        // "killed on the 2s budget" from "waited out the grandchild's 60s
-        // sleep", so it is derived from that 60s — the old 10s was derived from
+        // "killed on the window's budget" from "waited out the grandchild's sleep",
+        // so it is derived from that sleep — the old 10s was derived from
         // a ~2.2s quiet-path measurement and was violated twice on this fleet
         // (11.46s on 2026-09-04, 13.99s on 2026-09-05) by runs that tree-killed
         // correctly. Plan
         // `2026-09-06-supervisor-test-wall-clock-deadlines-fail-under-fleet-load`.
-        let wedge_backstop = crate::test_clock::backstop(Duration::from_secs(30));
+        let wedge_backstop = window + crate::test_clock::backstop(Duration::from_secs(60));
         assert!(
             elapsed < wedge_backstop,
-            "timeout+tree-kill must complete on the 2s budget, not by waiting out the 60s \
-             grandchild sleep; took {elapsed:?}, backstop {wedge_backstop:?} (half that 60s)"
+            "timeout+tree-kill must complete on the {window:?} budget, not by waiting out the \
+             {sleep:?} grandchild sleep; took {elapsed:?}, backstop {wedge_backstop:?} (the \
+             window plus half that sleep)"
         );
     }
 

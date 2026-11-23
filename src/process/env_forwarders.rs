@@ -27,6 +27,7 @@ use std::pin::Pin;
 use tokio::process::Command;
 
 use crate::log_capture::{LogLevel, LogSource};
+use crate::process::instance_root::{is_inside_root, INSTANCE_ROOT_ENV, ROOT_CONFINED_ENV_KEYS};
 use crate::process::manager::is_temp_runner;
 use crate::state::{ManagedRunner, SharedState};
 
@@ -677,8 +678,7 @@ impl EnvForwarder for WindowPositionEnv {
             let runner_name = runner.config.name.as_str();
 
             // Count existing test-* runners EXCLUDING the one we're about to spawn.
-            // `start_managed_runner` pre-inserts the new runner into `state.runners`
-            // (defensive re-insertion against the spawn-test 404 race), so a naive
+            // The new runner is already in `state.runners` when it starts, so a naive
             // count would include the runner-to-be and shift every spawn one index
             // off — the first temp would land on index 1 instead of 0.
             let runners = state.runners.read().await;
@@ -704,10 +704,16 @@ impl EnvForwarder for WindowPositionEnv {
                 Overflow, SpawnPlacementClient, SpawnPlacementClientError,
             };
 
-            let base = match reqwest::Url::parse("http://localhost:9876") {
+            // The primary's API on the IPv4 loopback it binds, through the
+            // same port field the `/ui-bridge`, `/runner-api` and `/graphql`
+            // proxies forward to (a test can point it at a stub).
+            let base = match reqwest::Url::parse(&crate::loopback::runner_loopback_base(
+                state.runner_api_port,
+            )) {
                 Ok(u) => u,
                 Err(e) => {
-                    // Static URL — this should never fail, but log defensively.
+                    // An IPv4 literal and a u16 port — this should never fail,
+                    // but log defensively.
                     let msg = format!(
                         "Spawn temp placement: skipping runner '{}' — runner base URL parse failed: {}",
                         runner_name, e
@@ -870,19 +876,31 @@ impl EnvForwarder for RestateEnv {
 // RunnerTierEnv
 // =============================================================================
 
-/// Force a spawned temp runner to boot at Tier 0 (`Local`) regardless of what
-/// the shared runner settings.json says.
+/// Force a spawned temp runner to boot at Tier 0 (`Local`) regardless of the
+/// tier its own settings and its copied pairing would resolve to.
 ///
-/// **Why this is necessary.** The runner's `settings::get_settings_path()`
-/// resolves to `dirs::config_dir() / "com.qontinui.runner" / "settings.json"`
-/// — a single shared file across the primary runner, every named runner, and
-/// every temp runner. When the primary is signed into Qontinui (Tier 2,
-/// `runner_token` populated), every fresh temp runner reads the same shared
-/// settings, sees `tier == qontinui_account`, has no JWT in its (also-shared)
-/// keychain slot, and parks on `LoginScreen` waiting for credentials. The
-/// supervisor cannot fix this by `POST`ing `set_runner_tier` to the temp
-/// runner because that handler persists, and the persist would clobber the
-/// primary's Tier 2 state on disk.
+/// **Why this is necessary.** A temp runner does not load its settings from
+/// the primary's `settings.json`. Since #56 (2026-05-27)
+/// `manager::apply_instance_root_env` points every non-primary runner's
+/// `QONTINUI_CONFIG_DIR` at its own instance dir, so it boots on a fresh
+/// settings file. One automatic read of the primary's file survives, and it
+/// does not touch the tier. When the machine-global `claude-accounts.json` is
+/// absent, qontinui-runner `claude_accounts::load_with_migration` probes the
+/// unscoped `settings.json` for an account roster to seed it with, once per
+/// process. Backup and restore reach the primary's file too, on request: the
+/// runner's `backup.rs` resolves `settings.json` without the instance dir, so
+/// `GET /backup` on a temp runner reads the primary's file and
+/// `POST /restore` there writes it. This paragraph used to describe
+/// one shared file; that was true when this forwarder landed (#48, 2026-05-22)
+/// and stopped being true five days later. What still lifts a fresh temp runner
+/// to Tier 2 is the pairing spawn-test copies into that same instance dir
+/// (`routes::runners::PAIRED_STATE_FILES`): the runner's tier inference
+/// (qontinui-runner `profiles::infer_tier`) answers `qontinui_account` for any
+/// install that is paired and never chose a tier. Setting the tier afterwards
+/// through the temp runner's own `set_runner_tier` does not replace this: on a
+/// secondary that handler applies the tier in memory only, after the runner has
+/// already booted at the inferred tier, while this overlay is read by the
+/// runner's first settings load.
 ///
 /// The runner now honors `QONTINUI_RUNNER_TIER` as an in-memory overlay
 /// inside `load_settings()` (parallel to the existing `QONTINUI_RESTATE_*`
@@ -1027,11 +1045,15 @@ fn read_persisted_user_env(_name: &str) -> Option<String> {
 /// Decide and set `QONTINUI_RUNNER_LOG_DIR` for the spawned runner, plus
 /// `QONTINUI_RUNNER_ID` so the runner's panic hook can tag its output.
 ///
-/// Resolution:
-/// * If `state.config.log_dir` is set on the supervisor (`--log-dir <dir>`),
-///   use `<log-dir>/runner-<id>/`. The per-runner subdir avoids clobbering
-///   a sibling runner's `runner-panic.log` when several test runners panic
-///   in quick succession.
+/// Resolution ([`panic_log_dir_for`]):
+/// * A **non-primary** runner keeps its logs in its instance root
+///   (`<root>/logs`), which the non-primary env block already exported. Nothing
+///   is set here: a log dir outside the root would make a root-honouring runner
+///   refuse to start. Only the path is recorded, so the panic log is read back
+///   from where the child actually wrote it.
+/// * The **primary**, when `state.config.log_dir` is set (`--log-dir <dir>`),
+///   gets `<log-dir>/runner-<id>/`. The per-runner subdir avoids clobbering a
+///   sibling runner's `runner-panic.log`.
 /// * Otherwise the runner's default path is fine — we still set
 ///   `QONTINUI_RUNNER_ID` so any diagnostic tooling can correlate.
 ///
@@ -1057,14 +1079,16 @@ impl EnvForwarder for PanicLogEnv {
             let runner_id = runner.config.id.as_str();
             cmd.env("QONTINUI_RUNNER_ID", runner_id);
 
-            let new_dir = if let Some(log_dir) = state.config.log_dir.as_ref() {
-                let per_runner = log_dir.join(format!("runner-{}", runner_id));
-                let _ = std::fs::create_dir_all(&per_runner);
-                cmd.env("QONTINUI_RUNNER_LOG_DIR", &per_runner);
-                Some(per_runner)
-            } else {
-                None
-            };
+            let new_dir = panic_log_dir_for(
+                runner.config.kind().is_primary(),
+                runner_id,
+                state.config.log_dir.as_deref(),
+            );
+            if let PanicLogDir::Export(dir) = &new_dir {
+                let _ = std::fs::create_dir_all(dir);
+                cmd.env("QONTINUI_RUNNER_LOG_DIR", dir);
+            }
+            let new_dir = new_dir.into_path();
             // Stash on the ManagedRunner so `monitor_runner_process_exit`
             // can find `runner-panic.log` after a non-zero exit. The
             // pre-trait code returned this from the helper and the caller
@@ -1076,13 +1100,53 @@ impl EnvForwarder for PanicLogEnv {
     }
 }
 
+/// Where a runner's panic log lives, and whether this forwarder exports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PanicLogDir {
+    /// Set `QONTINUI_RUNNER_LOG_DIR` to this dir (the primary under `--log-dir`).
+    Export(std::path::PathBuf),
+    /// Already exported by the non-primary env block — record it only.
+    InstanceRoot(std::path::PathBuf),
+    /// The runner's own default; the supervisor has no hint.
+    RunnerDefault,
+}
+
+impl PanicLogDir {
+    fn into_path(self) -> Option<std::path::PathBuf> {
+        match self {
+            Self::Export(dir) | Self::InstanceRoot(dir) => Some(dir),
+            Self::RunnerDefault => None,
+        }
+    }
+}
+
+/// Pure core of [`PanicLogEnv`]: see its resolution rules.
+pub(crate) fn panic_log_dir_for(
+    is_primary: bool,
+    runner_id: &str,
+    supervisor_log_dir: Option<&std::path::Path>,
+) -> PanicLogDir {
+    if !is_primary {
+        return match crate::process::instance_root::InstanceRoot::for_runner(runner_id) {
+            Some(root) => PanicLogDir::InstanceRoot(root.logs_dir()),
+            // Unreachable in a real spawn — the env block refuses an
+            // unresolvable root before forwarders run.
+            None => PanicLogDir::RunnerDefault,
+        };
+    }
+    match supervisor_log_dir {
+        Some(log_dir) => PanicLogDir::Export(log_dir.join(format!("runner-{runner_id}"))),
+        None => PanicLogDir::RunnerDefault,
+    }
+}
+
 // =============================================================================
 // ExtraEnv
 // =============================================================================
 
 /// Env vars whose silent override re-opens the unpaired-spawn bug.
 ///
-/// `process::manager::apply_instance_dir_env` points the child at its
+/// `process::manager::apply_instance_root_env` points the child at its
 /// per-instance dir with these two, and `routes::runners` writes the
 /// `paired_profile_id` snapshot into that same dir. A caller that passes BOTH
 /// `paired_profile_id` and an `extra_env` override for one of these gets the
@@ -1099,7 +1163,9 @@ const INSTANCE_DIR_ENV_KEYS: [&str; 2] = ["QONTINUI_CONFIG_DIR", "QONTINUI_SECUR
 /// the supervisor set, including `QONTINUI_SERVER_MODE`, `QONTINUI_API_URL`,
 /// etc. See `config.rs:148-153` for the documented contract.
 ///
-/// Overriding one of [`INSTANCE_DIR_ENV_KEYS`] is warned about — see there.
+/// Overriding one of [`INSTANCE_DIR_ENV_KEYS`], the instance root, or a
+/// root-confined location with a path outside the root is warned about — see
+/// [`instance_dir_override_warning`].
 pub struct ExtraEnv;
 
 impl EnvForwarder for ExtraEnv {
@@ -1115,6 +1181,14 @@ impl EnvForwarder for ExtraEnv {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
             for (k, v) in &runner.config.extra_env {
+                if let Some(msg) = fresh_identity_extra_env_refusal(&runner.config, k) {
+                    tracing::warn!("{}", msg);
+                    state
+                        .logs
+                        .emit(LogSource::Supervisor, LogLevel::Warn, msg)
+                        .await;
+                    continue;
+                }
                 if let Some(msg) = instance_dir_override_warning(cmd, &runner.config.name, k, v) {
                     tracing::warn!("{}", msg);
                     state
@@ -1128,38 +1202,115 @@ impl EnvForwarder for ExtraEnv {
     }
 }
 
-/// Build the warning for an `extra_env` entry that would redirect one of the
-/// [`INSTANCE_DIR_ENV_KEYS`] away from the per-instance dir the supervisor
-/// already set. Returns `None` when the key is unrelated, was never set by the
-/// supervisor (nothing is being overridden), or the value is identical.
+/// A `fresh_device_identity` runner's `extra_env` entry that would re-inject
+/// the harness's device id ([`crate::process::instance_root::MACHINE_ID_ENV`]):
+/// the warning to log, and the entry is NOT applied. The spawn routes refuse
+/// this combination up front (400 `fresh_device_identity_conflict`); this is
+/// the backstop for a config that reached the forwarder another way (a
+/// hand-edited settings file). `None` for every other entry and every
+/// unflagged runner — whose `extra_env` stays exactly as honoured as before.
+pub(crate) fn fresh_identity_extra_env_refusal(
+    config: &crate::config::RunnerConfig,
+    key: &str,
+) -> Option<String> {
+    (config.fresh_device_identity
+        && key.eq_ignore_ascii_case(crate::process::instance_root::MACHINE_ID_ENV))
+    .then(|| {
+        format!(
+            "runner '{}' runs under a fresh device identity: its extra_env {key} is NOT \
+                 applied — it would override the device id the runner mints for itself",
+            config.name
+        )
+    })
+}
+
+/// The value `cmd` currently carries for `key`, if it set one.
+fn command_env(cmd: &Command, key: &str) -> Option<String> {
+    let key_os = std::ffi::OsStr::new(key);
+    cmd.as_std()
+        .get_envs()
+        .find(|(k, _)| *k == key_os)
+        .and_then(|(_, v)| v)
+        .map(|v| v.to_string_lossy().into_owned())
+}
+
+/// Build the warning for an `extra_env` entry that undoes the per-instance
+/// isolation the supervisor already set. Returns `None` when the entry is
+/// harmless. Two cases warn, and one message names both when both hold:
 ///
-/// Names BOTH values so the reader can see the split at a glance.
+/// - the entry redirects one of [`INSTANCE_DIR_ENV_KEYS`] away from the value
+///   the supervisor set — the child reads a pairing nothing was written to;
+/// - the command carries `QONTINUI_INSTANCE_ROOT` and the entry sets a
+///   root-confined location ([`ROOT_CONFINED_ENV_KEYS`]) to a non-blank path
+///   outside that root, or moves the root itself away from where the supervisor
+///   provisioned it — a root-honouring runner then refuses to start (exit 78).
+///
+/// Names both values so the reader can see the split at a glance.
 fn instance_dir_override_warning(
     cmd: &Command,
     runner_name: &str,
     key: &str,
     new_value: &str,
 ) -> Option<String> {
-    if !INSTANCE_DIR_ENV_KEYS.contains(&key) {
-        return None;
+    let mut problems: Vec<String> = Vec::new();
+    let current = command_env(cmd, key);
+
+    if INSTANCE_DIR_ENV_KEYS.contains(&key) {
+        if let Some(current) = current.as_deref().filter(|c| *c != new_value) {
+            problems.push(format!(
+                "it redirects {key} from the supervisor's per-instance dir '{current}' to \
+                 '{new_value}'. A `paired_profile_id` snapshot is copied into '{current}', so the \
+                 child will read a directory nothing was written to and come up UNPAIRED"
+            ));
+        }
     }
-    let key_os = std::ffi::OsStr::new(key);
-    let current = cmd
-        .as_std()
-        .get_envs()
-        .find(|(k, _)| *k == key_os)
-        .and_then(|(_, v)| v)?
-        .to_string_lossy()
-        .into_owned();
-    if current == new_value {
+
+    if let Some(root) = command_env(cmd, INSTANCE_ROOT_ENV) {
+        let root_path = std::path::Path::new(&root);
+        if key == "QONTINUI_PORT" {
+            let refused = match new_value.parse::<u16>() {
+                Ok(0) | Err(_) => true,
+                Ok(port) => port == crate::config::DEFAULT_RUNNER_API_PORT,
+            };
+            if refused {
+                problems.push(format!(
+                    "it sets QONTINUI_PORT='{new_value}' — a runner under the instance root \
+                     '{root}' refuses to start (exit 78) on an unparseable port, 0 or the \
+                     primary's {}",
+                    crate::config::DEFAULT_RUNNER_API_PORT
+                ));
+            }
+        } else if key == INSTANCE_ROOT_ENV && new_value.trim().is_empty() {
+            problems.push(format!(
+                "it blanks {INSTANCE_ROOT_ENV} — the child runs with NO instance root while \
+                 every location the supervisor exported still points into '{root}'"
+            ));
+        } else if key == INSTANCE_ROOT_ENV && std::path::Path::new(new_value) != root_path {
+            problems.push(format!(
+                "it moves {INSTANCE_ROOT_ENV} from '{root}' to '{new_value}', but every \
+                 per-instance location the supervisor exported (config, pairing, home, logs, \
+                 embedded PG, WebView data) lies under '{root}' — a runner that honours the root \
+                 refuses to start (exit 78) on the first one outside the new root"
+            ));
+        } else if ROOT_CONFINED_ENV_KEYS.contains(&key)
+            && !new_value.trim().is_empty()
+            && !is_inside_root(std::path::Path::new(new_value), root_path)
+        {
+            problems.push(format!(
+                "it sets {key}='{new_value}', outside the instance root '{root}' — a runner that \
+                 honours {INSTANCE_ROOT_ENV} refuses to start (exit 78, \
+                 '{root}/startup-refusal.log')"
+            ));
+        }
+    }
+
+    if problems.is_empty() {
         return None;
     }
     Some(format!(
-        "extra_env override: runner '{runner_name}' redirects {key} from the supervisor's \
-         per-instance dir '{current}' to '{new_value}'. A `paired_profile_id` snapshot is \
-         copied into '{current}', so the child will read a directory nothing was written to \
-         and come up UNPAIRED. Honoring the override as documented — drop it if you wanted \
-         the paired profile."
+        "extra_env override: runner '{runner_name}': {}. Honoring the override as documented — \
+         drop it if you wanted the supervisor's isolation.",
+        problems.join("; and ")
     ))
 }
 
@@ -1170,9 +1321,10 @@ fn instance_dir_override_warning(
 #[cfg(test)]
 mod tests {
     use super::{
-        display_refusal, display_refusal_for_command, resolve_display_env,
-        resolve_plan_adapter_value, resolve_test_auto_login, resolve_worktree_mode,
-        setup_wizard_bypass_value, TestAutoLoginSource, PLAN_ADAPTER_VARS,
+        display_refusal, display_refusal_for_command, instance_dir_override_warning,
+        panic_log_dir_for, resolve_display_env, resolve_plan_adapter_value,
+        resolve_test_auto_login, resolve_worktree_mode, setup_wizard_bypass_value, PanicLogDir,
+        TestAutoLoginSource, PLAN_ADAPTER_VARS,
     };
     use std::path::{Path, PathBuf};
 
@@ -1602,5 +1754,123 @@ mod tests {
         assert_eq!(names.last(), Some(&"extra_env"));
         assert!(pos("display") < pos("extra_env"));
         assert!(pos("setup_wizard_bypass") < pos("extra_env"));
+    }
+
+    use crate::process::instance_root::tests::abs;
+
+    fn s(p: &Path) -> String {
+        p.to_string_lossy().into_owned()
+    }
+
+    fn cmd_with(envs: &[(&str, &str)]) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new("cargo");
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd
+    }
+
+    #[test]
+    fn override_warning_flags_a_confined_key_outside_the_root() {
+        let root = abs("r/instances/test-1");
+        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", &s(&root))]);
+        let msg =
+            instance_dir_override_warning(&cmd, "t", "QONTINUI_RUNNER_LOG_DIR", &s(&abs("x/logs")))
+                .expect("outside the root must warn");
+        assert!(msg.contains("exit 78"), "{msg}");
+        // Inside the root, or blank, is fine.
+        assert!(instance_dir_override_warning(
+            &cmd,
+            "t",
+            "QONTINUI_RUNNER_LOG_DIR",
+            &s(&root.join("other-logs"))
+        )
+        .is_none());
+        assert!(instance_dir_override_warning(&cmd, "t", "QONTINUI_HOME", " ").is_none());
+        // An unrelated key never warns.
+        assert!(
+            instance_dir_override_warning(&cmd, "t", "QONTINUI_SCRIPTED_OUTPUT", "1").is_none()
+        );
+    }
+
+    #[test]
+    fn override_warning_flags_moving_the_root_and_redirecting_the_pairing_dir() {
+        let root_path = abs("r/instances/test-1");
+        let root_s = s(&root_path);
+        let root = root_s.as_str();
+        let cmd = cmd_with(&[
+            ("QONTINUI_INSTANCE_ROOT", root),
+            ("QONTINUI_SECURE_STORAGE_DIR", root),
+        ]);
+        let elsewhere = s(&abs("elsewhere"));
+        let moved = instance_dir_override_warning(&cmd, "t", "QONTINUI_INSTANCE_ROOT", &elsewhere)
+            .expect("moving the root must warn");
+        assert!(moved.contains("exit 78"), "{moved}");
+        let both =
+            instance_dir_override_warning(&cmd, "t", "QONTINUI_SECURE_STORAGE_DIR", &elsewhere)
+                .expect("redirecting the pairing dir outside the root must warn");
+        assert!(
+            both.contains("UNPAIRED") && both.contains("exit 78"),
+            "{both}"
+        );
+        assert!(instance_dir_override_warning(&cmd, "t", "QONTINUI_INSTANCE_ROOT", root).is_none());
+    }
+
+    #[test]
+    fn override_warning_flags_a_refused_port_under_a_root() {
+        let root = abs("r/instances/test-1");
+        let cmd = cmd_with(&[("QONTINUI_INSTANCE_ROOT", &s(&root))]);
+        for bad in ["9876", "0", "x"] {
+            let msg = instance_dir_override_warning(&cmd, "t", "QONTINUI_PORT", bad)
+                .unwrap_or_else(|| panic!("QONTINUI_PORT={bad} must warn"));
+            assert!(msg.contains("exit 78"), "{msg}");
+        }
+        assert!(instance_dir_override_warning(&cmd, "t", "QONTINUI_PORT", "9880").is_none());
+        // A trailing separator is the same root, not a move.
+        assert!(instance_dir_override_warning(
+            &cmd,
+            "t",
+            "QONTINUI_INSTANCE_ROOT",
+            &format!("{}{}", s(&root), std::path::MAIN_SEPARATOR)
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn panic_log_dir_follows_the_instance_root_for_non_primary_runners() {
+        let log_dir = Path::new("/var/log/sup");
+        assert_eq!(
+            panic_log_dir_for(true, "primary", Some(log_dir)),
+            PanicLogDir::Export(log_dir.join("runner-primary"))
+        );
+        assert_eq!(
+            panic_log_dir_for(true, "primary", None),
+            PanicLogDir::RunnerDefault
+        );
+        let Some(root) = crate::process::instance_config_dir("test-panic-1") else {
+            eprintln!("SKIPPED non-primary arm: dirs::config_dir() did not resolve");
+            return;
+        };
+        // Even with --log-dir: a dir outside the root would be refused.
+        assert_eq!(
+            panic_log_dir_for(false, "test-panic-1", Some(log_dir)),
+            PanicLogDir::InstanceRoot(root.join("logs"))
+        );
+    }
+
+    /// Phase 8b backstop: a fresh-identity runner never has
+    /// `QONTINUI_MACHINE_ID` re-injected through `extra_env`; every other key,
+    /// and every key of an unflagged runner, is applied as before.
+    #[test]
+    fn fresh_identity_extra_env_machine_id_is_not_applied() {
+        let mut cfg = crate::config::RunnerConfig::default_primary();
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_MACHINE_ID").is_none());
+        cfg.fresh_device_identity = true;
+        let msg = super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_MACHINE_ID")
+            .expect("refused for a fresh runner");
+        assert!(msg.contains("NOT applied"), "{msg}");
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "QONTINUI_API_URL").is_none());
+        // Case-insensitively: Windows env names are.
+        assert!(super::fresh_identity_extra_env_refusal(&cfg, "qontinui_machine_id").is_some());
     }
 }

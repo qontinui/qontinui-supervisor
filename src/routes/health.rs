@@ -18,6 +18,15 @@ use qontinui_types::wire::runner_kind::RunnerKind;
 #[derive(Serialize)]
 pub struct HealthResponse {
     pub status: String,
+    /// Why `status` is not the plain process/API verdict, when it is not.
+    ///
+    /// Set today only when the primary runner is running and answering but
+    /// reports ITSELF errored (e.g. a PLACEHOLDER frontend: `frontendReady:
+    /// false`) — the case that used to read `status: "healthy"` beside a
+    /// runner `errored`. Absent otherwise. Plan
+    /// `2026-10-05-supervisor-first-start-embeds-placeholder-frontend`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     pub runner: RunnerHealth,
     pub ports: PortsHealth,
     pub watchdog: WatchdogHealth,
@@ -116,6 +125,11 @@ pub struct RunnerInstanceHealth {
     /// see the state that most contradicts it. `running` + `api_responding`
     /// below are unchanged; read `liveness`.
     pub liveness: crate::state::RunnerLiveness,
+    /// Whether this runner's API has answered during its current boot
+    /// (`RunnerState::answered_this_boot`). `null` = UNKNOWN: no boot recorded.
+    /// A `wedged` verdict with `false` here is a boot that has held its port and
+    /// never answered, carrying a previous boot's `last_seen_responding_at`.
+    pub answered_this_boot: Option<bool>,
     /// When this runner's API was last seen responding, RFC3339. `null` =
     /// never observed responding, which is UNKNOWN, not "never ran".
     pub last_seen_responding_at: Option<String>,
@@ -124,6 +138,10 @@ pub struct RunnerInstanceHealth {
     /// is derived from, so an operator can check the derivation rather than
     /// trust it.
     pub port_open: bool,
+    /// Whether this runner's newest spawn is alive while its port is free and
+    /// its API silent (`CachedPortHealth::spawn_up`): a runner that has not
+    /// bound its listener. The third input `liveness` is derived from.
+    pub spawn_up: bool,
 }
 
 #[derive(Serialize)]
@@ -145,8 +163,14 @@ pub struct RunnerHealth {
     /// a header that reads `running` alone is exactly how a runner that held
     /// its port for ~14h while answering nothing kept showing as healthy.
     pub liveness: crate::state::RunnerLiveness,
+    /// Whether the primary's API has answered during its current boot, as on
+    /// `runners[]`. `null` = UNKNOWN.
+    pub answered_this_boot: Option<bool>,
     /// When the primary's API was last seen responding, RFC3339.
     pub last_seen_responding_at: Option<String>,
+    /// Whether the primary's newest spawn is alive while its port is free and
+    /// its API silent, as on `runners[]`.
+    pub spawn_up: bool,
 }
 
 #[derive(Serialize)]
@@ -191,6 +215,22 @@ pub struct WatchdogHealth {
     /// `disabled_reason`, so a crash-loop disarm and a serving-loop disarm are
     /// never mistaken for each other.
     pub serving_disabled_reason: Option<String>,
+    /// When the last pre-bind hang alert (`never_bound_since_spawn`) was sent
+    /// for this runner, RFC3339, and the `started_at` of the spawn it named.
+    /// That shape reads `liveness: unknown` with `pid: null`, so these two are
+    /// the only place in this response that shows it. A historical fact, like
+    /// `last_serving_restart_at`: compare the spawn with the runner's current
+    /// `started_at` before reading it as current. `null` = no such alert in this
+    /// supervisor's lifetime.
+    pub last_prebind_alert_at: Option<String>,
+    pub last_prebind_alert_spawn_started_at: Option<String>,
+    /// The `started_at` of the spawn a first-healthy watchdog is tracking right
+    /// now, RFC3339, or `null` when none is. Live, not historical: while it names
+    /// the runner's current `started_at` and that spawn has not answered, the
+    /// serving watchdog holds its restart
+    /// (`ServingRestartDecision::SkipInsideFirstHealthyBudget`). Read from
+    /// `WatchdogState::first_healthy_tracked_spawn`.
+    pub first_healthy_tracked_spawn_started_at: Option<String>,
 }
 
 impl WatchdogHealth {
@@ -221,6 +261,13 @@ impl WatchdogHealth {
             serving_restart_attempts: wd.serving_restart_attempts,
             last_serving_restart_at: wd.last_serving_restart_at.map(|t| t.to_rfc3339()),
             serving_disabled_reason: wd.serving_disabled_reason.clone(),
+            last_prebind_alert_at: wd.last_prebind_alert.map(|(_, at)| at.to_rfc3339()),
+            last_prebind_alert_spawn_started_at: wd
+                .last_prebind_alert
+                .map(|(spawn, _)| spawn.to_rfc3339()),
+            first_healthy_tracked_spawn_started_at: wd
+                .first_healthy_tracked_spawn_at()
+                .map(|spawn| spawn.to_rfc3339()),
         }
     }
 
@@ -239,6 +286,9 @@ impl WatchdogHealth {
             serving_restart_attempts: 0,
             last_serving_restart_at: None,
             serving_disabled_reason: None,
+            last_prebind_alert_at: None,
+            last_prebind_alert_spawn_started_at: None,
+            first_healthy_tracked_spawn_started_at: None,
         }
     }
 }
@@ -253,6 +303,12 @@ pub struct BuildHealth {
     pub error_detected: bool,
     pub last_error: Option<String>,
     pub last_build_at: Option<String>,
+    /// Pre-permit memory-gate outcome of the most recent real build
+    /// (`passed` | `passed_after_wait` | `proceeded_after_wait` |
+    /// `probe_unreadable` | `disabled`). `proceeded_after_wait` means the gate
+    /// FAILED OPEN — memory stayed short past `mem_wait_max_secs` and the build
+    /// ran anyway. `null` until the first build.
+    pub last_mem_gate: Option<crate::build_monitor::MemGateOutcome>,
     /// True when at least one build slot embeds a stale frontend because its
     /// most recent `npm run build` failed but a cargo build proceeded using a
     /// prior `dist/` snapshot. Clears when a subsequent npm build on that
@@ -268,6 +324,69 @@ pub struct BuildHealth {
     /// predates the changes and would silently run stale code.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lkg: Option<LkgHealth>,
+    /// How the build pool is sized for this machine: pool size and its
+    /// source, the per-slot `CARGO_BUILD_JOBS`, slot occupancy, and the
+    /// effective disk floor with its inputs (plan
+    /// `2026-10-02-cargo-jobs-supervisor-build-pool-and-physical-disk-floors-follow-the-machine`).
+    pub pool: BuildPoolHealth,
+}
+
+/// `build.pool` on `GET /health` and the SSE stream.
+#[derive(Serialize)]
+pub struct BuildPoolHealth {
+    pub pool_size: usize,
+    /// `derived` | `override`.
+    pub source: crate::build_sizing::PoolSizeSource,
+    /// The derivation's inputs and terms; `null` for an explicit size.
+    pub derivation: Option<crate::build_sizing::PoolSizeDerivation>,
+    /// Per-slot `CARGO_BUILD_JOBS` (`source: derived` = set by the supervisor,
+    /// `inherited` = the supervisor's own env value reaches the child).
+    pub jobs: crate::build_sizing::SlotJobs,
+    /// Slots executing a build right now; `null` when a slot lock was
+    /// contended on this read (UNKNOWN, never "idle").
+    pub slots_busy: Option<u32>,
+    /// Callers queued on the permit semaphore.
+    pub queue_depth: u32,
+    /// The pre-permit disk guard's effective floor and its inputs; `null`
+    /// when the footprint lock was contended on this read (UNKNOWN for this
+    /// tick — not the guard's answer, which waits for the lock).
+    pub disk_floor: Option<crate::build_sizing::DiskFloor>,
+}
+
+/// Build the `build.pool` block without awaiting: every lock is `try_read`,
+/// so both the async `/health` handler and the sync SSE path share it. A
+/// contended lock yields `null` for the field it feeds, never a default.
+pub fn build_pool_health(state: &crate::state::SupervisorState) -> BuildPoolHealth {
+    let pool = &state.config.build_pool;
+    let mut busy = 0u32;
+    let mut contended = false;
+    for slot in &state.build_pool.slots {
+        match slot.busy.try_read() {
+            Ok(g) => busy += u32::from(g.is_some()),
+            Err(_) => contended = true,
+        }
+    }
+    let disk_floor = state.footprint.try_read().ok().map(|g| {
+        crate::build_sizing::effective_disk_floor(
+            crate::config::min_free_disk_gb_override(),
+            pool.pool_size.min(u32::MAX as usize) as u32,
+            g.as_ref(),
+            pool.persisted_estimate.as_ref(),
+        )
+    });
+    BuildPoolHealth {
+        pool_size: pool.pool_size,
+        source: pool.source,
+        derivation: pool.derivation.clone(),
+        jobs: pool.jobs.clone(),
+        slots_busy: (!contended).then_some(busy),
+        queue_depth: state
+            .build_pool
+            .queue_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(u32::MAX as usize) as u32,
+        disk_floor,
+    }
 }
 
 #[derive(Serialize)]
@@ -327,6 +446,18 @@ pub struct SupervisorInfo {
     /// sha a lower bound: "contains fix X" still holds, "does not contain fix
     /// X" is not conclusive.
     pub built_from_dirty: Option<bool>,
+    /// The attribution epoch every dev-action snapshot this binary posts is
+    /// stamped with ([`crate::dev_action::ingest::ATTRIBUTION_EPOCH`]): the
+    /// per-box answer to "what does this supervisor stamp on its rows?", which
+    /// [`Self::built_from_sha`] can only answer by ancestry against a PR the
+    /// reader has to know. A missing key is UNKNOWN: builds from
+    /// qontinui-supervisor#270 and #272 stamp epoch 2 and predate this field.
+    pub attribution_epoch: u32,
+    /// Delivery counters of this process's dev-action snapshot ingest
+    /// ([`crate::dev_action::ingest::ingest_counters`]): delivered, retried,
+    /// refused, the two drop counts, and what is in delivery now. Process
+    /// lifetime only; a missing key is a build that predates the buffer.
+    pub dev_action_ingest: crate::dev_action::ingest::IngestCounters,
 }
 
 impl SupervisorInfo {
@@ -339,6 +470,8 @@ impl SupervisorInfo {
             project_dir,
             built_from_sha: crate::self_provenance::built_from_sha().map(str::to_string),
             built_from_dirty: crate::self_provenance::built_from_dirty(),
+            attribution_epoch: crate::dev_action::ingest::ATTRIBUTION_EPOCH,
+            dev_action_ingest: crate::dev_action::ingest::ingest_counters(),
         }
     }
 }
@@ -363,6 +496,135 @@ pub fn determine_overall_status(
     }
 }
 
+/// The top-level `status` plus the reason it was overridden, if it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverallStatus {
+    pub status: &'static str,
+    pub reason: Option<String>,
+}
+
+/// How long the primary's own `/health` must report `frontendReady: false`
+/// WITHOUT A BREAK before the top-level status says `degraded`.
+///
+/// Why 120 s, from the runner's own code (qontinui-runner origin/main
+/// b58a81dce) and one measured recovery:
+/// - `frontendReady` is `frontendState == Responsive`
+///   (`mcp_api.rs:1390`), so it is false while the WebView boots and whenever
+///   no pong arrived for `UI_STALE_AFTER_MS` = 30 s (`ui_error.rs:220`). Rust
+///   pings every 3 s; a healthy boot pongs within the runner's own 10 s
+///   UI-Bridge readiness budget (`main.rs:2612`). Boot is far inside 120 s.
+/// - The runner itself calls the UI dead only at `UI_DEAD_AFTER_MS` = 90 s
+///   (`ui_error.rs:237`, "30 consecutive missed pings"). The supervisor must
+///   not call it sooner than the runner does.
+/// - The runner's in-process WebView recovery waits 60 s for a reload to pong
+///   and then recreates the window; on this box (2026-09-30 02:51:03 →
+///   02:52:36, `webview_recovery`) that cycle took 93 s. 120 s lets a
+///   self-healing runner recover without flapping the top level.
+///
+/// The placeholder-frontend runner of 2026-10-05 never pongs at all, so any
+/// grace catches it; the grace only buys freedom from false positives.
+/// The clock starts when the supervisor FIRST OBSERVES `false` (the health
+/// cache refreshes every 2 s and restarts the run on a pid change), so the
+/// runner's API bootstrap time before `/health` answers never counts.
+pub const PRIMARY_FRONTEND_NOT_READY_GRACE_SECS: i64 = 120;
+
+/// The primary runner's frontend, as the health cache last observed it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrimaryFrontend {
+    /// Start of the current run of `frontendReady == false` observations
+    /// (UNKNOWN ticks pause it, see `health_cache::next_frontend_run`); `None`
+    /// when there is no run (ready, or never observed — e.g. an older runner
+    /// that publishes no `frontendReady`).
+    pub not_ready_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// The runner's `frontendState`, when it published one.
+    pub state: Option<String>,
+    /// The primary's config has `server_mode` (`QONTINUI_SERVER_MODE=1`): it
+    /// never creates a window, so `frontendReady` is `false`
+    /// (`frontendState=window_missing`) for its whole life BY DESIGN. Never an
+    /// override for such a runner.
+    pub server_mode: bool,
+}
+
+impl PrimaryFrontend {
+    /// Read from the primary's cached snapshot plus its config's
+    /// `server_mode`. No snapshot = UNKNOWN = no observation, which never
+    /// overrides the top-level status.
+    pub fn from_snapshot(snap: Option<&CachedRunnerHealth>, server_mode: bool) -> Self {
+        match snap {
+            Some(c) => Self {
+                not_ready_since: c.frontend_not_ready_since,
+                state: c.frontend_state.clone(),
+                server_mode,
+            },
+            None => Self {
+                server_mode,
+                ..Self::default()
+            },
+        }
+    }
+}
+
+/// The one rule both `GET /health` and the SSE stream use for the top-level
+/// status, so the two surfaces cannot diverge.
+///
+/// [`determine_overall_status`] answers from process + API liveness only, so
+/// the 2026-10-05 runner with a PLACEHOLDER frontend (`frontendReady: false`,
+/// `frontendState: "window_not_visible"`) read `healthy`. Here a primary whose
+/// frontend has been not-ready for at least
+/// [`PRIMARY_FRONTEND_NOT_READY_GRACE_SECS`] turns a `healthy` base into
+/// `degraded`, with a reason naming the duration and `frontendState`.
+///
+/// Scoped to the FRONTEND on purpose — not to the runner's `errored` status.
+/// That status folds in `recent_crash`, a startup scan of an unclean PRIOR
+/// shutdown that stays set until a user dismisses it (qontinui-runner
+/// `crash_observability.rs:512`, folded by `ui_error.rs:1501`
+/// `compute_derived_status`), so keying on it would read `degraded` for a
+/// runner's whole life after any power loss. An absent `frontendReady` (older
+/// runner) is UNKNOWN and changes nothing.
+///
+/// `primary_legacy_exe` = the primary was started from the legacy cargo-target
+/// exe ([`crate::process::manager::ExeOrigin::is_legacy_fallback`]); the reason
+/// then says so and names the rebuild that produces a real build-pool slot.
+///
+/// **Display only.** No supervisor code path acts on this top-level string
+/// (the watchdog keys on per-runner liveness, not on it), so a `degraded`
+/// here can never trigger a restart.
+pub fn resolve_overall_status(
+    runner_running: bool,
+    api_responding: bool,
+    build_in_progress: bool,
+    frontend: &PrimaryFrontend,
+    primary_legacy_exe: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> OverallStatus {
+    let base = determine_overall_status(runner_running, api_responding, build_in_progress);
+    if base == "healthy" && !frontend.server_mode {
+        if let Some(since) = frontend.not_ready_since {
+            let secs = (now - since).num_seconds();
+            if secs >= PRIMARY_FRONTEND_NOT_READY_GRACE_SECS {
+                let state = frontend.state.as_deref().unwrap_or("unknown");
+                let mut why = format!(
+                    "primary runner frontend not ready for {secs}s (frontendState={state})"
+                );
+                if primary_legacy_exe {
+                    why.push_str(
+                        "; the primary runs the legacy cargo-target exe (no build-pool slot) \
+                         — POST /runner/restart {\"rebuild\":true} builds a real slot",
+                    );
+                }
+                return OverallStatus {
+                    status: "degraded",
+                    reason: Some(why),
+                };
+            }
+        }
+    }
+    OverallStatus {
+        status: base,
+        reason: None,
+    }
+}
+
 /// Build runner instance health from the cached snapshot (sync-safe for SSE).
 fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
     match state.cached_runner_health.try_read() {
@@ -382,8 +644,10 @@ fn build_sse_runners(state: &SharedState) -> Vec<RunnerInstanceHealth> {
                 recent_crash: r.recent_crash.clone(),
                 derived_status: r.derived_status.clone(),
                 liveness: r.liveness,
+                answered_this_boot: r.answered_this_boot,
                 last_seen_responding_at: r.last_seen_responding_at.map(|t| t.to_rfc3339()),
                 port_open: r.port_open,
+                spawn_up: r.spawn_up,
             })
             .collect(),
         Err(_) => Vec::new(), // Lock contended, skip this tick
@@ -412,7 +676,50 @@ pub async fn health(
     if let (Some(axum::Extension(ctx)), Some(obj)) = (guard, value.as_object_mut()) {
         obj.insert("originGuard".to_string(), ctx.health_json());
     }
+    if let Some(obj) = value.as_object_mut() {
+        let report = runner_isolation_report(&state).await;
+        obj.insert(
+            "runner_isolation".to_string(),
+            serde_json::to_value(report).unwrap_or(serde_json::Value::Null),
+        );
+    }
     Json(value).into_response()
+}
+
+/// `/health` `runner_isolation`: `{"mechanism": "systemd-scope"|"unknown"|"none",
+/// "reason": …}` — whether user-owned runners this supervisor spawns leave its
+/// cgroup (Linux, plan `2026-11-04-linux-dev-supervisor-dies-with-its-launcher-
+/// and-orphans-its-temp-runners` Phase 1b; `unknown` until the systemd
+/// preflight has answered). It is supervisor-wide, so it is a summary, never
+/// proof about any one runner. Its consumer is qontinui-claude-config's
+/// `supervisor-verbs.sh stop`, which that plan's Phase 2 adds after this
+/// change; that verb reads each user-owned runner's own cgroup before it
+/// stops a supervisor.
+///
+/// `systemd-scope` needs BOTH a positive systemd preflight AND no running
+/// user-owned runner this supervisor spawned unscoped: one such runner shares
+/// the supervisor's cgroup and would die with its unit.
+pub async fn runner_isolation_report(
+    state: &SharedState,
+) -> crate::process::systemd_scope::RunnerIsolationReport {
+    let probe = state.runner_isolation_probe.read().await.clone();
+    let mut spawned = Vec::new();
+    for managed in state.get_all_runners().await {
+        if crate::process::job::should_assign_to_ephemeral_job(&managed.config.kind()) {
+            continue;
+        }
+        if !managed.runner.read().await.running {
+            continue;
+        }
+        if let Some(isolation) = managed.isolation.read().await.clone() {
+            spawned.push((managed.config.name.clone(), isolation));
+        }
+    }
+    crate::process::systemd_scope::summarize_isolation(
+        cfg!(target_os = "linux"),
+        probe.as_ref(),
+        &spawned,
+    )
 }
 
 pub async fn build_health_response(state: &SharedState) -> HealthResponse {
@@ -437,6 +744,7 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
     let cached = state.cached_health.read().await;
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
+    let api_spawn_up = cached.spawn_up;
     drop(cached);
 
     // Use primary ManagedRunner state (not the legacy state.runner which is never
@@ -452,8 +760,26 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
         primary_started_at,
         primary_watchdog,
         primary_liveness,
+        primary_answered,
         primary_last_seen,
+        primary_frontend,
+        primary_legacy_exe,
     ) = if let Some(primary) = state.get_primary().await {
+        let frontend = PrimaryFrontend::from_snapshot(
+            state
+                .cached_runner_health
+                .read()
+                .await
+                .iter()
+                .find(|c| c.id == primary.config.id),
+            primary.config.server_mode,
+        );
+        let legacy_exe = primary
+            .resolved_exe
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|r| r.origin.is_legacy_fallback());
         let watchdog = {
             let wd = primary.watchdog.read().await;
             WatchdogHealth::from_state_with_arms(
@@ -468,8 +794,11 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             pr.pid,
             pr.started_at,
             watchdog,
-            pr.liveness(api_in_use, api_responding),
+            pr.liveness(api_in_use, api_responding, api_spawn_up),
+            pr.answered_this_boot(),
             pr.last_seen_responding_at,
+            frontend,
+            legacy_exe,
         )
     } else {
         // Fallback to legacy state.runner if no managed primary exists
@@ -479,13 +808,23 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             runner.pid,
             runner.started_at,
             WatchdogHealth::unavailable(),
-            runner.liveness(api_in_use, api_responding),
+            // The legacy state has no spawn ring.
+            runner.liveness(api_in_use, api_responding, false),
+            runner.answered_this_boot(),
             runner.last_seen_responding_at,
+            PrimaryFrontend::default(),
+            false,
         )
     };
 
-    let overall_status =
-        determine_overall_status(primary_running, api_responding, build.build_in_progress);
+    let overall = resolve_overall_status(
+        primary_running,
+        api_responding,
+        build.build_in_progress,
+        &primary_frontend,
+        primary_legacy_exe,
+        chrono::Utc::now(),
+    );
 
     // Build multi-runner status array. The `watchdog_status` field reports
     // the per-runner crash-only watchdog (`WatchdogState`, maintained by
@@ -522,22 +861,27 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             ui_error: cached.and_then(|c| c.ui_error.clone()),
             recent_crash: cached.and_then(|c| c.recent_crash.clone()),
             derived_status: cached.map(|c| c.derived_status.clone()).unwrap_or_default(),
-            liveness: mr.liveness(mc.runner_port_open, mc.runner_responding),
+            liveness: mr.liveness(mc.runner_port_open, mc.runner_responding, mc.spawn_up),
+            answered_this_boot: mr.answered_this_boot(),
             last_seen_responding_at: mr.last_seen_responding_at.map(|t| t.to_rfc3339()),
             port_open: mc.runner_port_open,
+            spawn_up: mc.spawn_up,
         });
     }
     drop(cached_snapshots);
 
     HealthResponse {
-        status: overall_status.to_string(),
+        status: overall.status.to_string(),
+        status_reason: overall.reason,
         runner: RunnerHealth {
             running: primary_running,
             pid: primary_pid,
             started_at: primary_started_at.map(|t| t.to_rfc3339()),
             api_responding,
             liveness: primary_liveness,
+            answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
+            spawn_up: api_spawn_up,
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -552,8 +896,10 @@ pub async fn build_health_response(state: &SharedState) -> HealthResponse {
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             lkg,
+            pool: build_pool_health(state),
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -604,40 +950,68 @@ fn try_build_sse_health(
     let build = state.build.try_read().map_err(|_| ())?;
     let expo = state.expo.try_read().map_err(|_| ())?;
     let cached = state.cached_health.try_read().map_err(|_| ())?;
-    let runner_snapshots = state.cached_runner_health.try_read();
+    // `?`, not `.ok()`: a contended snapshot lock used to yield
+    // `primary_snapshot = None`, so for one tick the SSE path reported a
+    // different status from `GET /health`. Skip the tick instead (keepalive).
+    let runner_snapshots = state.cached_runner_health.try_read().map_err(|_| ())?;
 
     let api_responding = cached.runner_responding;
     let api_in_use = cached.runner_port_open;
+    let api_spawn_up = cached.spawn_up;
 
     // Use the primary runner from cached snapshots (not the legacy
     // state.runner which is never updated for user-managed runners).
-    let primary_snapshot = runner_snapshots
-        .as_ref()
-        .ok()
-        .and_then(|snaps| snaps.iter().find(|r| r.kind.is_primary()));
+    let primary_snapshot = runner_snapshots.iter().find(|r| r.kind.is_primary());
     let (primary_running, primary_pid) = match primary_snapshot {
         Some(p) => (p.running, p.pid),
         None => {
-            // Fallback to legacy state.runner
-            match state.runner.try_read() {
-                Ok(r) => (r.running, r.pid),
-                Err(_) => (false, None),
-            }
+            // Fallback to legacy state.runner; contended = skip the tick, for
+            // the same reason as the snapshot lock above.
+            let r = state.runner.try_read().map_err(|_| ())?;
+            (r.running, r.pid)
         }
     };
     let primary_watchdog = primary_snapshot
         .map(|p| p.watchdog.clone())
         .unwrap_or_else(WatchdogHealth::unavailable);
-    // No snapshot yet (first ticks after boot, or a contended lock) is not
+    // No primary snapshot yet (first ticks after boot) is not
     // evidence of health: it is `Unknown`, the same answer every other
     // surface gives for an un-probed runner.
-    let (primary_liveness, primary_last_seen) = match primary_snapshot {
-        Some(p) => (p.liveness, p.last_seen_responding_at),
-        None => (crate::state::RunnerLiveness::Unknown, None),
+    let (primary_liveness, primary_answered, primary_last_seen) = match primary_snapshot {
+        Some(p) => (p.liveness, p.answered_this_boot, p.last_seen_responding_at),
+        None => (crate::state::RunnerLiveness::Unknown, None, None),
     };
 
-    let overall_status =
-        determine_overall_status(primary_running, api_responding, build.build_in_progress);
+    // Sync-safe, and contention SKIPS the tick (keepalive) rather than
+    // dropping the legacy-exe hint, so the SSE status line can never differ
+    // from `GET /health`'s for the same state.
+    let primary_managed = state
+        .runners
+        .try_read()
+        .map_err(|_| ())?
+        .values()
+        .find(|r| r.config.kind().is_primary())
+        .cloned();
+    let primary_server_mode = primary_managed
+        .as_ref()
+        .is_some_and(|m| m.config.server_mode);
+    let primary_legacy_exe = match primary_managed {
+        Some(m) => m
+            .resolved_exe
+            .try_read()
+            .map_err(|_| ())?
+            .as_ref()
+            .is_some_and(|r| r.origin.is_legacy_fallback()),
+        None => false,
+    };
+    let overall = resolve_overall_status(
+        primary_running,
+        api_responding,
+        build.build_in_progress,
+        &PrimaryFrontend::from_snapshot(primary_snapshot, primary_server_mode),
+        primary_legacy_exe,
+        chrono::Utc::now(),
+    );
 
     // Sync-safe scan: use try_read on each slot's frontend_stale flag.
     // If any slot's lock is contended, skip reporting staleness for that
@@ -655,14 +1029,17 @@ fn try_build_sse_health(
     };
 
     Ok(HealthResponse {
-        status: overall_status.to_string(),
+        status: overall.status.to_string(),
+        status_reason: overall.reason,
         runner: RunnerHealth {
             running: primary_running,
             pid: primary_pid,
             started_at: None, // Not available from cached snapshot
             api_responding,
             liveness: primary_liveness,
+            answered_this_boot: primary_answered,
             last_seen_responding_at: primary_last_seen.map(|t| t.to_rfc3339()),
+            spawn_up: api_spawn_up,
         },
         ports: PortsHealth {
             api_port: PortStatus {
@@ -677,6 +1054,7 @@ fn try_build_sse_health(
             error_detected: build.build_error_detected,
             last_error: build.last_build_error.clone(),
             last_build_at: build.last_build_at.map(|t| t.to_rfc3339()),
+            last_mem_gate: build.last_mem_gate,
             frontend_stale_any,
             // SSE path: try_read on the LKG lock — if contended, skip the
             // field this tick (the next tick will catch up).
@@ -694,6 +1072,7 @@ fn try_build_sse_health(
                         source: info.source,
                     })
                 }),
+            pool: build_pool_health(state),
         },
         expo: ExpoHealth {
             running: expo.running,
@@ -796,6 +1175,22 @@ pub async fn health_stream(
 
 #[cfg(test)]
 mod tests {
+    /// A `build.pool` block for hand-built `HealthResponse` fixtures.
+    fn fixture_pool_health() -> BuildPoolHealth {
+        let cfg = crate::config::BuildPoolConfig::fixed(3);
+        BuildPoolHealth {
+            pool_size: cfg.pool_size,
+            source: cfg.source,
+            derivation: cfg.derivation,
+            jobs: cfg.jobs,
+            slots_busy: Some(0),
+            queue_depth: 0,
+            disk_floor: Some(crate::build_sizing::effective_disk_floor(
+                None, 3, None, None,
+            )),
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -838,17 +1233,343 @@ mod tests {
         assert_eq!(determine_overall_status(false, true, true), "external");
     }
 
+    fn not_ready_for(
+        secs: i64,
+        state: Option<&str>,
+    ) -> (PrimaryFrontend, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::Utc::now();
+        (
+            PrimaryFrontend {
+                not_ready_since: Some(now - chrono::Duration::seconds(secs)),
+                state: state.map(str::to_string),
+                server_mode: false,
+            },
+            now,
+        )
+    }
+
+    /// (a) The 2026-10-05 shape: primary running + answering, frontend not
+    /// ready past the grace. Top-level must NOT read healthy.
+    #[test]
+    fn test_degraded_when_primary_frontend_not_ready_past_grace() {
+        let (fe, now) = not_ready_for(125, Some("window_not_visible"));
+        let o = resolve_overall_status(true, true, false, &fe, false, now);
+        assert_eq!(o.status, "degraded");
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("primary runner frontend not ready for 125s (frontendState=window_not_visible)")
+        );
+    }
+
+    /// Inside the grace (boot, an in-process WebView recovery) stays healthy.
+    #[test]
+    fn test_frontend_not_ready_inside_grace_stays_healthy() {
+        let (fe, now) = not_ready_for(119, Some("booting"));
+        let o = resolve_overall_status(true, true, false, &fe, true, now);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    /// (b) The legacy-exe hint appears for the legacy origin only.
+    #[test]
+    fn test_frontend_reason_carries_legacy_exe_hint_only_for_legacy_origin() {
+        let (fe, now) = not_ready_for(300, Some("window_not_visible"));
+        let legacy = resolve_overall_status(true, true, false, &fe, true, now);
+        assert_eq!(legacy.status, "degraded");
+        let r = legacy.reason.unwrap();
+        assert!(r.contains("window_not_visible"), "{r}");
+        assert!(r.contains("legacy cargo-target exe"), "{r}");
+        assert!(
+            r.contains(r#"POST /runner/restart {"rebuild":true}"#),
+            "{r}"
+        );
+
+        let slot = resolve_overall_status(true, true, false, &fe, false, now);
+        assert!(!slot.reason.unwrap().contains("legacy"));
+    }
+
+    /// (c) No not-ready observation — a ready frontend, an older runner with no
+    /// `frontendReady` (UNKNOWN), or a runner the cache calls Errored/Degraded
+    /// for any other reason (e.g. a stale `recent_crash`) — keeps `healthy`
+    /// with no reason, even on the legacy exe.
+    #[test]
+    fn test_no_frontend_observation_stays_healthy_with_no_reason() {
+        let now = chrono::Utc::now();
+        let o = resolve_overall_status(true, true, false, &PrimaryFrontend::default(), true, now);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    /// `frontend_not_ready_since` is what drives it, not the runner's status:
+    /// a snapshot whose `derived_status` is Errored (the `recent_crash` case)
+    /// but whose frontend is ready yields no observation.
+    #[test]
+    fn test_errored_snapshot_with_ready_frontend_is_not_an_observation() {
+        let mut snap = cached_primary_snapshot();
+        snap.derived_status = RunnerStatus::Errored {
+            reason: "runner restarted after Rust panic (no message captured)".to_string(),
+        };
+        snap.frontend_ready = Some(true);
+        snap.frontend_not_ready_since = None;
+        let fe = PrimaryFrontend::from_snapshot(Some(&snap), false);
+        let o = resolve_overall_status(true, true, false, &fe, true, chrono::Utc::now());
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    /// A not-ready frontend never overrides a non-healthy base verdict
+    /// (stopped / external / building / API-down degraded keep their meaning).
+    #[test]
+    fn test_frontend_not_ready_does_not_override_non_healthy_verdicts() {
+        let (fe, now) = not_ready_for(600, Some("window_not_visible"));
+        assert_eq!(
+            resolve_overall_status(false, false, false, &fe, true, now).status,
+            "stopped"
+        );
+        assert_eq!(
+            resolve_overall_status(false, true, false, &fe, true, now).status,
+            "external"
+        );
+        assert_eq!(
+            resolve_overall_status(false, false, true, &fe, true, now).status,
+            "building"
+        );
+        let api_down = resolve_overall_status(true, false, false, &fe, true, now);
+        assert_eq!(api_down.status, "degraded");
+        assert_eq!(api_down.reason, None);
+    }
+
+    /// A primary snapshot with every field at a neutral value.
+    fn cached_primary_snapshot() -> CachedRunnerHealth {
+        CachedRunnerHealth {
+            id: crate::config::RunnerConfig::default_primary().id,
+            name: "Primary".to_string(),
+            port: RUNNER_API_PORT,
+            kind: RunnerKind::Primary,
+            running: true,
+            pid: Some(4242),
+            api_responding: true,
+            ui_error: None,
+            recent_crash: None,
+            derived_status: RunnerStatus::Healthy,
+            watchdog: WatchdogHealth::unavailable(),
+            liveness: crate::state::RunnerLiveness::Responding,
+            answered_this_boot: None,
+            last_seen_responding_at: None,
+            port_open: true,
+            spawn_up: false,
+            frontend_ready: None,
+            frontend_state: None,
+            frontend_not_ready_since: None,
+        }
+    }
+
+    /// A supervisor state with only a primary runner, which this test marks
+    /// running + responding, started from the LEGACY cargo-target exe, and
+    /// whose cached snapshot says the frontend has been not ready for 200 s.
+    async fn state_with_placeholder_primary(root: &std::path::Path) -> SharedState {
+        state_with_not_ready_primary(root, false).await
+    }
+
+    async fn state_with_not_ready_primary(
+        root: &std::path::Path,
+        server_mode: bool,
+    ) -> SharedState {
+        use crate::config::{BuildPoolConfig, RunnerConfig, SupervisorConfig};
+        let config = SupervisorConfig {
+            project_dir: root.join("src-tauri"),
+            watchdog_enabled_at_start: false,
+            auto_start: false,
+            auto_debug: false,
+            log_file: None,
+            log_dir: None,
+            port: 9875,
+            dev_logs_dir: root.join(".dev-logs"),
+            cli_args: vec![],
+            expo_dir: None,
+            expo_port: 8081,
+            runners: vec![RunnerConfig {
+                server_mode,
+                ..RunnerConfig::default_primary()
+            }],
+            build_pool: BuildPoolConfig::fixed(1),
+            no_prewarm: true,
+            no_webview: true,
+            temp_runner_display: None,
+            ambient_target_dir: crate::config::AmbientTargetDir::Ignore,
+            ambient_coord: crate::config::AmbientCoord::Ignore,
+            ambient_boot_id: crate::config::AmbientBootId::Ignore,
+        };
+        let state: SharedState = std::sync::Arc::new(crate::state::SupervisorState::new(config));
+        let primary = state
+            .get_primary()
+            .await
+            .expect("config declares a primary");
+        primary.runner.write().await.running = true;
+        *primary.resolved_exe.write().await = Some(crate::process::manager::ResolvedRunnerExe {
+            path: root.join("target/debug/qontinui-runner"),
+            origin: crate::process::manager::ExeOrigin::CargoTargetDir(
+                crate::config::TargetDirSource::WorkspaceDefault,
+            ),
+            mtime: None,
+            provenance: None,
+            unverified_warning: None,
+        });
+        state.cached_health.write().await.runner_responding = true;
+        state.cached_health.write().await.runner_port_open = true;
+        let mut snap = cached_primary_snapshot();
+        snap.frontend_ready = Some(false);
+        snap.frontend_state = Some("window_not_visible".to_string());
+        snap.frontend_not_ready_since = Some(chrono::Utc::now() - chrono::Duration::seconds(200));
+        state.cached_runner_health.write().await.push(snap);
+        state
+    }
+
+    /// `GET /health` `build.pool` serves the pool size, its source, the
+    /// per-slot jobs, occupancy, and the effective disk floor — and the floor
+    /// follows the cached footprint (UNKNOWN → 30, then derived).
+    #[tokio::test]
+    async fn health_build_pool_reports_size_jobs_and_disk_floor() {
+        // The served floor reads the disk-floor env override; a test driving a
+        // real build switches it off while holding this lock.
+        let _env = crate::test_env::BUILD_GUARD_ENV.lock().await;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = build_health_response(&state).await;
+        let v = serde_json::to_value(&r.build.pool).unwrap();
+        assert_eq!(v["pool_size"], 1);
+        assert_eq!(v["source"], "override");
+        assert_eq!(v["slots_busy"], 0);
+        assert!(v["jobs"]["per_slot"].as_u64().unwrap() >= 1);
+        assert!(v["jobs"]["source"].is_string());
+        // The served floor is the guard's own resolution (the pure rule is
+        // pinned in build_sizing's tests), before and after a footprint walk.
+        let ovr = crate::config::min_free_disk_gb_override();
+        let expect = |snap: Option<&crate::footprint::FootprintSnapshot>| {
+            serde_json::to_value(crate::build_sizing::effective_disk_floor(
+                ovr, 1, snap, None,
+            ))
+            .unwrap()
+        };
+        assert_eq!(v["disk_floor"], expect(None));
+        let mut snap = crate::footprint::compute_snapshot(&state.config);
+        snap.slots = vec![crate::footprint::SlotFootprint {
+            id: 0,
+            bytes: 40 * GIB,
+        }];
+        snap.disk_total_bytes = Some(2000 * GIB);
+        *state.footprint.write().await = Some(snap.clone());
+        let v = serde_json::to_value(build_pool_health(&state)).unwrap();
+        assert_eq!(v["disk_floor"], expect(Some(&snap)));
+        // A contended footprint lock is UNKNOWN (null), never a default.
+        let _held = state.footprint.write().await;
+        let v = serde_json::to_value(build_pool_health(&state)).unwrap();
+        assert!(v["disk_floor"].is_null(), "{v}");
+    }
+
+    /// (d) WIRING: `GET /health`'s builder reads the cached primary frontend
+    /// observation and the resolved exe origin, not just the pure function.
+    #[tokio::test]
+    async fn test_build_health_response_degrades_on_cached_placeholder_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = build_health_response(&state).await;
+        assert_eq!(r.status, "degraded");
+        let reason = r
+            .status_reason
+            .expect("degraded must carry a status_reason");
+        assert!(
+            reason.starts_with("primary runner frontend not ready for "),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("(frontendState=window_not_visible)"),
+            "{reason}"
+        );
+        assert!(reason.contains("legacy cargo-target exe"), "{reason}");
+    }
+
+    /// (d') The same through the SSE builder, which must agree with the plain
+    /// handler for the same state.
+    #[tokio::test]
+    async fn test_sse_health_degrades_on_cached_placeholder_frontend() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let r = try_build_sse_health(&state, None).expect("no lock is contended");
+        assert_eq!(r.status, "degraded");
+        let reason = r
+            .status_reason
+            .expect("degraded must carry a status_reason");
+        assert!(
+            reason.contains("(frontendState=window_not_visible)"),
+            "{reason}"
+        );
+        assert!(reason.contains("legacy cargo-target exe"), "{reason}");
+    }
+
+    /// A `server_mode` primary has no window, so `frontendReady` is false
+    /// for life by design: never an override, on either surface.
+    #[test]
+    fn test_server_mode_primary_never_degrades_on_frontend() {
+        let (mut fe, now) = not_ready_for(10_000, Some("window_missing"));
+        fe.server_mode = true;
+        let o = resolve_overall_status(true, true, false, &fe, true, now);
+        assert_eq!(o.status, "healthy");
+        assert_eq!(o.reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_server_mode_primary_stays_healthy_through_both_builders() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_not_ready_primary(dir.path(), true).await;
+        let plain = build_health_response(&state).await;
+        assert_eq!(plain.status, "healthy");
+        assert_eq!(plain.status_reason, None);
+        let sse = try_build_sse_health(&state, None).expect("no lock is contended");
+        assert_eq!(sse.status, "healthy");
+        assert_eq!(sse.status_reason, None);
+    }
+
+    /// A contended snapshot lock skips the SSE tick rather than emitting a
+    /// status computed without the primary snapshot.
+    #[tokio::test]
+    async fn test_sse_health_skips_tick_when_snapshot_lock_is_contended() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with_placeholder_primary(dir.path()).await;
+        let _held = state.cached_runner_health.write().await;
+        assert!(try_build_sse_health(&state, None).is_err());
+    }
+
+    /// `status_reason` is omitted from the JSON when None, present when Some.
+    #[test]
+    fn test_status_reason_serialization() {
+        let mut r = build_minimal_health_response();
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("status_reason").is_none());
+        r.status = "degraded".to_string();
+        r.status_reason = Some("primary runner reports itself errored: x".to_string());
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["status_reason"],
+            "primary runner reports itself errored: x"
+        );
+    }
+
     #[test]
     fn test_health_response_serializes_to_json() {
         let response = HealthResponse {
             status: "healthy".to_string(),
+            status_reason: None,
             runner: RunnerHealth {
                 running: true,
                 pid: Some(1234),
                 started_at: None,
                 api_responding: true,
                 liveness: crate::state::RunnerLiveness::Responding,
+                answered_this_boot: None,
                 last_seen_responding_at: None,
+                spawn_up: false,
             },
             ports: PortsHealth {
                 api_port: PortStatus {
@@ -867,6 +1588,9 @@ mod tests {
                 serving_restart_attempts: 0,
                 last_serving_restart_at: None,
                 serving_disabled_reason: None,
+                last_prebind_alert_at: None,
+                last_prebind_alert_spawn_started_at: None,
+                first_healthy_tracked_spawn_started_at: None,
             },
             build: BuildHealth {
                 in_progress: false,
@@ -874,8 +1598,10 @@ mod tests {
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,
+                last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
                 running: false,
@@ -969,6 +1695,35 @@ mod tests {
         );
     }
 
+    /// `/health` serves the same epoch every snapshot of this binary is stamped
+    /// with, so a box's stamp can be read without a snapshot having been posted.
+    #[test]
+    fn test_supervisor_block_serves_the_dev_action_ingest_counters() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        let block = &value["supervisor"]["dev_action_ingest"];
+        for key in [
+            "delivered",
+            "retried",
+            "refused",
+            "dropped_retries_exhausted",
+            "dropped_buffer_full",
+            "pending",
+        ] {
+            assert!(block[key].is_u64(), "{key} must be a count, got {block}");
+        }
+    }
+
+    #[test]
+    fn test_supervisor_block_serves_the_attribution_epoch() {
+        let value = serde_json::to_value(build_minimal_health_response())
+            .expect("should serialize to a JSON value");
+        assert_eq!(
+            value["supervisor"]["attribution_epoch"],
+            crate::dev_action::ingest::ATTRIBUTION_EPOCH
+        );
+    }
+
     /// `GET /health` must carry the wedge verdict, on the primary block AND
     /// on every `runners[]` row — in the same shape `GET /runners` uses.
     ///
@@ -984,6 +1739,7 @@ mod tests {
         let mut response = build_minimal_health_response();
         response.runner.liveness = crate::state::RunnerLiveness::UnresponsiveSince(seen);
         response.runner.last_seen_responding_at = Some(seen.to_rfc3339());
+        response.runner.answered_this_boot = Some(false);
         response.runners.push(RunnerInstanceHealth {
             id: "primary".to_string(),
             name: "Primary".to_string(),
@@ -998,8 +1754,10 @@ mod tests {
             recent_crash: None,
             derived_status: RunnerStatus::default(),
             liveness: crate::state::RunnerLiveness::UnresponsiveSince(seen),
+            answered_this_boot: Some(false),
             last_seen_responding_at: Some(seen.to_rfc3339()),
             port_open: true,
+            spawn_up: false,
         });
 
         let value = serde_json::to_value(&response).expect("health response serializes");
@@ -1021,6 +1779,12 @@ mod tests {
         assert_eq!(row["liveness"]["state"], "wedged", "row: {row}");
         assert_eq!(row["port_open"], true);
         assert_eq!(row["last_seen_responding_at"], seen.to_rfc3339());
+        // Beside the verdict: a wedged reading on a stamp this boot never made.
+        assert_eq!(value["runner"]["answered_this_boot"], false);
+        assert_eq!(row["answered_this_boot"], false);
+        // The third liveness input rides beside `port_open` on both shapes.
+        assert_eq!(value["runner"]["spawn_up"], false);
+        assert_eq!(row["spawn_up"], false);
         // The pre-existing fields keep their meanings and values.
         assert_eq!(row["running"], true);
         assert_eq!(row["api_responding"], false);
@@ -1044,19 +1808,29 @@ mod tests {
                 value["runner"]["liveness"]["unresponsive_since"].is_null(),
                 "{name} must carry an explicit null, never a missing key"
             );
+            // UNKNOWN is an explicit null too, never an absent key or `false`.
+            assert!(
+                value["runner"]
+                    .as_object()
+                    .is_some_and(|r| r.get("answered_this_boot") == Some(&serde_json::Value::Null)),
+                "answered_this_boot must be an explicit null: {value}"
+            );
         }
     }
     /// Minimal `HealthResponse` for serialization-shape assertions.
     fn build_minimal_health_response() -> HealthResponse {
         HealthResponse {
             status: "stopped".to_string(),
+            status_reason: None,
             runner: RunnerHealth {
                 running: false,
                 pid: None,
                 started_at: None,
                 api_responding: false,
                 liveness: crate::state::RunnerLiveness::Unknown,
+                answered_this_boot: None,
                 last_seen_responding_at: None,
+                spawn_up: false,
             },
             ports: PortsHealth {
                 api_port: PortStatus {
@@ -1071,8 +1845,10 @@ mod tests {
                 error_detected: false,
                 last_error: None,
                 last_build_at: None,
+                last_mem_gate: None,
                 frontend_stale_any: false,
                 lkg: None,
+                pool: fixture_pool_health(),
             },
             expo: ExpoHealth {
                 running: false,
@@ -1118,6 +1894,64 @@ mod tests {
         // The unavailable fallback is never armed — on EITHER arm.
         assert!(!WatchdogHealth::unavailable().crash_restart_armed);
         assert!(!WatchdogHealth::unavailable().serving_restart_armed);
+    }
+
+    /// A pre-bind hang reads `liveness: unknown` with `pid: null`, so the alert
+    /// bookkeeping is its only trace in this response. Both halves are carried,
+    /// unswapped, and both keys stay present (as `null`) when no alert was sent.
+    #[test]
+    fn the_last_prebind_alert_is_reported_with_the_spawn_it_named() {
+        let spawn = chrono::DateTime::parse_from_rfc3339("2026-11-04T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let sent = spawn + chrono::Duration::seconds(95);
+        let mut wd = crate::state::WatchdogState::new(true);
+        wd.last_prebind_alert = Some((spawn, sent));
+
+        let h = WatchdogHealth::from_state_with_arms(&wd, true, true);
+        assert_eq!(h.last_prebind_alert_at, Some(sent.to_rfc3339()));
+        assert_eq!(
+            h.last_prebind_alert_spawn_started_at,
+            Some(spawn.to_rfc3339())
+        );
+
+        let none = WatchdogHealth::from_state_with_arms(
+            &crate::state::WatchdogState::new(true),
+            true,
+            true,
+        );
+        let json = serde_json::to_value(none).unwrap();
+        assert!(json["last_prebind_alert_at"].is_null());
+        assert!(json
+            .as_object()
+            .unwrap()
+            .contains_key("last_prebind_alert_spawn_started_at"));
+    }
+
+    /// The first-healthy marker is served live: the spawn it names while set,
+    /// `null` (key present) once cleared.
+    #[test]
+    fn the_first_healthy_tracked_spawn_is_reported_while_set() {
+        let spawn = chrono::DateTime::parse_from_rfc3339("2026-11-09T01:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let wd = crate::state::WatchdogState::new(true);
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = Some(spawn);
+
+        let h = WatchdogHealth::from_state_with_arms(&wd, true, true);
+        assert_eq!(
+            h.first_healthy_tracked_spawn_started_at,
+            Some(spawn.to_rfc3339())
+        );
+
+        *wd.first_healthy_tracked_spawn.lock().unwrap() = None;
+        let json =
+            serde_json::to_value(WatchdogHealth::from_state_with_arms(&wd, true, true)).unwrap();
+        assert!(json["first_healthy_tracked_spawn_started_at"].is_null());
+        assert!(json
+            .as_object()
+            .unwrap()
+            .contains_key("first_healthy_tracked_spawn_started_at"));
     }
 
     /// The serving arm is independent of the crash arm on every axis, and the

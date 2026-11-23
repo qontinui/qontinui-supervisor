@@ -28,9 +28,11 @@
 //! naming the cause; subsequent ones drop to DEBUG so a coord outage cannot
 //! spam the supervisor log. A coord outage must never affect a build.
 //!
-//! **The ingest route lands via a sibling coord PR.** Until it does, this POSTs
-//! into a 404 and degrades silently by design — which is exactly the posture it
-//! must have during any later coord outage, so it is not a temporary shim.
+//! **The ingest route is served** (`qontinui-coord`
+//! `crates/coord/src/device_resource_samples.rs`). A refusal is therefore
+//! reported by status — a 401/403 names the credential source that was sent,
+//! a 404 says this coord does not serve the route — so the one WARN an
+//! episode gets says what to fix.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -38,6 +40,9 @@ use std::time::Duration;
 use serde::Serialize;
 use tracing::{debug, warn};
 
+use crate::config::AmbientCoord;
+use crate::coord_client::coord_base;
+use crate::fleet::DeviceSources;
 use crate::footprint::{BuildPoolOccupancy, FootprintSnapshot, MemorySnapshot};
 
 /// Per-request HTTP timeout. Short on purpose: this runs on the footprint
@@ -51,9 +56,6 @@ const LANE: &str = "host";
 /// Publisher class, per §A1's `source` column (`runner` | `supervisor` |
 /// `ci-step`).
 const SOURCE: &str = "supervisor";
-
-/// Env var carrying a coord device JWT, checked before the on-disk file.
-const DEVICE_JWT_ENV: &str = "COORD_DEVICE_JWT";
 
 /// One-shot latch so a persistent failure warns once and then goes quiet.
 static WARNED_ONCE: AtomicBool = AtomicBool::new(false);
@@ -82,6 +84,11 @@ pub struct ResourceSamplePayload {
     /// NULL on the Windows host lane — Windows has no load average, and a
     /// fabricated 0.0 would read as an idle box.
     pub load_1m: Option<f64>,
+    /// CPU package temperature in degrees Celsius. NULL means unmeasured
+    /// (Windows, WSL, no `x86_pkg_temp`/`coretemp` sensor, or an implausible
+    /// reading) — never `0`. Display only; must not feed any pressure or
+    /// headroom ranking. Serialized as `null`, not skipped.
+    pub cpu_temp_c: Option<f64>,
     #[serde(flatten)]
     pub memory: MemorySnapshot,
     pub disk_total_bytes: Option<u64>,
@@ -112,15 +119,109 @@ fn load_1m() -> Option<f64> {
     }
 }
 
+/// Accepted raw sysfs range, in millidegrees: `1..=150000` (0.001..=150 C).
+/// `0` and every negative value (`-1` and friends are "no reading" sentinels)
+/// are rejected, as is anything above 150 C (a stuck or garbage sensor).
+#[cfg(any(target_os = "linux", test))]
+const CPU_TEMP_RAW_MIN: f64 = 1.0;
+#[cfg(any(target_os = "linux", test))]
+const CPU_TEMP_RAW_MAX: f64 = 150_000.0;
+
+/// Parse a sysfs millidegree value (`71000`) into Celsius (`71.0`).
+///
+/// Pure over `&str`. Empty, non-numeric, non-finite or out-of-range input
+/// (raw outside `1..=150000`, so `0` and negatives included) yields `None`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_millidegrees_c(raw: &str) -> Option<f64> {
+    let milli: f64 = raw.trim().parse().ok()?;
+    (milli.is_finite() && (CPU_TEMP_RAW_MIN..=CPU_TEMP_RAW_MAX).contains(&milli))
+        .then(|| milli / 1000.0)
+}
+
+/// Read the package temperature under a `/sys`-shaped `root`.
+///
+/// First choice: the MAX over every thermal zone whose `type` is
+/// `x86_pkg_temp` (order independent). If none yields a valid value, the MAX
+/// over every `temp*_input` of every hwmon device named exactly `coretemp`.
+/// A directory that cannot be read is skipped, never fatal.
+#[cfg(target_os = "linux")]
+fn read_cpu_package_temp_c(root: &std::path::Path) -> Option<f64> {
+    use std::fs;
+
+    let read = |p: std::path::PathBuf| fs::read_to_string(p).ok();
+    let max = |acc: Option<f64>, c: f64| Some(acc.map_or(c, |h| h.max(c)));
+
+    let mut pkg: Option<f64> = None;
+    if let Ok(zones) = fs::read_dir(root.join("class/thermal")) {
+        for zone in zones.flatten() {
+            let dir = zone.path();
+            let is_zone = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("thermal_zone"));
+            if !is_zone {
+                continue;
+            }
+            if read(dir.join("type")).is_some_and(|t| t.trim() == "x86_pkg_temp") {
+                if let Some(c) = read(dir.join("temp")).and_then(|r| parse_millidegrees_c(&r)) {
+                    pkg = max(pkg, c);
+                }
+            }
+        }
+    }
+    if pkg.is_some() {
+        return pkg;
+    }
+
+    let mut hottest: Option<f64> = None;
+    let Ok(hwmons) = fs::read_dir(root.join("class/hwmon")) else {
+        return None;
+    };
+    for hw in hwmons.flatten() {
+        let dir = hw.path();
+        if read(dir.join("name")).is_none_or(|n| n.trim() != "coretemp") {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("temp") && name.ends_with("_input") {
+                if let Some(c) = read(entry.path()).and_then(|r| parse_millidegrees_c(&r)) {
+                    hottest = max(hottest, c);
+                }
+            }
+        }
+    }
+    hottest
+}
+
+/// CPU package temperature in Celsius, or `None` where unmeasured. Linux only
+/// (`/sys`); every other target reports `None` rather than a guess.
+fn cpu_package_temp_c() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        read_cpu_package_temp_c(std::path::Path::new("/sys"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// Build the §A1 payload from a footprint snapshot.
 ///
-/// Pure: every field is projected from the snapshot the timer already
-/// refreshed, plus the CPU count from the existing
-/// [`crate::fleet::detect_resources`] probe. Nothing here re-samples memory,
+/// Pure over its arguments: every field is projected from the snapshot the
+/// timer already refreshed, plus the CPU count from the existing
+/// [`crate::fleet::detect_resources`] probe and the already-read
+/// `cpu_temp_c` (the caller reads sysfs off the async worker). Nothing here re-samples memory,
 /// disk or pool state — a second sampler is exactly what the plan forbids.
 pub fn payload_from_snapshot(
     snapshot: &FootprintSnapshot,
     cpu_cores: u32,
+    cpu_temp_c: Option<f64>,
 ) -> ResourceSamplePayload {
     ResourceSamplePayload {
         sampled_at: snapshot.computed_at.clone(),
@@ -128,6 +229,7 @@ pub fn payload_from_snapshot(
         lane_instance: None,
         cpu_cores: Some(cpu_cores),
         load_1m: load_1m(),
+        cpu_temp_c,
         memory: snapshot.memory,
         disk_total_bytes: snapshot.disk_total_bytes,
         disk_free_bytes: snapshot.disk_free_bytes,
@@ -135,32 +237,6 @@ pub fn payload_from_snapshot(
         build_pool: snapshot.build_pool,
         ci_jobs_running: None,
         source: SOURCE,
-    }
-}
-
-/// A coord device bearer, if this host has one.
-///
-/// The supervisor holds no credentials of its own (see `routes::web_fleet` and
-/// `routes::ci_runner`, which forward the caller's `Authorization` verbatim and
-/// add nothing), so this reads the machine-wide device JWT: `$COORD_DEVICE_JWT`
-/// first, then `~/.qontinui/coord-device-jwt`. `None` means the POST goes out
-/// unauthenticated exactly like the sibling budget publish — coord decides
-/// whether to accept it, and a refusal degrades silently like any other
-/// non-2xx.
-fn device_bearer() -> Option<String> {
-    if let Ok(v) = std::env::var(DEVICE_JWT_ENV) {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    let path = dirs::home_dir()?.join(".qontinui").join("coord-device-jwt");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
     }
 }
 
@@ -178,49 +254,65 @@ fn note_failure(reason: &str) {
 }
 
 /// Everything the POST needs that comes from the filesystem, resolved in one
-/// blocking hop.
+/// blocking hop. The bearer is NOT here: it is resolved on the async side of
+/// [`publish`] through the shared, transport-guarded
+/// [`crate::fleet::resolve_device_bearer_for`].
 struct PublishTarget {
     device_id: String,
+    /// Coord HTTP base, kept so [`crate::fleet::resolve_device_bearer_for`]
+    /// can apply its transport guard.
+    base: String,
     url: String,
-    /// `Some` only when a credential exists AND the transport is safe to carry
-    /// it on — see [`bearer_for`].
-    bearer: Option<String>,
     cpu_cores: u32,
 }
 
-/// A bearer to send to `base`, or `None`.
+/// The failure text for a non-2xx publish response.
 ///
-/// This is the supervisor's FIRST outbound credential (the sibling budget POST
-/// sends none), and [`crate::fleet::coord_http_base`] maps `ws://` to plain
-/// `http://` — so a profile pointing at a non-loopback `ws://` host would put a
-/// device JWT on the wire in cleartext. Attach it only over `https://` or to a
-/// loopback host; everything else publishes unauthenticated and lets coord
-/// decide, which degrades exactly like any other non-2xx.
-fn bearer_for(base: &str) -> Option<String> {
-    let host_is_loopback = base
-        .split("://")
-        .nth(1)
-        .map(|rest| rest.split('/').next().unwrap_or(rest))
-        .map(|hostport| hostport.split(':').next().unwrap_or(hostport))
-        .map(|host| host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1")
-        .unwrap_or(false);
-    if base.starts_with("https://") || host_is_loopback {
-        device_bearer()
-    } else {
-        None
-    }
+/// Status-specific, because the one WARN an episode gets is the operator's
+/// only signal that this host fell off fleet telemetry:
+/// - 401/403 → the credential was refused, naming which source was sent;
+/// - 404 → this coord does not serve the route;
+/// - anything else → the status and coord's own body.
+///
+/// Takes the source NAME, never the token.
+fn failure_message(
+    status: reqwest::StatusCode,
+    device_id: &str,
+    body: &str,
+    source: &str,
+) -> String {
+    let hint = crate::fleet::refusal_hint(status, source);
+    format!(
+        "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: {body}{hint}"
+    )
 }
 
-/// Resolve machine identity, coord URL, credential and CPU count.
+/// Resolve coord URL, machine identity and CPU count.
 ///
-/// Every step here touches the filesystem (`machine.json`, `profiles.json`, the
-/// device-JWT file), so it runs inside `spawn_blocking` — a stalled volume must
+/// Every step here can touch the filesystem (`profiles.json`, `machine.json`),
+/// so it runs inside `spawn_blocking` — a stalled volume must
 /// not park a tokio worker, and the surrounding code already knows this (the
 /// footprint walk is `spawn_blocking`-hosted for the same reason).
 ///
-/// `Err` carries a ready-to-log reason.
-fn resolve_target() -> Result<PublishTarget, String> {
-    let machine = crate::fleet::load_machine_file().ok_or_else(|| {
+/// The coord base is resolved FIRST, through the one resolver: `Ok(None)` under
+/// [`AmbientCoord::Ignore`], before `machine` is read. `Err` carries a
+/// ready-to-log reason.
+fn resolve_target(
+    access: &AmbientCoord,
+    machine: fn() -> Option<crate::fleet::MachineFile>,
+) -> Result<Option<PublishTarget>, String> {
+    let base = match coord_base(access) {
+        Some(base) => base,
+        None if *access == AmbientCoord::Ignore => return Ok(None),
+        None => {
+            return Err(
+                "no coord base: COORD_HTTP_URL unset and ~/.qontinui/profiles.json \
+                        missing or its active profile has no coord_url"
+                    .to_string(),
+            )
+        }
+    };
+    let machine = machine().ok_or_else(|| {
         "~/.qontinui/machine.json missing — run `qontinui_profile machine init` on this host"
             .to_string()
     })?;
@@ -234,10 +326,6 @@ fn resolve_target() -> Result<PublishTarget, String> {
     let device_id = uuid::Uuid::parse_str(raw.trim())
         .map_err(|e| format!("machine.json device_id is not a UUID ({e})"))?
         .to_string();
-    let base = crate::fleet::coord_http_base().ok_or_else(|| {
-        "~/.qontinui/profiles.json missing or its active profile has no coord_url".to_string()
-    })?;
-    let bearer = bearer_for(&base);
     // Same probe `fleet::detect_resources` uses for `cpu_cores`, without its
     // disk enumeration + memory refresh — this module must not re-sample what
     // the footprint snapshot already carries.
@@ -245,21 +333,39 @@ fn resolve_target() -> Result<PublishTarget, String> {
         .map(|n| n.get() as u32)
         .unwrap_or(1)
         .max(1);
-    Ok(PublishTarget {
+    Ok(Some(PublishTarget {
         url: format!("{base}/coord/devices/{device_id}/resource-sample"),
         device_id,
-        bearer,
+        base,
         cpu_cores,
-    })
+    }))
 }
 
 /// Best-effort publish of one `lane='host'`, `source='supervisor'` sample.
 ///
 /// Never returns an error and never panics: the caller is the footprint timer,
-/// and telemetry must not be able to disturb builds.
-pub async fn publish(snapshot: &FootprintSnapshot) {
-    let target = match tokio::task::spawn_blocking(resolve_target).await {
-        Ok(Ok(t)) => t,
+/// and telemetry must not be able to disturb builds. Under
+/// [`AmbientCoord::Ignore`] it returns having read nothing ambient.
+pub async fn publish(access: &AmbientCoord, snapshot: &FootprintSnapshot) {
+    publish_from(access, &DeviceSources::for_access(access), snapshot).await
+}
+
+/// [`publish`] with its identity sources passed in — the seam the counting
+/// tests drive.
+pub(crate) async fn publish_from(
+    access: &AmbientCoord,
+    sources: &DeviceSources,
+    snapshot: &FootprintSnapshot,
+) {
+    let (access_owned, machine) = (access.clone(), sources.machine);
+    let resolved =
+        tokio::task::spawn_blocking(move || resolve_target(&access_owned, machine)).await;
+    let target = match resolved {
+        Ok(Ok(Some(t))) => t,
+        Ok(Ok(None)) => {
+            debug!("resource_sample: ambient coord is Ignore — not publishing");
+            return;
+        }
         Ok(Err(reason)) => {
             note_failure(&reason);
             return;
@@ -271,12 +377,20 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     };
     let PublishTarget {
         device_id,
+        base,
         url,
-        bearer,
         cpu_cores,
     } = target;
+    // The shared resolver is async (file read + runner mint), so the bearer
+    // is resolved here rather than inside the blocking identity hop.
+    let (bearer, bearer_source) = crate::fleet::resolve_device_bearer_for(&base, sources).await;
 
-    let payload = payload_from_snapshot(snapshot, cpu_cores);
+    // sysfs reads are blocking I/O: keep them off the async worker.
+    let cpu_temp_c = tokio::task::spawn_blocking(cpu_package_temp_c)
+        .await
+        .unwrap_or(None);
+
+    let payload = payload_from_snapshot(snapshot, cpu_cores, cpu_temp_c);
 
     let client = match reqwest::Client::builder().timeout(HTTP_TIMEOUT).build() {
         Ok(c) => c,
@@ -292,11 +406,10 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
             // Re-arm the warn-once latch: "once" must mean once per failure
-            // EPISODE, not once per process. Otherwise the expected 404 at boot
-            // (before the coord ingest route lands) consumes the only WARN this
-            // module will ever emit, and a later real failure — an expired JWT,
-            // a coord outage — takes this machine off the fleet dashboard in
-            // total silence.
+            // EPISODE, not once per process. Otherwise one early refusal
+            // consumes the only WARN this module will ever emit, and a later
+            // real failure — an expired JWT, a coord outage — takes this
+            // machine off the fleet dashboard in total silence.
             WARNED_ONCE.store(false, Ordering::Relaxed);
             debug!(
                 "resource_sample: published lane={LANE} device_id={device_id} \
@@ -312,10 +425,7 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
             // failure; bound it so a stray HTML page can't fill the log.
             let mut body = resp.text().await.unwrap_or_default();
             body.truncate(500);
-            note_failure(&format!(
-                "coord returned {status} for POST /coord/devices/{device_id}/resource-sample: \
-                 {body} (a 404 is expected until the coord ingest route lands)"
-            ));
+            note_failure(&failure_message(status, &device_id, &body, bearer_source));
         }
         Err(e) => note_failure(&format!("POST {url}: {e}")),
     }
@@ -325,6 +435,45 @@ pub async fn publish(snapshot: &FootprintSnapshot) {
 mod tests {
     use super::*;
     use crate::footprint::{ExeCopiesFootprint, SpawnContainersFootprint};
+
+    /// Under `Ignore` the sample reaches neither coord nor the runner's mint and
+    /// reads no `machine.json`; under `At` it connects to each once.
+    #[tokio::test]
+    async fn resource_sample_reaches_coord_and_the_mint_only_under_at() {
+        use crate::coord_client::counting_listener;
+        use std::sync::atomic::AtomicUsize;
+        static MACHINE_READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted_machine() -> Option<crate::fleet::MachineFile> {
+            MACHINE_READS.fetch_add(1, Ordering::SeqCst);
+            crate::fleet::fixture_machine()
+        }
+
+        let coord = counting_listener::serve().await;
+        let runner = counting_listener::serve().await;
+        let sources = DeviceSources {
+            machine: counted_machine,
+            ..DeviceSources::fixture(&runner.base)
+        };
+        let snapshot = snapshot_fixture();
+
+        publish_from(&AmbientCoord::Ignore, &sources, &snapshot).await;
+        assert_eq!(coord.connections(), 0, "Ignore reached coord");
+        assert_eq!(runner.connections(), 0, "Ignore minted a device JWT");
+        assert_eq!(
+            MACHINE_READS.load(Ordering::SeqCst),
+            0,
+            "Ignore read machine.json"
+        );
+
+        publish_from(&AmbientCoord::At(coord.base.clone()), &sources, &snapshot).await;
+        assert_eq!(coord.connections(), 1);
+        assert_eq!(
+            runner.connections(),
+            1,
+            "the mint connects to the stub runner once"
+        );
+        assert_eq!(MACHINE_READS.load(Ordering::SeqCst), 1);
+    }
 
     fn snapshot_fixture() -> FootprintSnapshot {
         FootprintSnapshot {
@@ -355,7 +504,7 @@ mod tests {
     #[test]
     fn payload_projects_the_snapshot_without_resampling() {
         let snap = snapshot_fixture();
-        let p = payload_from_snapshot(&snap, 24);
+        let p = payload_from_snapshot(&snap, 24, None);
         assert_eq!(p.lane, "host");
         assert_eq!(p.source, "supervisor");
         // The supervisor is the sole publisher for its lane, so NULL is the
@@ -375,13 +524,14 @@ mod tests {
 
     #[test]
     fn payload_serializes_every_a1_column_name() {
-        let v = serde_json::to_value(payload_from_snapshot(&snapshot_fixture(), 8)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snapshot_fixture(), 8, None)).unwrap();
         for key in [
             "sampled_at",
             "lane",
             "lane_instance",
             "cpu_cores",
             "load_1m",
+            "cpu_temp_c",
             "mem_total_bytes",
             "mem_available_bytes",
             "commit_total_bytes",
@@ -419,7 +569,7 @@ mod tests {
         snap.disk_free_bytes = None;
         snap.disk_total_bytes = None;
         snap.disk_mount = None;
-        let v = serde_json::to_value(payload_from_snapshot(&snap, 1)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snap, 1, None)).unwrap();
         for key in [
             "mem_total_bytes",
             "commit_available_bytes",
@@ -443,7 +593,7 @@ mod tests {
         // box, and §C3 forbids absence of signal being read as anything else.
         let mut snap = snapshot_fixture();
         snap.memory = crate::footprint::memory_snapshot();
-        let v = serde_json::to_value(payload_from_snapshot(&snap, 1)).unwrap();
+        let v = serde_json::to_value(payload_from_snapshot(&snap, 1, None)).unwrap();
         if crate::footprint::SWAP_IS_DERIVED_FROM_COMMIT {
             assert!(
                 v["swap_total_bytes"].is_null(),
@@ -483,5 +633,233 @@ mod tests {
         } else {
             assert!(got.is_some());
         }
+    }
+
+    #[test]
+    fn millidegrees_parse_to_celsius_and_reject_garbage() {
+        assert_eq!(parse_millidegrees_c("71000"), Some(71.0));
+        assert_eq!(
+            parse_millidegrees_c(
+                "71000
+"
+            ),
+            Some(71.0)
+        );
+        for bad in ["", "abc", "-1", "255000", "NaN"] {
+            assert_eq!(parse_millidegrees_c(bad), None, "{bad:?} must be None");
+        }
+    }
+
+    #[test]
+    fn unmeasured_cpu_temp_serializes_as_null_not_skipped() {
+        let mut p = payload_from_snapshot(&snapshot_fixture(), 8, None);
+        p.cpu_temp_c = None;
+        let v = serde_json::to_value(p).unwrap();
+        assert!(v.get("cpu_temp_c").is_some_and(|x| x.is_null()));
+    }
+
+    #[test]
+    fn cpu_temp_is_null_off_linux() {
+        if !cfg!(target_os = "linux") {
+            assert!(cpu_package_temp_c().is_none());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_reader_prefers_pkg_zone_then_hottest_coretemp() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sup-cputemp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let w = |rel: &str, body: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        // No sensors at all.
+        fs::create_dir_all(&root).unwrap();
+        assert_eq!(read_cpu_package_temp_c(&root), None);
+        // coretemp fallback: hottest input wins.
+        w(
+            "class/hwmon/hwmon3/name",
+            "coretemp
+",
+        );
+        w(
+            "class/hwmon/hwmon3/temp1_input",
+            "50000
+",
+        );
+        w(
+            "class/hwmon/hwmon3/temp2_input",
+            "64000
+",
+        );
+        w(
+            "class/hwmon/hwmon4/name",
+            "nvme
+",
+        );
+        w(
+            "class/hwmon/hwmon4/temp1_input",
+            "99000
+",
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(64.0));
+        // x86_pkg_temp zone takes precedence.
+        w(
+            "class/thermal/thermal_zone0/type",
+            "acpitz
+",
+        );
+        w(
+            "class/thermal/thermal_zone0/temp",
+            "30000
+",
+        );
+        w(
+            "class/thermal/thermal_zone1/type",
+            "x86_pkg_temp
+",
+        );
+        w(
+            "class/thermal/thermal_zone1/temp",
+            "71000
+",
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(71.0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_root(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("sup-cputemp-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        for (rel, body) in files {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+        root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_pkg_zones_take_max_and_ignore_invalid() {
+        let root = fake_root(
+            "zones",
+            &[
+                ("class/thermal/thermal_zone0/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone0/temp", "55000\n"),
+                ("class/thermal/thermal_zone1/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone1/temp", "72000\n"),
+                ("class/thermal/thermal_zone2/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone2/temp", "0\n"),
+                ("class/thermal/thermal_zone3/type", "acpitz\n"),
+                ("class/thermal/thermal_zone3/temp", "99000\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(72.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn two_coretemp_hwmons_take_max_across() {
+        let root = fake_root(
+            "hwmons",
+            &[
+                ("class/hwmon/hwmon0/name", "coretemp\n"),
+                ("class/hwmon/hwmon0/temp1_input", "48000\n"),
+                ("class/hwmon/hwmon1/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/temp1_input", "66000\n"),
+                ("class/hwmon/hwmon2/name", "coretemp_x\n"),
+                ("class/hwmon/hwmon2/temp1_input", "99000\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), Some(66.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn raw_zero_and_negatives_are_rejected() {
+        assert_eq!(parse_millidegrees_c("0"), None);
+        assert_eq!(parse_millidegrees_c("-1"), None);
+        assert_eq!(parse_millidegrees_c("-5000"), None);
+        assert_eq!(parse_millidegrees_c("150001"), None);
+        assert_eq!(parse_millidegrees_c("1"), Some(0.001));
+        assert_eq!(parse_millidegrees_c("150000"), Some(150.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_zero_zone_yields_none() {
+        let root = fake_root(
+            "zero",
+            &[
+                ("class/thermal/thermal_zone0/type", "x86_pkg_temp\n"),
+                ("class/thermal/thermal_zone0/temp", "0\n"),
+            ],
+        );
+        assert_eq!(read_cpu_package_temp_c(&root), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unreadable_hwmon_entry_is_skipped() {
+        let root = fake_root(
+            "unreadable",
+            &[
+                ("class/hwmon/hwmon0/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/name", "coretemp\n"),
+                ("class/hwmon/hwmon1/temp1_input", "61000\n"),
+            ],
+        );
+        // hwmon0 has a name but a temp dir entry that is not a readable
+        // file; hwmon9 is a plain file so read_dir on it errors. Neither
+        // may discard hwmon1's valid reading.
+        std::fs::create_dir(root.join("class/hwmon/hwmon0/temp1_input")).unwrap();
+        std::fs::write(root.join("class/hwmon/hwmon9"), "x").unwrap();
+        assert_eq!(read_cpu_package_temp_c(&root), Some(61.0));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_403_names_the_credential_source_and_blames_no_route() {
+        let msg = failure_message(
+            reqwest::StatusCode::FORBIDDEN,
+            "00000000-0000-0000-0000-000000000001",
+            r#"{"error":"auth_required"}"#,
+            "~/.qontinui/coord-device-jwt",
+        );
+        assert!(msg.contains("credential refused"), "{msg}");
+        assert!(msg.contains("~/.qontinui/coord-device-jwt"), "{msg}");
+        assert!(msg.contains("auth_required"), "{msg}");
+        assert!(!msg.contains("404 is expected"), "{msg}");
+        let unauth = failure_message(
+            reqwest::StatusCode::UNAUTHORIZED,
+            "d",
+            "",
+            crate::fleet::SOURCE_NONE,
+        );
+        assert!(unauth.contains("credential refused"), "{unauth}");
+        assert!(unauth.contains(crate::fleet::SOURCE_NONE), "{unauth}");
+    }
+
+    #[test]
+    fn a_404_says_the_route_is_not_served_and_other_statuses_stay_plain() {
+        let msg = failure_message(reqwest::StatusCode::NOT_FOUND, "d", "", "COORD_DEVICE_JWT");
+        assert!(msg.contains("route not served by this coord"), "{msg}");
+        assert!(!msg.contains("credential"), "{msg}");
+        let msg = failure_message(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "d",
+            "boom",
+            "COORD_DEVICE_JWT",
+        );
+        assert!(msg.ends_with(": boom"), "{msg}");
     }
 }
